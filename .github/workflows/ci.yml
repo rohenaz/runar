@@ -43,7 +43,7 @@ jobs:
 
   conformance:
     name: Conformance Tests
-    needs: [typescript, go]
+    needs: [typescript, go, rust]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,14 +55,29 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - uses: dtolnay/rust-toolchain@stable
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
+      - name: Build Go compiler
+        run: cd compilers/go && go build -o ../../tsop-go .
+      - name: Build Rust compiler
+        run: cd compilers/rust && cargo build --release && cp target/release/tsop-compiler-rust ../../tsop-rust
       - name: Run conformance tests
         run: |
-          cd compilers/go && go build -o ../../tsop-go . && cd ../..
+          fail=0
           for test in conformance/tests/*/expected-ir.json; do
             dir=$(dirname "$test")
             name=$(basename "$dir")
             echo "=== $name ==="
-            ./tsop-go --ir "$test" --hex
+            go_hex=$(./tsop-go --ir "$test" --hex)
+            rust_hex=$(./tsop-rust --ir "$test" --hex)
+            echo "  Go:   $go_hex"
+            echo "  Rust: $rust_hex"
+            if [ "$go_hex" != "$rust_hex" ]; then
+              echo "  MISMATCH between Go and Rust for $name"
+              fail=1
+            else
+              echo "  OK"
+            fi
           done
+          exit $fail
