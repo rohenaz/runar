@@ -247,6 +247,9 @@ func collectRefs(value *ir.ANFValue) []string {
 		refs = append(refs, value.ValueRef)
 	case "check_preimage":
 		refs = append(refs, value.Preimage)
+	case "add_output":
+		refs = append(refs, value.Satoshis)
+		refs = append(refs, value.StateValues...)
 	}
 
 	return refs
@@ -410,6 +413,8 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 		ctx.lowerGetStateScript(name)
 	case "check_preimage":
 		ctx.lowerCheckPreimage(name, value.Preimage, bindingIndex, lastUses)
+	case "add_output":
+		ctx.lowerAddOutput(name, value.Satoshis, value.StateValues, bindingIndex, lastUses)
 	}
 }
 
@@ -790,6 +795,61 @@ func (ctx *loweringContext) lowerGetStateScript(bindingName string) {
 		first = false
 	}
 
+	ctx.sm.pop()
+	ctx.sm.push(bindingName)
+	ctx.trackDepth()
+}
+
+func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateValues []string, bindingIndex int, lastUses map[string]int) {
+	// Serialize a transaction output: <8-byte LE satoshis> <serialized state values>
+	// This mirrors lowerGetStateScript but uses the provided value refs instead
+	// of loading from the stack, and prepends the satoshis amount.
+
+	var stateProps []ir.ANFProperty
+	for _, p := range ctx.properties {
+		if !p.Readonly {
+			stateProps = append(stateProps, p)
+		}
+	}
+
+	// Step 1: Serialize satoshis as 8-byte LE
+	isLastSatoshis := ctx.isLastUse(satoshis, bindingIndex, lastUses)
+	ctx.bringToTop(satoshis, isLastSatoshis)
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
+	ctx.sm.pop() // pop the width
+
+	// Step 2: Serialize each state value and concatenate
+	for i := 0; i < len(stateValues) && i < len(stateProps); i++ {
+		valueRef := stateValues[i]
+		prop := stateProps[i]
+
+		isLast := ctx.isLastUse(valueRef, bindingIndex, lastUses)
+		ctx.bringToTop(valueRef, isLast)
+
+		// Convert numeric/boolean values to fixed-width bytes
+		if prop.Type == "bigint" {
+			ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
+			ctx.sm.push("")
+			ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
+			ctx.sm.pop()
+		} else if prop.Type == "boolean" {
+			ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(1)})
+			ctx.sm.push("")
+			ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
+			ctx.sm.pop()
+		}
+		// Byte types used as-is
+
+		// Concatenate with accumulator
+		ctx.sm.pop()
+		ctx.sm.pop()
+		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CAT"})
+		ctx.sm.push("")
+	}
+
+	// Rename top to binding name
 	ctx.sm.pop()
 	ctx.sm.push(bindingName)
 	ctx.trackDepth()

@@ -206,7 +206,7 @@ fn collect_refs(value: &ANFValue) -> Vec<String> {
     match value {
         ANFValue::LoadParam { .. }
         | ANFValue::LoadProp { .. }
-        | ANFValue::GetStateScript {} => {}
+        | ANFValue::GetStateScript { .. } => {}
 
         ANFValue::LoadConst { value: v } => {
             // load_const with @ref: values reference another binding
@@ -257,6 +257,10 @@ fn collect_refs(value: &ANFValue) -> Vec<String> {
         }
         ANFValue::CheckPreimage { preimage } => {
             refs.push(preimage.clone());
+        }
+        ANFValue::AddOutput { satoshis, state_values } => {
+            refs.push(satoshis.clone());
+            refs.extend(state_values.iter().cloned());
         }
     }
     refs
@@ -437,6 +441,9 @@ impl LoweringContext {
             }
             ANFValue::CheckPreimage { preimage } => {
                 self.lower_check_preimage(name, preimage, binding_index, last_uses);
+            }
+            ANFValue::AddOutput { satoshis, state_values } => {
+                self.lower_add_output(name, satoshis, state_values, binding_index, last_uses);
             }
         }
     }
@@ -893,6 +900,70 @@ impl LoweringContext {
             first = false;
         }
 
+        self.sm.pop();
+        self.sm.push(binding_name);
+        self.track_depth();
+    }
+
+    fn lower_add_output(
+        &mut self,
+        binding_name: &str,
+        satoshis: &str,
+        state_values: &[String],
+        binding_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) {
+        // Serialize a transaction output: <8-byte LE satoshis> <serialized state values>
+        // This mirrors lower_get_state_script but uses the provided value refs instead
+        // of loading from the stack, and prepends the satoshis amount.
+
+        let state_props: Vec<ANFProperty> = self
+            .properties
+            .iter()
+            .filter(|p| !p.readonly)
+            .cloned()
+            .collect();
+
+        // Step 1: Serialize satoshis as 8-byte LE
+        let is_last_satoshis = self.is_last_use(satoshis, binding_index, last_uses);
+        self.bring_to_top(satoshis, is_last_satoshis);
+        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
+        self.sm.pop(); // pop the width
+
+        // Step 2: Serialize each state value and concatenate
+        for (i, value_ref) in state_values.iter().enumerate() {
+            if i >= state_props.len() {
+                break;
+            }
+            let prop = &state_props[i];
+
+            let is_last = self.is_last_use(value_ref, binding_index, last_uses);
+            self.bring_to_top(value_ref, is_last);
+
+            // Convert numeric/boolean values to fixed-width bytes via OP_NUM2BIN
+            if prop.prop_type == "bigint" {
+                self.emit_op(StackOp::Push(PushValue::Int(8)));
+                self.sm.push("");
+                self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
+                self.sm.pop(); // pop the width
+            } else if prop.prop_type == "boolean" {
+                self.emit_op(StackOp::Push(PushValue::Int(1)));
+                self.sm.push("");
+                self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
+                self.sm.pop(); // pop the width
+            }
+            // Byte types used as-is
+
+            // Concatenate with accumulator
+            self.sm.pop();
+            self.sm.pop();
+            self.emit_op(StackOp::Opcode("OP_CAT".to_string()));
+            self.sm.push("");
+        }
+
+        // Rename top to binding name
         self.sm.pop();
         self.sm.push(binding_name);
         self.track_depth();

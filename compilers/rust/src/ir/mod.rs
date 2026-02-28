@@ -132,6 +132,13 @@ pub enum ANFValue {
 
     #[serde(rename = "check_preimage")]
     CheckPreimage { preimage: String },
+
+    #[serde(rename = "add_output")]
+    AddOutput {
+        satoshis: String,
+        #[serde(rename = "stateValues")]
+        state_values: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------

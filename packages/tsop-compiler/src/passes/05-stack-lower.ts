@@ -209,6 +209,9 @@ function collectRefs(value: ANFValue): string[] {
     case 'load_const':
     case 'get_state_script':
       break;
+    case 'add_output':
+      refs.push(value.satoshis, ...value.stateValues);
+      break;
     case 'bin_op':
       refs.push(value.left, value.right);
       break;
@@ -403,6 +406,9 @@ class LoweringContext {
         break;
       case 'check_preimage':
         this.lowerCheckPreimage(name, value.preimage, bindingIndex, lastUses);
+        break;
+      case 'add_output':
+        this.lowerAddOutput(name, value.satoshis, value.stateValues, bindingIndex, lastUses);
         break;
     }
   }
@@ -847,6 +853,62 @@ class LoweringContext {
         this.stackMap.push(null);
       }
       first = false;
+    }
+
+    // Rename top to binding name
+    this.stackMap.pop();
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  private lowerAddOutput(
+    bindingName: string,
+    satoshis: string,
+    stateValues: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    // Serialize a transaction output: <8-byte LE satoshis> <serialized state values>
+    // This mirrors lowerGetStateScript but uses the provided value refs instead
+    // of loading from the stack, and prepends the satoshis amount.
+
+    const stateProps = this._properties.filter(p => !p.readonly);
+
+    // Step 1: Serialize satoshis as 8-byte LE
+    const isLastSatoshis = this.isLastUse(satoshis, bindingIndex, lastUses);
+    this.bringToTop(satoshis, isLastSatoshis);
+    this.emitOp({ op: 'push', value: 8n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
+    this.stackMap.pop(); // pop the width
+
+    // Step 2: Serialize each state value and concatenate
+    for (let i = 0; i < stateValues.length && i < stateProps.length; i++) {
+      const valueRef = stateValues[i]!;
+      const prop = stateProps[i]!;
+
+      const isLast = this.isLastUse(valueRef, bindingIndex, lastUses);
+      this.bringToTop(valueRef, isLast);
+
+      // Convert numeric/boolean values to fixed-width bytes
+      if (prop.type === 'bigint') {
+        this.emitOp({ op: 'push', value: 8n });
+        this.stackMap.push(null);
+        this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
+        this.stackMap.pop();
+      } else if (prop.type === 'boolean') {
+        this.emitOp({ op: 'push', value: 1n });
+        this.stackMap.push(null);
+        this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
+        this.stackMap.pop();
+      }
+      // Byte types used as-is
+
+      // Concatenate with accumulator
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.emitOp({ op: 'opcode', code: 'OP_CAT' });
+      this.stackMap.push(null);
     }
 
     // Rename top to binding name

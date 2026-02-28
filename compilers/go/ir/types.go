@@ -109,6 +109,10 @@ type ANFValue struct {
 
 	// check_preimage
 	Preimage string `json:"preimage,omitempty"`
+
+	// add_output
+	Satoshis    string   `json:"satoshis,omitempty"`
+	StateValues []string `json:"stateValues,omitempty"`
 }
 
 // DecodeConstants walks the program and decodes the RawValue fields in
@@ -166,6 +170,8 @@ func decodeValue(v *ANFValue) error {
 		if err := decodeBindings(v.Body); err != nil {
 			return fmt.Errorf("loop/body: %w", err)
 		}
+	case "add_output":
+		// satoshis and stateValues are decoded directly from JSON tags; nothing extra needed.
 	}
 	return nil
 }

@@ -691,6 +691,50 @@ class TypeChecker {
         return BYTESTRING;
       }
 
+      if (methodName === 'addOutput') {
+        if (this.contract.parentClass !== 'StatefulSmartContract') {
+          this.errors.push(makeDiagnostic(
+            `addOutput() is only available in StatefulSmartContract`,
+            'error',
+          ));
+          return VOID;
+        }
+        const mutableProps = this.contract.properties.filter(p => !p.readonly);
+        const expectedArgCount = 1 + mutableProps.length;
+        if (args.length !== expectedArgCount) {
+          this.errors.push(makeDiagnostic(
+            `addOutput() expects ${expectedArgCount} argument(s): satoshis + ${mutableProps.length} state value(s), got ${args.length}`,
+            'error',
+          ));
+        }
+        // Type-check: first arg = bigint (satoshis)
+        if (args.length >= 1) {
+          const satoshisType = this.inferExprType(args[0]!, env);
+          if (!isBigintFamily(satoshisType) && satoshisType !== '<unknown>') {
+            this.errors.push(makeDiagnostic(
+              `addOutput() first argument (satoshis) must be bigint, got '${satoshisType}'`,
+              'error',
+            ));
+          }
+        }
+        // Type-check: remaining args match mutable property types
+        for (let i = 0; i < mutableProps.length && i + 1 < args.length; i++) {
+          const argType = this.inferExprType(args[i + 1]!, env);
+          const propType = typeNodeToTType(mutableProps[i]!.type);
+          if (!isSubtype(argType, propType) && argType !== '<unknown>') {
+            this.errors.push(makeDiagnostic(
+              `addOutput() argument ${i + 2} (${mutableProps[i]!.name}) must be '${propType}', got '${argType}'`,
+              'error',
+            ));
+          }
+        }
+        // Infer remaining args
+        for (let i = expectedArgCount; i < args.length; i++) {
+          this.inferExprType(args[i]!, env);
+        }
+        return VOID;
+      }
+
       // Check contract method signatures
       const methodSig = this.methodSigs.get(methodName);
       if (methodSig) {

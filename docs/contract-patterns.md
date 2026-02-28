@@ -130,30 +130,52 @@ A simple fungible token where ownership can be transferred. The total supply is 
 import { StatefulSmartContract, assert, checkSig } from 'tsop-lang';
 import type { PubKey, Sig } from 'tsop-lang';
 
-class SimpleFungibleToken extends StatefulSmartContract {
+class FungibleToken extends StatefulSmartContract {
   owner: PubKey;           // stateful: current token owner
-  readonly supply: bigint; // immutable: total supply
+  balance: bigint;         // stateful: token balance in this UTXO
+  readonly tokenId: ByteString; // immutable: token identifier
 
-  constructor(owner: PubKey, supply: bigint) {
-    super(owner, supply);
+  constructor(owner: PubKey, balance: bigint, tokenId: ByteString) {
+    super(owner, balance, tokenId);
     this.owner = owner;
-    this.supply = supply;
+    this.balance = balance;
+    this.tokenId = tokenId;
   }
 
-  public transfer(sig: Sig, newOwner: PubKey) {
+  // Split: 1 input → 2 outputs (recipient + change)
+  public transfer(sig: Sig, to: PubKey, amount: bigint, outputSatoshis: bigint) {
     assert(checkSig(sig, this.owner));
-    this.owner = newOwner;
+    assert(amount > 0n);
+    assert(amount <= this.balance);
+
+    // addOutput(satoshis, owner, balance) — args match mutable props in order
+    this.addOutput(outputSatoshis, to, amount);
+    this.addOutput(outputSatoshis, this.owner, this.balance - amount);
+  }
+
+  // Simple send: 1 input → 1 output, full balance
+  public send(sig: Sig, to: PubKey, outputSatoshis: bigint) {
+    assert(checkSig(sig, this.owner));
+    this.addOutput(outputSatoshis, to, this.balance);
+  }
+
+  // Merge: N inputs → 1 output (each input calls this independently)
+  public merge(sig: Sig, totalBalance: bigint, outputSatoshis: bigint) {
+    assert(checkSig(sig, this.owner));
+    assert(totalBalance >= this.balance);
+    this.addOutput(outputSatoshis, this.owner, totalBalance);
   }
 }
 ```
 
 **How it works:**
 
-1. Only the current `owner` can transfer the token (verified by `checkSig`).
-2. `this.owner = newOwner` updates the state.
-3. The compiler auto-injects preimage verification and state continuation, ensuring the output UTXO carries the updated state (new owner).
+1. Each UTXO tracks an `owner` and a `balance` — the number of tokens it holds.
+2. **Split (transfer)**: The owner signs and specifies a recipient and amount. `addOutput` registers two outputs: one for the recipient with the transferred amount, and one for the sender with the remaining balance. The compiler verifies both outputs against the transaction's `hashOutputs`.
+3. **Send**: Transfers the full balance to a new owner in a single output.
+4. **Merge**: Multiple UTXOs can be combined. Each input independently verifies the same output (with `totalBalance`). Since all inputs check the same `hashOutputs`, they must agree — if any input lies about the total, the hash check fails.
 
-The `supply` is `readonly` and baked into the locking script at deploy time -- it cannot change across transfers.
+The `tokenId` is `readonly` and baked into the locking script at deploy time.
 
 ---
 
@@ -177,19 +199,20 @@ class SimpleNFT extends StatefulSmartContract {
     this.metadata = metadata;
   }
 
-  public transfer(sig: Sig, newOwner: PubKey) {
+  public transfer(sig: Sig, newOwner: PubKey, outputSatoshis: bigint) {
     assert(checkSig(sig, this.owner));
-    this.owner = newOwner;
+    // addOutput(satoshis, owner) — single mutable prop
+    this.addOutput(outputSatoshis, newOwner);
   }
 
   public burn(sig: Sig) {
     assert(checkSig(sig, this.owner));
-    // No state mutation = token is destroyed
+    // No addOutput and no state mutation = token destroyed
   }
 }
 ```
 
-**Key difference from FT:** The `burn` method does not modify any state. The compiler detects this and only injects the preimage check — no state continuation. The UTXO is spent without creating a new contract UTXO. The token ceases to exist.
+**Key difference from FT:** The NFT has a single mutable property (`owner`), so `addOutput` takes just satoshis and the new owner. The `burn` method uses neither `addOutput` nor direct state mutation, so the compiler only injects the preimage check — no state continuation. The token ceases to exist.
 
 ---
 

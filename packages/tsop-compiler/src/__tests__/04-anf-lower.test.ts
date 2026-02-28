@@ -634,6 +634,90 @@ describe('Pass 4: ANF Lower', () => {
       expect(txPreimageProps).toHaveLength(0);
     });
 
+    it('lowers this.addOutput() to add_output nodes', () => {
+      const source = `
+        class FT extends StatefulSmartContract {
+          owner: PubKey;
+          balance: bigint;
+          constructor(owner: PubKey, balance: bigint) {
+            super(owner, balance);
+            this.owner = owner;
+            this.balance = balance;
+          }
+          public transfer(to: PubKey, amount: bigint, sats: bigint) {
+            assert(amount > 0n);
+            this.addOutput(sats, to, amount);
+            this.addOutput(sats, this.owner, this.balance - amount);
+          }
+        }
+      `;
+      const program = lowerSource(source);
+      const method = findMethod(program, 'transfer');
+
+      const addOutputs = bindingsOfKind(method.body, 'add_output');
+      expect(addOutputs).toHaveLength(2);
+
+      // Each add_output has satoshis and stateValues
+      const first = addOutputs[0]!.value as { kind: 'add_output'; satoshis: string; stateValues: string[] };
+      expect(first.stateValues).toHaveLength(2);
+    });
+
+    it('injects multi-output continuation when addOutput is used', () => {
+      const source = `
+        class FT extends StatefulSmartContract {
+          owner: PubKey;
+          balance: bigint;
+          constructor(owner: PubKey, balance: bigint) {
+            super(owner, balance);
+            this.owner = owner;
+            this.balance = balance;
+          }
+          public transfer(to: PubKey, amount: bigint, sats: bigint) {
+            this.addOutput(sats, to, amount);
+            this.addOutput(sats, this.owner, this.balance - amount);
+          }
+        }
+      `;
+      const program = lowerSource(source);
+      const method = findMethod(program, 'transfer');
+
+      // Should have cat (to concatenate outputs), hash256, extractOutputHash, and final assert
+      const calls = bindingsOfKind(method.body, 'call');
+      const catCall = calls.find(b => (b.value as { func: string }).func === 'cat');
+      expect(catCall).toBeDefined();
+      const hash256Call = calls.find(b => (b.value as { func: string }).func === 'hash256');
+      expect(hash256Call).toBeDefined();
+      const extractCall = calls.find(b => (b.value as { func: string }).func === 'extractOutputHash');
+      expect(extractCall).toBeDefined();
+    });
+
+    it('does not inject single-output continuation when addOutput is used', () => {
+      const source = `
+        class FT extends StatefulSmartContract {
+          owner: PubKey;
+          balance: bigint;
+          constructor(owner: PubKey, balance: bigint) {
+            super(owner, balance);
+            this.owner = owner;
+            this.balance = balance;
+          }
+          public send(to: PubKey, sats: bigint) {
+            this.addOutput(sats, to, this.balance);
+          }
+        }
+      `;
+      const program = lowerSource(source);
+      const method = findMethod(program, 'send');
+
+      // Should NOT have get_state_script (uses addOutput instead)
+      const getStateScripts = bindingsOfKind(method.body, 'get_state_script');
+      expect(getStateScripts).toHaveLength(0);
+
+      // Should have add_output
+      const addOutputs = bindingsOfKind(method.body, 'add_output');
+      expect(addOutputs).toHaveLength(1);
+    });
+
     it('does not affect regular SmartContract methods', () => {
       const source = `
         class C extends SmartContract {

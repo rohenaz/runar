@@ -146,8 +146,21 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			// Lower the developer's method body
 			methodCtx.lowerStatements(method.Body)
 
-			// If the method mutates state, inject state continuation assertion at the end
-			if methodMutatesState(method, contract) {
+			// Determine state continuation type
+			addOutputRefs := methodCtx.getAddOutputRefs()
+			if len(addOutputRefs) > 0 {
+				// Multi-output continuation: concat all outputs, hash, compare to extractOutputHash
+				accumulated := addOutputRefs[0]
+				for i := 1; i < len(addOutputRefs); i++ {
+					accumulated = methodCtx.emit(makeCall("cat", []string{accumulated, addOutputRefs[i]}))
+				}
+				hashRef := methodCtx.emit(makeCall("hash256", []string{accumulated}))
+				preimageRef2 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+				outputHashRef := methodCtx.emit(makeCall("extractOutputHash", []string{preimageRef2}))
+				eqRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: hashRef, Right: outputHashRef, ResultType: "bytes"})
+				methodCtx.emit(makeAssert(eqRef))
+			} else if methodMutatesState(method, contract) {
+				// Single-output continuation (existing behavior)
 				stateScriptRef := methodCtx.emit(ir.ANFValue{Kind: "get_state_script"})
 				hashRef := methodCtx.emit(makeCall("hash256", []string{stateScriptRef}))
 				preimageRef2 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
@@ -204,11 +217,12 @@ func lowerParams(params []ParamNode) []ir.ANFParam {
 // ---------------------------------------------------------------------------
 
 type lowerCtx struct {
-	bindings   []ir.ANFBinding
-	counter    int
-	contract   *ContractNode
-	localNames map[string]bool // tracks variable names registered via addLocal
-	paramNames map[string]bool // tracks parameter names registered via addParam
+	bindings      []ir.ANFBinding
+	counter       int
+	contract      *ContractNode
+	localNames    map[string]bool // tracks variable names registered via addLocal
+	paramNames    map[string]bool // tracks parameter names registered via addParam
+	addOutputRefs []string        // tracks addOutput binding refs for multi-output continuation
 }
 
 func newLowerCtx(contract *ContractNode) *lowerCtx {
@@ -256,6 +270,16 @@ func (ctx *lowerCtx) addParam(name string) {
 // isParam checks if a name is a registered parameter.
 func (ctx *lowerCtx) isParam(name string) bool {
 	return ctx.paramNames[name]
+}
+
+// addOutputRef tracks an addOutput binding ref for multi-output continuation.
+func (ctx *lowerCtx) addOutputRef(ref string) {
+	ctx.addOutputRefs = append(ctx.addOutputRefs, ref)
+}
+
+// getAddOutputRefs returns all addOutput refs collected during lowering.
+func (ctx *lowerCtx) getAddOutputRefs() []string {
+	return ctx.addOutputRefs
 }
 
 // isProperty checks if a name is a contract property.
@@ -634,6 +658,26 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 		if len(e.Args) >= 1 {
 			preimageRef := ctx.lowerExprToRef(e.Args[0])
 			return ctx.emit(ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef})
+		}
+	}
+
+	// this.addOutput(satoshis, val1, val2, ...) -> special node
+	if pa, ok := callee.(PropertyAccessExpr); ok && pa.Property == "addOutput" {
+		argRefs := ctx.lowerArgs(e.Args)
+		satoshis := argRefs[0]
+		stateValues := argRefs[1:]
+		ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues})
+		ctx.addOutputRef(ref)
+		return ref
+	}
+	if me, ok := callee.(MemberExpr); ok {
+		if id, ok := me.Object.(Identifier); ok && id.Name == "this" && me.Property == "addOutput" {
+			argRefs := ctx.lowerArgs(e.Args)
+			satoshis := argRefs[0]
+			stateValues := argRefs[1:]
+			ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues})
+			ctx.addOutputRef(ref)
+			return ref
 		}
 	}
 

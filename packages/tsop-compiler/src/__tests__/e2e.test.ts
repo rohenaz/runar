@@ -494,6 +494,73 @@ describe('End-to-end: compile()', () => {
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // addOutput multi-output compilation
+  // ---------------------------------------------------------------------------
+
+  describe('addOutput compilation', () => {
+    it('compiles a FungibleToken with addOutput for splitting', () => {
+      const source = `
+        class FungibleToken extends StatefulSmartContract {
+          owner: PubKey;
+          balance: bigint;
+
+          constructor(owner: PubKey, balance: bigint) {
+            super(owner, balance);
+            this.owner = owner;
+            this.balance = balance;
+          }
+
+          public transfer(sig: Sig, to: PubKey, amount: bigint, sats: bigint) {
+            assert(checkSig(sig, this.owner));
+            assert(amount > 0n);
+            assert(amount <= this.balance);
+            this.addOutput(sats, to, amount);
+            this.addOutput(sats, this.owner, this.balance - amount);
+          }
+
+          public send(sig: Sig, to: PubKey, sats: bigint) {
+            assert(checkSig(sig, this.owner));
+            this.addOutput(sats, to, this.balance);
+          }
+
+          public merge(sig: Sig, totalBalance: bigint, sats: bigint) {
+            assert(checkSig(sig, this.owner));
+            assert(totalBalance >= this.balance);
+            this.addOutput(sats, this.owner, totalBalance);
+          }
+        }
+      `;
+      const result = compile(source);
+      expect(result.success).toBe(true);
+      expect(result.artifact).toBeDefined();
+      expect(result.artifact!.script.length).toBeGreaterThan(0);
+    });
+
+    it('ANF contains add_output nodes for methods using addOutput', () => {
+      const source = `
+        class FT extends StatefulSmartContract {
+          owner: PubKey;
+          balance: bigint;
+          constructor(owner: PubKey, balance: bigint) {
+            super(owner, balance);
+            this.owner = owner;
+            this.balance = balance;
+          }
+          public transfer(to: PubKey, amount: bigint, sats: bigint) {
+            this.addOutput(sats, to, amount);
+            this.addOutput(sats, this.owner, this.balance - amount);
+          }
+        }
+      `;
+      const result = compile(source);
+      expect(result.success).toBe(true);
+      const transfer = result.anf!.methods.find(m => m.name === 'transfer')!;
+      const addOutputs = transfer.body.filter(b => b.value.kind === 'add_output');
+      expect(addOutputs).toHaveLength(2);
+    });
+  });
+
   describe('complex expression compilation', () => {
     it('compiles nested binary expressions', () => {
       const source = `

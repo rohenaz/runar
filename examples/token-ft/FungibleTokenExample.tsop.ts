@@ -1,21 +1,41 @@
 import { StatefulSmartContract, assert, checkSig } from 'tsop-lang';
-import type { PubKey, Sig } from 'tsop-lang';
+import type { PubKey, Sig, ByteString } from 'tsop-lang';
 
-class SimpleFungibleToken extends StatefulSmartContract {
-  owner: PubKey;          // stateful: current token owner
-  readonly supply: bigint; // immutable: total supply
+class FungibleToken extends StatefulSmartContract {
+  owner: PubKey;           // stateful: current token owner
+  balance: bigint;         // stateful: token balance in this UTXO
+  readonly tokenId: ByteString; // immutable: token identifier
 
-  constructor(owner: PubKey, supply: bigint) {
-    super(owner, supply);
+  constructor(owner: PubKey, balance: bigint, tokenId: ByteString) {
+    super(owner, balance, tokenId);
     this.owner = owner;
-    this.supply = supply;
+    this.balance = balance;
+    this.tokenId = tokenId;
   }
 
-  public transfer(sig: Sig, newOwner: PubKey) {
-    // Only current owner can transfer
+  // Split: 1 input → 2 outputs (recipient + change)
+  public transfer(sig: Sig, to: PubKey, amount: bigint, outputSatoshis: bigint) {
+    assert(checkSig(sig, this.owner));
+    assert(amount > 0n);
+    assert(amount <= this.balance);
+
+    // addOutput(satoshis, owner, balance) — args match mutable props in order
+    this.addOutput(outputSatoshis, to, amount);
+    this.addOutput(outputSatoshis, this.owner, this.balance - amount);
+  }
+
+  // Simple send: 1 input → 1 output, full balance
+  public send(sig: Sig, to: PubKey, outputSatoshis: bigint) {
     assert(checkSig(sig, this.owner));
 
-    // Update owner
-    this.owner = newOwner;
+    this.addOutput(outputSatoshis, to, this.balance);
+  }
+
+  // Merge: N inputs → 1 output (each input calls this independently)
+  public merge(sig: Sig, totalBalance: bigint, outputSatoshis: bigint) {
+    assert(checkSig(sig, this.owner));
+    assert(totalBalance >= this.balance);
+
+    this.addOutput(outputSatoshis, this.owner, totalBalance);
   }
 }

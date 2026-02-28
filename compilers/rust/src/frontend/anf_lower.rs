@@ -98,8 +98,37 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             // Lower the developer's method body
             lower_statements(&method.body, &mut method_ctx);
 
-            // If the method mutates state, inject state continuation assertion at the end
-            if method_mutates_state(method, contract) {
+            // Determine state continuation type
+            let add_output_refs = method_ctx.add_output_refs.clone();
+            if !add_output_refs.is_empty() {
+                // Multi-output continuation: concat all outputs, hash, compare to extractOutputHash
+                let mut accumulated = add_output_refs[0].clone();
+                for i in 1..add_output_refs.len() {
+                    accumulated = method_ctx.emit(ANFValue::Call {
+                        func: "cat".to_string(),
+                        args: vec![accumulated, add_output_refs[i].clone()],
+                    });
+                }
+                let hash_ref = method_ctx.emit(ANFValue::Call {
+                    func: "hash256".to_string(),
+                    args: vec![accumulated],
+                });
+                let preimage_ref2 = method_ctx.emit(ANFValue::LoadParam {
+                    name: "txPreimage".to_string(),
+                });
+                let output_hash_ref = method_ctx.emit(ANFValue::Call {
+                    func: "extractOutputHash".to_string(),
+                    args: vec![preimage_ref2],
+                });
+                let eq_ref = method_ctx.emit(ANFValue::BinOp {
+                    op: "===".to_string(),
+                    left: hash_ref,
+                    right: output_hash_ref,
+                    result_type: Some("bytes".to_string()),
+                });
+                method_ctx.emit(ANFValue::Assert { value: eq_ref });
+            } else if method_mutates_state(method, contract) {
+                // Single-output continuation (existing behavior)
                 let state_script_ref = method_ctx.emit(ANFValue::GetStateScript {});
                 let hash_ref = method_ctx.emit(ANFValue::Call {
                     func: "hash256".to_string(),
@@ -174,6 +203,7 @@ struct LoweringContext<'a> {
     contract: &'a ContractNode,
     param_names: HashSet<String>,
     local_names: HashSet<String>,
+    add_output_refs: Vec<String>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -184,6 +214,7 @@ impl<'a> LoweringContext<'a> {
             contract,
             param_names: HashSet::new(),
             local_names: HashSet::new(),
+            add_output_refs: Vec::new(),
         }
     }
 
@@ -241,6 +272,9 @@ impl<'a> LoweringContext<'a> {
         sub.counter = self.counter;
         sub.param_names = self.param_names.clone();
         sub.local_names = self.local_names.clone();
+        // Note: add_output_refs is NOT propagated to sub-contexts
+        // because addOutput calls in sub-blocks should flow up to
+        // the parent context via explicit tracking.
         sub
     }
 
@@ -669,6 +703,31 @@ fn lower_call_expr(
                 return ctx.emit(ANFValue::CheckPreimage {
                     preimage: preimage_ref,
                 });
+            }
+        }
+    }
+
+    // this.addOutput(satoshis, val1, val2, ...) -> special node (via PropertyAccess)
+    if let Expression::PropertyAccess { property } = callee {
+        if property == "addOutput" {
+            let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+            let satoshis = arg_refs.first().cloned().unwrap_or_default();
+            let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
+            let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values });
+            ctx.add_output_refs.push(r.clone());
+            return r;
+        }
+    }
+    // this.addOutput(satoshis, val1, val2, ...) -> special node (via MemberExpr with this)
+    if let Expression::MemberExpr { object, property } = callee {
+        if let Expression::Identifier { name } = object.as_ref() {
+            if name == "this" && property == "addOutput" {
+                let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+                let satoshis = arg_refs.first().cloned().unwrap_or_default();
+                let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
+                let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values });
+                ctx.add_output_refs.push(r.clone());
+                return r;
             }
         }
     }

@@ -13,14 +13,15 @@ class SimpleNFT extends StatefulSmartContract {
     this.metadata = metadata;
   }
 
-  public transfer(sig: Sig, newOwner: PubKey) {
+  public transfer(sig: Sig, newOwner: PubKey, outputSatoshis: bigint) {
     assert(checkSig(sig, this.owner));
-    this.owner = newOwner;
+    // addOutput(satoshis, owner) — single mutable prop
+    this.addOutput(outputSatoshis, newOwner);
   }
 
   public burn(sig: Sig) {
     // Only owner can burn
     assert(checkSig(sig, this.owner));
-    // No state mutation = token destroyed
+    // No addOutput and no state mutation = token destroyed
   }
 }

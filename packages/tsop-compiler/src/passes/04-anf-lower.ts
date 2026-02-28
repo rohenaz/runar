@@ -94,8 +94,21 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       // Lower the developer's method body
       lowerStatements(method.body, methodCtx);
 
-      // If the method mutates state, inject state continuation assertion at the end
-      if (methodMutatesState(method, contract)) {
+      // Determine state continuation type
+      const addOutputRefs = methodCtx.getAddOutputRefs();
+      if (addOutputRefs.length > 0) {
+        // Multi-output continuation: concat all outputs, hash, compare to extractOutputHash
+        let accumulated = addOutputRefs[0]!;
+        for (let i = 1; i < addOutputRefs.length; i++) {
+          accumulated = methodCtx.emit({ kind: 'call', func: 'cat', args: [accumulated, addOutputRefs[i]!] });
+        }
+        const hashRef = methodCtx.emit({ kind: 'call', func: 'hash256', args: [accumulated] });
+        const preimageRef2 = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
+        const outputHashRef = methodCtx.emit({ kind: 'call', func: 'extractOutputHash', args: [preimageRef2] });
+        const eqRef = methodCtx.emit({ kind: 'bin_op', op: '===', left: hashRef, right: outputHashRef, result_type: 'bytes' });
+        methodCtx.emit({ kind: 'assert', value: eqRef });
+      } else if (methodMutatesState(method, contract)) {
+        // Single-output continuation (existing behavior)
         const stateScriptRef = methodCtx.emit({ kind: 'get_state_script' });
         const hashRef = methodCtx.emit({ kind: 'call', func: 'hash256', args: [stateScriptRef] });
         const preimageRef2 = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
@@ -147,6 +160,7 @@ class LoweringContext {
   private readonly contract: ContractNode;
   private readonly paramNames: Set<string> = new Set();
   private readonly localNames: Set<string> = new Set();
+  private readonly _addOutputRefs: string[] = [];
 
   constructor(contract: ContractNode) {
     this.contract = contract;
@@ -189,6 +203,16 @@ class LoweringContext {
 
   isProperty(name: string): boolean {
     return this.contract.properties.some(p => p.name === name);
+  }
+
+  /** Track an addOutput binding ref for multi-output continuation. */
+  addOutputRef(ref: string): void {
+    this._addOutputRefs.push(ref);
+  }
+
+  /** Get all addOutput refs collected during lowering. */
+  getAddOutputRefs(): string[] {
+    return this._addOutputRefs;
   }
 
   /** Look up the type of a method parameter by name. Returns the type string or null. */
@@ -584,6 +608,16 @@ function lowerCallExpr(
       const preimageRef = lowerExprToRef(expr.args[0]!, ctx);
       return ctx.emit({ kind: 'check_preimage', preimage: preimageRef });
     }
+  }
+
+  // this.addOutput(satoshis, val1, val2, ...) -> special node
+  if (callee.kind === 'property_access' && callee.property === 'addOutput') {
+    const argRefs = expr.args.map(arg => lowerExprToRef(arg, ctx));
+    const satoshis = argRefs[0]!;
+    const stateValues = argRefs.slice(1);
+    const ref = ctx.emit({ kind: 'add_output', satoshis, stateValues });
+    ctx.addOutputRef(ref);
+    return ref;
   }
 
   // this.getStateScript() -> special node

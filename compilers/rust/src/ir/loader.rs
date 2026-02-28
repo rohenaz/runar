@@ -39,6 +39,7 @@ const KNOWN_KINDS: &[&str] = &[
     "update_prop",
     "get_state_script",
     "check_preimage",
+    "add_output",
 ];
 
 fn kind_name(value: &ANFValue) -> &'static str {
@@ -56,6 +57,7 @@ fn kind_name(value: &ANFValue) -> &'static str {
         ANFValue::UpdateProp { .. } => "update_prop",
         ANFValue::GetStateScript { .. } => "get_state_script",
         ANFValue::CheckPreimage { .. } => "check_preimage",
+        ANFValue::AddOutput { .. } => "add_output",
     }
 }
 

@@ -239,4 +239,27 @@ export abstract class StatefulSmartContract extends SmartContract {
    * ```
    */
   protected readonly txPreimage!: SigHashPreimageType;
+
+  /**
+   * Register a transaction output with custom state values.
+   *
+   * Each call adds one output to the transaction. At method exit, the
+   * compiler verifies that all registered outputs match the transaction's
+   * `hashOutputs` field.
+   *
+   * Arguments after `satoshis` correspond to the mutable (non-readonly)
+   * properties **in declaration order**.
+   *
+   * ```ts
+   * // For a contract with mutable props [owner: PubKey, balance: bigint]:
+   * this.addOutput(satoshis, recipientPubKey, amount);
+   * this.addOutput(satoshis, this.owner, this.balance - amount);
+   * ```
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  protected addOutput(_satoshis: bigint, ..._stateValues: unknown[]): void {
+    throw new Error(
+      'StatefulSmartContract.addOutput() cannot be called at runtime — compile this contract.',
+    );
+  }
 }
