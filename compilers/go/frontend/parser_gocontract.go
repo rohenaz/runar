@@ -190,6 +190,44 @@ func (p *goContractParser) extractContract() *ContractNode {
 		})
 	}
 
+	// Find standalone (non-method) functions — treated as private helpers.
+	// These are package-level functions without a receiver, e.g.:
+	//   func testInternal(amount tsop.Bigint) tsop.Bigint { ... }
+	// They become private methods with no access to contract state.
+	for _, decl := range p.file.Decls {
+		funcDecl, ok := decl.(*ast.FuncDecl)
+		if !ok || funcDecl.Recv != nil {
+			continue // skip methods (already handled above)
+		}
+		// Skip the package-level init() or main() functions
+		if funcDecl.Name.Name == "init" || funcDecl.Name.Name == "main" {
+			continue
+		}
+		// Standalone functions must be unexported (private helpers)
+		if funcDecl.Name.IsExported() {
+			continue
+		}
+
+		methodName := goFieldToCamel(funcDecl.Name.Name)
+		p.receiverName = "" // no receiver for standalone functions
+
+		params := p.extractParams(funcDecl.Type.Params)
+		body := p.extractStatements(funcDecl.Body)
+
+		pos := p.fset.Position(funcDecl.Pos())
+		methods = append(methods, MethodNode{
+			Name:       methodName,
+			Params:     params,
+			Body:       body,
+			Visibility: "private",
+			SourceLocation: SourceLocation{
+				File:   p.fileName,
+				Line:   pos.Line,
+				Column: pos.Column,
+			},
+		})
+	}
+
 	// Build constructor
 	constructorParams := make([]ParamNode, len(properties))
 	for i, prop := range properties {

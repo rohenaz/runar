@@ -42,3 +42,7 @@ path = "oracle-price/OraclePriceFeed_test.rs"
 [[test]]
 name = "math_demo"
 path = "math-demo/MathDemo_test.rs"
+
+[[test]]
+name = "function_patterns"
+path = "function-patterns/FunctionPatterns_test.rs"
