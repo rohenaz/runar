@@ -1,6 +1,6 @@
-# TSOP -- TypeScript Smart Contract Operations Protocol
+# TSOP -- Smart Contract Operations Protocol for Bitcoin
 
-**Production-grade TypeScript DSL that compiles to Bitcoin Script for BSV.**
+**Write Bitcoin smart contracts in TypeScript, Go, Rust, Solidity, or Move. Compile to Bitcoin Script.**
 
 <!-- Badges -->
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
@@ -9,28 +9,16 @@
 
 ---
 
-## Overview
+## Write Once, Compile Anywhere
 
-TSOP is a compiler toolchain that lets you write Bitcoin SV smart contracts in a strict subset of TypeScript and compiles them to raw Bitcoin Script. Contracts are valid TypeScript files -- they type-check with `tsc`, get full IDE support, and run through a purpose-built nanopass compiler that produces the exact opcodes the BSV virtual machine executes.
+TSOP lets you write Bitcoin SV smart contracts in the language you already know. All formats compile through the same pipeline and produce identical Bitcoin Script.
 
-The project exists because Bitcoin Script development today forces a choice between two bad options: hand-writing opcodes (error-prone, unauditable) or adopting a framework with heavy decorator-based DSLs that obscure what is actually happening on-chain. TSOP takes a different path.
+<table>
+<tr>
+<td>
 
-### Key Design Principles
-
-| Aspect | TSOP Approach |
-|---|---|
-| **Syntax style** | Native TypeScript keywords (`readonly`, `public`) -- no decorators |
-| **Compiler count** | 3 planned (TS reference, Go, Rust) |
-| **Compiler architecture** | Nanopass (6 passes, each ~100-200 lines) |
-| **UTXO safety** | Affine types (compile-time guarantee) |
-| **Correctness strategy** | Differential testing + reference interpreter oracle |
-| **IR format** | Canonical JSON (RFC 8785), cross-compiler conformance boundary |
-
-### Quick Example
-
+**TypeScript**
 ```typescript
-import { SmartContract, assert, PubKey, Sig, Addr, hash160, checkSig } from 'tsop-lang';
-
 class P2PKH extends SmartContract {
   readonly pubKeyHash: Addr;
 
@@ -45,59 +33,205 @@ class P2PKH extends SmartContract {
   }
 }
 ```
+</td>
+<td>
 
-This compiles to the standard P2PKH script: `OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`.
+**Go**
+```go
+type P2PKH struct {
+    tsop.SmartContract
+    PubKeyHash tsop.Addr `tsop:"readonly"`
+}
+
+func (c *P2PKH) Unlock(sig tsop.Sig, pubKey tsop.PubKey) {
+    tsop.Assert(tsop.Hash160(pubKey) == c.PubKeyHash)
+    tsop.Assert(tsop.CheckSig(sig, pubKey))
+}
+```
+</td>
+</tr>
+<tr>
+<td>
+
+**Rust**
+```rust
+#[tsop::contract]
+pub struct P2PKH {
+    #[readonly]
+    pub pub_key_hash: Addr,
+}
+
+#[tsop::methods(P2PKH)]
+impl P2PKH {
+    #[public]
+    pub fn unlock(&self, sig: &Sig, pub_key: &PubKey) {
+        assert!(hash160(pub_key) == self.pub_key_hash);
+        assert!(check_sig(sig, pub_key));
+    }
+}
+```
+</td>
+<td>
+
+**Solidity-like**
+```solidity
+pragma tsop ^0.1.0;
+
+contract P2PKH is SmartContract {
+    Addr immutable pubKeyHash;
+
+    constructor(Addr _pubKeyHash) {
+        pubKeyHash = _pubKeyHash;
+    }
+
+    function unlock(Sig sig, PubKey pubKey) public {
+        require(hash160(pubKey) == pubKeyHash);
+        require(checkSig(sig, pubKey));
+    }
+}
+```
+</td>
+</tr>
+</table>
+
+All four produce the same Bitcoin Script: `OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`
+
+---
+
+## Why TSOP?
+
+Bitcoin Script development today forces a choice between hand-writing opcodes (error-prone, unauditable) or adopting a framework with heavy decorator-based DSLs that obscure what happens on-chain. TSOP takes a different path:
+
+- **No decorators** — uses native language keywords (`readonly`, `public`, `immutable`, `#[readonly]`)
+- **Write in your language** — TypeScript, Go, Rust, Solidity-like, or Move-style
+- **Test natively** — `vitest` for TS, `go test` for Go, `cargo test` for Rust
+- **Three compilers** — TypeScript (reference), Go, Rust — all produce byte-identical output
+- **Nanopass architecture** — 6 small passes, each auditable in a single sitting
+- **Full IDE support** — type checking, autocompletion, go-to-definition in every language
 
 ---
 
 ## Quick Start
 
-### Installation
+### TypeScript
 
 ```bash
 pnpm add tsop-lang tsop-compiler tsop-cli
+tsop compile MyContract.tsop.ts    # => artifacts/MyContract.json
 ```
 
-### Create a Contract
+### Go
 
-Create `MyContract.tsop.ts`:
+```bash
+# In your go.mod, add: require tsop v0.0.0
+# Contracts are real Go — test with go test, compile with the TSOP Go compiler
+go test ./...
+```
 
+### Rust
+
+```bash
+# In Cargo.toml: tsop = { path = "..." }
+# Contracts are real Rust — test with cargo test, compile with the TSOP Rust compiler
+cargo test
+```
+
+---
+
+## Test Your Contracts
+
+Every contract format has native testing support. Business logic tests run the contract as real code in the host language. TSOP compile checks verify the contract will produce valid Bitcoin Script.
+
+**TypeScript** (vitest):
 ```typescript
-import { SmartContract, assert, PubKey, Sig, Addr, hash160, checkSig } from 'tsop-lang';
+import { TestContract } from 'tsop-testing';
 
-class MyContract extends SmartContract {
-  readonly pubKeyHash: Addr;
+const counter = TestContract.fromSource(source, { count: 0n });
+counter.call('increment');
+expect(counter.state.count).toBe(1n);
+```
 
-  constructor(pubKeyHash: Addr) {
-    super(pubKeyHash);
-    this.pubKeyHash = pubKeyHash;
-  }
+**Go** (go test):
+```go
+func TestCounter_Increment(t *testing.T) {
+    c := &Counter{Count: 0}
+    c.Increment()
+    if c.Count != 1 { t.Errorf("expected 1, got %d", c.Count) }
+}
 
-  public unlock(sig: Sig, pubKey: PubKey) {
-    assert(hash160(pubKey) === this.pubKeyHash);
-    assert(checkSig(sig, pubKey));
-  }
+func TestCounter_Compile(t *testing.T) {
+    if err := tsop.CompileCheck("Counter.tsop.go"); err != nil {
+        t.Fatalf("TSOP compile check failed: %v", err)
+    }
 }
 ```
 
-### Compile
+**Rust** (cargo test):
+```rust
+#[path = "Counter.tsop.rs"]
+mod contract;
+use contract::*;
 
-```bash
-tsop compile MyContract.tsop.ts
-# => artifacts/MyContract.json
+#[test]
+fn test_increment() {
+    let mut c = Counter { count: 0 };
+    c.increment();
+    assert_eq!(c.count, 1);
+}
+
+#[test]
+fn test_compile() {
+    tsop::compile_check(include_str!("Counter.tsop.rs"), "Counter.tsop.rs").unwrap();
+}
 ```
 
-### Test
+---
 
-```bash
-tsop test
+## Supported Formats
+
+| Format | Extension | Compilers | IDE Support | Status |
+|--------|-----------|-----------|-------------|--------|
+| TypeScript | `.tsop.ts` | TS, Go, Rust | Full (`tsc`) | **Stable** |
+| Go | `.tsop.go` | Go | Full (`gopls`) | Experimental |
+| Rust DSL | `.tsop.rs` | Rust | Full (`rust-analyzer`) | Experimental |
+| Solidity-like | `.tsop.sol` | TS, Go, Rust | Syntax highlighting | Experimental |
+| Move-style | `.tsop.move` | TS, Go, Rust | Syntax highlighting | Experimental |
+
+All formats parse into the same `ContractNode` AST. From there, the pipeline is identical:
+
+```
+  .tsop.ts ──┐
+  .tsop.sol ──┤
+  .tsop.move ─┼──► ContractNode AST ──► Validate ──► TypeCheck ──► ANF ──► Stack ──► Bitcoin Script
+  .tsop.go ───┤
+  .tsop.rs ───┘
 ```
 
-### Deploy
+---
 
-```bash
-tsop deploy ./artifacts/MyContract.json --network testnet --key <wif>
-# => Deployed: txid abc123...
+## Example Contracts
+
+8 example contracts demonstrate all major patterns, each available in all supported formats:
+
+| Contract | Pattern | Stateful | Multi-method |
+|----------|---------|----------|-------------|
+| [P2PKH](examples/ts/p2pkh/) | Pay-to-Public-Key-Hash | No | No |
+| [Escrow](examples/ts/escrow/) | Multi-party authorization | No | Yes (4 paths) |
+| [Counter](examples/ts/stateful-counter/) | Stateful state machine | Yes | Yes |
+| [Auction](examples/ts/auction/) | Bidding with deadline | Yes | Yes |
+| [CovenantVault](examples/ts/covenant-vault/) | Spending constraints | No | No |
+| [OraclePriceFeed](examples/ts/oracle-price/) | Rabin signature oracle | No | No |
+| [FungibleToken](examples/ts/token-ft/) | Token with split/merge | Yes | Yes (3 paths) |
+| [SimpleNFT](examples/ts/token-nft/) | NFT with transfer/burn | Yes | Yes |
+
+Each contract has tests in TypeScript, Go, Rust, Solidity, and Move:
+```
+examples/
+  ts/p2pkh/          P2PKH.tsop.ts + P2PKH.test.ts
+  go/p2pkh/          P2PKH.tsop.go + P2PKH_test.go
+  rust/p2pkh/        P2PKH.tsop.rs + P2PKH_test.rs
+  sol/p2pkh/         P2PKH.tsop.sol + P2PKH.test.ts
+  move/p2pkh/        P2PKH.tsop.move + P2PKH.test.ts
 ```
 
 ---
@@ -106,415 +240,71 @@ tsop deploy ./artifacts/MyContract.json --network testnet --key <wif>
 
 ### Compilation Pipeline
 
-```
-                         TSOP Compilation Pipeline
- ___________________________________________________________________________
-|                                                                           |
-|   .tsop.ts -----> [Parse] -----> [Validate] -----> [Type-check]          |
-|   source          Pass 1          Pass 2             Pass 3               |
-|                  ts-morph        constraints         affine types          |
-|                  extracts        & linting            & builtins           |
-|                  TSOP AST                                                 |
-|                                                                           |
-|              TSOP AST          Validated AST       Typed AST              |
-|                   |                 |                  |                   |
-|                   v                 v                  v                   |
-|                                                                           |
-|             [ANF Lower] -----> [Stack Lower] -----> [Emit]               |
-|              Pass 4              Pass 5              Pass 6               |
-|              flatten to         map names to         encode opcodes        |
-|              ANF IR             stack positions      & push data           |
-|                                                                           |
-|              ANF IR             Stack IR             Bitcoin Script        |
-|              (canonical         (stack offsets,       (hex-encoded         |
-|               JSON)              alt-stack)            byte string)        |
-|___________________________________________________________________________|
+The compiler is structured as six small, composable nanopass transforms. Each pass does one thing, transforms one IR into the next, and is small enough to audit in a single sitting.
 
-                        ^                        |
-                        |    Canonical IR         |
-                        |    conformance          |
-                        |    boundary             |
-                        |                         v
+| Pass | Name | Input | Output |
+|------|------|-------|--------|
+| 1 | **Parse** | Source (any format) | TSOP AST |
+| 2 | **Validate** | TSOP AST | Validated AST |
+| 3 | **Type-check** | Validated AST | Typed AST |
+| 4 | **ANF Lower** | Typed AST | ANF IR |
+| 5 | **Stack Lower** | ANF IR | Stack IR |
+| 6 | **Emit** | Stack IR | Bitcoin Script |
 
-                  [Go Compiler]            [Rust Compiler]
-                   tree-sitter              SWC frontend
-                   frontend                 (Phase 2)
-                   (Phase 2)
-```
-
-### The Nanopass Approach
-
-The compiler is structured as six small, composable passes. Each pass does one thing, transforms one IR into the next, and is small enough to audit in a single sitting. This is based on the nanopass framework by Sarkar, Waddell & Dybvig (ICFP 2004).
-
-| Pass | Name | Input | Output | Lines (~) |
-|------|------|-------|--------|-----------|
-| 1 | **Parse** | `.tsop.ts` source | TSOP AST | ~150 |
-| 2 | **Validate** | TSOP AST | Validated AST | ~120 |
-| 3 | **Type-check** | Validated AST | Typed AST | ~200 |
-| 4 | **ANF Lower** | Typed AST | ANF IR | ~180 |
-| 5 | **Stack Lower** | ANF IR | Stack IR | ~160 |
-| 6 | **Emit** | Stack IR | Bitcoin Script | ~100 |
-
-The alternative -- a monolithic compiler -- makes it nearly impossible to verify that each transformation is correct in isolation. With nanopass, you can unit-test pass 4 without caring about passes 1-3, and you can swap out pass 1 entirely (as the Go and Rust compilers do) while keeping passes 4-6.
-
-### Why ANF over CPS or SSA
-
-The intermediate representation between the typed AST and the stack machine is **Administrative Normal Form** (ANF). In ANF, every sub-expression is bound to a named temporary -- there are no nested expressions.
-
-We chose ANF over the alternatives for specific reasons:
-
-- **ANF vs CPS**: CPS (continuation-passing style) encodes control flow as function calls. Bitcoin Script has no functions, no call stack, and no closures. CPS would introduce abstractions that have no counterpart in the target. ANF keeps control flow explicit (`if`/`loop` nodes) which maps directly to `OP_IF`/`OP_ELSE`/`OP_ENDIF`.
-
-- **ANF vs SSA**: SSA (static single assignment) requires phi-nodes at control flow join points. Phi-nodes are the standard choice for register-based targets, but Bitcoin Script is a stack machine. The stack scheduling pass (Pass 5) needs to know the evaluation order of every value, and ANF provides this directly -- the sequence of bindings IS the evaluation order. SSA would require a separate linearization step.
-
-- **ANF vs raw AST**: Nested expressions in an AST create ambiguity about where intermediate values live during stack scheduling. ANF eliminates this by naming every intermediate result, which makes the stack layout deterministic and auditable.
+The optimizer (constant folding + dead binding elimination) runs between passes 4 and 5.
 
 ### Multi-Compiler Strategy
 
-TSOP defines a **canonical IR conformance boundary** at the ANF level. Any compiler that produces byte-identical ANF IR (serialized via RFC 8785 / JCS) for a given source file is conformant. This means:
+TSOP defines a **canonical IR conformance boundary** at the ANF level. Any compiler that produces byte-identical ANF IR for a given source file is conformant:
 
-1. The **TypeScript reference compiler** (this repo) is the source of truth.
-2. A **Go compiler** consumes the same `.tsop.ts` files and must produce identical ANF IR.
-3. A **Rust compiler** does the same.
+- The **TypeScript compiler** is the reference implementation
+- The **Go compiler** produces identical output for all 8 example contracts
+- The **Rust compiler** produces identical output for all 8 example contracts
 
-The conformance suite in `conformance/` contains golden-file tests: source programs paired with expected ANF IR and expected script output. All three compilers must pass the same suite.
+The conformance suite in `conformance/` contains golden-file tests. All three compilers must pass the same suite.
 
-Why multiple compilers? Different deployment contexts demand different toolchains. A Go binary integrates into existing BSV node infrastructure. A Rust binary enables WASM compilation for in-browser contract authoring. The TypeScript compiler serves as the readable reference and the day-one production tool.
+### Contract Model
 
----
+- `SmartContract` — stateless, all properties `readonly`
+- `StatefulSmartContract` — mutable state carried across transactions via OP_PUSH_TX
+- `this.addOutput(satoshis, ...values)` — multi-output intrinsic for token splitting/merging
+- Only TSOP built-in functions are allowed — the compiler rejects arbitrary function calls
 
-## Language Design
+### Language Subset
 
-### No Decorators
+Only a strict subset of each language is valid TSOP. The compiler enforces this at parse, validate, and typecheck time:
 
-TSOP uses TypeScript's own keywords to define contract structure, not decorators:
+**Allowed:** Class/struct declarations, readonly/mutable properties, public/private methods, const/let variables, if/else, bounded for loops, arithmetic/comparison/logical/bitwise operators, ternary expressions, TSOP built-in function calls.
 
-| TSOP Keyword | Meaning |
-|---|---|
-| _(plain property)_ | All class properties are contract state |
-| `readonly` | Immutable property (embedded in script at deploy time) |
-| `public` / `private` | Method visibility -- `public` marks a spending entry point, `private` marks an inlined helper |
-
-Decorators are runtime metadata in TypeScript. They have no standard compile-time semantics, they require experimental compiler flags or `ts-patch`, and they obscure what the compiler actually does with the annotated member. TSOP avoids them entirely and instead uses keywords that `tsc` already understands, so IDE features (go-to-definition, refactoring, error squiggles) work without plugins.
-
-### Allowed TypeScript Subset
-
-TSOP accepts a strict subset of TypeScript. This is by design -- Bitcoin Script has no heap, no closures, no dynamic dispatch, and no unbounded loops. The subset reflects these constraints:
-
-**Allowed:**
-- Class declarations extending `SmartContract`
-- `readonly` and mutable properties
-- `public` and `private` methods
-- `const` / `let` variable declarations
-- `if` / `else` statements
-- Bounded `for` loops (compile-time constant bound)
-- Arithmetic, comparison, logical, and bitwise operators
-- Ternary expressions
-- Built-in function calls
-
-**Disallowed (with rationale):**
-- `while` / `do-while` -- no unbounded loops in Script
-- Recursion -- requires unbounded stack
-- `async` / `await` -- no asynchrony on-chain
-- Closures / arrow functions -- no heap-allocated environments
-- `try` / `catch` -- Script has no exception model
-- `any` / `unknown` -- defeats static analysis
-- Dynamic arrays (`T[]`) -- no heap allocation
-- `number` -- ambiguous precision; use `bigint`
-- Arbitrary imports -- sandboxed compilation
-
-### Domain Types
-
-All values in Bitcoin Script are byte strings or integers. TSOP provides branded types that enforce size and semantic constraints at compile time:
-
-| Type | Bytes | Description |
-|---|---|---|
-| `bigint` | variable | Arbitrary-precision integer (Script number encoding) |
-| `boolean` | 0-1 | `OP_TRUE` or `OP_FALSE` |
-| `ByteString` | variable | Raw byte sequence |
-| `PubKey` | 33 | Compressed secp256k1 public key |
-| `Sig` | 71-73 | DER-encoded ECDSA signature + sighash byte |
-| `Sha256` | 32 | SHA-256 digest |
-| `Ripemd160` | 20 | RIPEMD-160 digest |
-| `Addr` | 20 | Bitcoin address (Hash160 of pubkey) |
-| `SigHashPreimage` | variable | Transaction sighash preimage for OP_PUSH_TX |
-| `RabinSig` | variable | Rabin signature (large integer) |
-| `RabinPubKey` | variable | Rabin public key (large integer) |
-| `FixedArray<T, N>` | N * sizeof(T) | Compile-time fixed-size array |
-
-These are implemented as TypeScript branded types (nominal types via unique symbols), so `tsc` itself catches misuse like passing a `Sha256` where a `PubKey` is expected.
-
-### Built-in Functions
-
-| Function | Signature | Script Opcode(s) |
-|---|---|---|
-| `assert` | `(cond: boolean) => void` | `OP_VERIFY` |
-| `checkSig` | `(sig: Sig, pk: PubKey) => boolean` | `OP_CHECKSIG` |
-| `checkMultiSig` | `(sigs: Sig[], pks: PubKey[]) => boolean` | `OP_CHECKMULTISIG` |
-| `hash256` | `(data: ByteString) => Sha256` | `OP_HASH256` |
-| `hash160` | `(data: ByteString) => Ripemd160` | `OP_HASH160` |
-| `sha256` | `(data: ByteString) => Sha256` | `OP_SHA256` |
-| `ripemd160` | `(data: ByteString) => Ripemd160` | `OP_RIPEMD160` |
-| `len` | `(data: ByteString) => bigint` | `OP_SIZE` |
-| `pack` | `(n: bigint) => ByteString` | `OP_NUM2BIN` |
-| `unpack` | `(data: ByteString) => bigint` | `OP_BIN2NUM` |
-| `abs` | `(n: bigint) => bigint` | `OP_ABS` |
-| `min` | `(a: bigint, b: bigint) => bigint` | `OP_MIN` |
-| `max` | `(a: bigint, b: bigint) => bigint` | `OP_MAX` |
-| `within` | `(x: bigint, lo: bigint, hi: bigint) => boolean` | `OP_WITHIN` |
-| `exit` | `(success: boolean) => void` | `OP_RETURN` |
-
----
-
-## Contract Patterns
-
-### Stateless Contracts
-
-Stateless contracts have only `readonly` properties. Their spending conditions are fixed at deployment time.
-
-**Pay-to-Public-Key-Hash (P2PKH):**
-
-```typescript
-class P2PKH extends SmartContract {
-  readonly pubKeyHash: Addr;
-
-  constructor(pubKeyHash: Addr) {
-    super(pubKeyHash);
-    this.pubKeyHash = pubKeyHash;
-  }
-
-  public unlock(sig: Sig, pubKey: PubKey) {
-    assert(hash160(pubKey) === this.pubKeyHash);
-    assert(checkSig(sig, pubKey));
-  }
-}
-```
-
-**Escrow with Arbiter:**
-
-```typescript
-class Escrow extends SmartContract {
-  readonly buyer: PubKey;
-  readonly seller: PubKey;
-  readonly arbiter: PubKey;
-
-  constructor(buyer: PubKey, seller: PubKey, arbiter: PubKey) {
-    super(buyer, seller, arbiter);
-    this.buyer = buyer;
-    this.seller = seller;
-    this.arbiter = arbiter;
-  }
-
-  public release(sig: Sig) {
-    assert(checkSig(sig, this.seller) || checkSig(sig, this.arbiter));
-  }
-
-  public refund(sig: Sig) {
-    assert(checkSig(sig, this.buyer) || checkSig(sig, this.arbiter));
-  }
-}
-```
-
-### Stateful Contracts (OP_PUSH_TX)
-
-Stateful contracts extend `StatefulSmartContract` and have non-`readonly` properties. State is carried across transactions using the OP_PUSH_TX pattern. The compiler automatically handles preimage verification and state continuation — you just write the business logic:
-
-```typescript
-class Counter extends StatefulSmartContract {
-  count: bigint;  // mutable = stateful
-
-  constructor(count: bigint) {
-    super(count);
-    this.count = count;
-  }
-
-  public increment() {
-    this.count++;
-  }
-}
-```
-
-The compiler auto-injects `checkPreimage` at method entry and state continuation at method exit for any method that modifies state. Access preimage fields via `this.txPreimage` when needed (e.g. `extractLocktime(this.txPreimage)`).
-
-### Token Contracts
-
-**Fungible Token:**
-
-```typescript
-class SimpleFungibleToken extends StatefulSmartContract {
-  owner: PubKey;
-  readonly supply: bigint;
-
-  constructor(owner: PubKey, supply: bigint) {
-    super(owner, supply);
-    this.owner = owner;
-    this.supply = supply;
-  }
-
-  public transfer(sig: Sig, newOwner: PubKey) {
-    assert(checkSig(sig, this.owner));
-    this.owner = newOwner;
-  }
-}
-```
-
-### Oracle Patterns (Rabin Signatures)
-
-```typescript
-class OraclePriceFeed extends SmartContract {
-  readonly oraclePubKey: RabinPubKey;
-  readonly receiver: PubKey;
-
-  constructor(oraclePubKey: RabinPubKey, receiver: PubKey) {
-    super(oraclePubKey, receiver);
-    this.oraclePubKey = oraclePubKey;
-    this.receiver = receiver;
-  }
-
-  public settle(price: bigint, rabinSig: RabinSig, padding: ByteString, sig: Sig) {
-    const msg = num2bin(price, 8n);
-    assert(verifyRabinSig(msg, rabinSig, padding, this.oraclePubKey));
-    assert(price > 50000n);
-    assert(checkSig(sig, this.receiver));
-  }
-}
-```
-
-### Covenant Enforcement
-
-Covenants restrict how a UTXO can be spent by inspecting the spending transaction itself via `checkPreimage`:
-
-```typescript
-class CovenantVault extends SmartContract {
-  readonly owner: PubKey;
-  readonly recipient: Addr;
-  readonly minAmount: bigint;
-
-  constructor(owner: PubKey, recipient: Addr, minAmount: bigint) {
-    super(owner, recipient, minAmount);
-    this.owner = owner;
-    this.recipient = recipient;
-    this.minAmount = minAmount;
-  }
-
-  public spend(sig: Sig, amount: bigint, txPreimage: SigHashPreimage) {
-    assert(checkSig(sig, this.owner));
-    assert(checkPreimage(txPreimage));
-    assert(amount >= this.minAmount);
-  }
-}
-```
-
----
-
-## Academic Foundations
-
-TSOP is built on established programming language research. Each major design choice traces to a specific paper or technique:
-
-### Nanopass Compiler Architecture
-
-> Sarkar, D., Waddell, O., & Dybvig, R. K. (2004). *A Nanopass Infrastructure for Compiler Education.* ICFP '04.
-
-The nanopass approach structures a compiler as many small passes, each performing a single transformation. TSOP uses 6 passes. The benefit is auditability: each pass can be tested and verified in isolation, and the intermediate representations between passes serve as checkpoints for debugging.
-
-### Administrative Normal Form (ANF)
-
-> Flanagan, C., Sabry, A., Duba, B. F., & Felleisen, M. (1993). *The Essence of Compiling with Continuations.* PLDI '93.
-
-ANF names every intermediate computation, eliminating nested expressions. This makes evaluation order explicit and deterministic -- critical for a stack machine target where the order of pushes and pops must be exactly right.
-
-### Affine Types for Resource Safety
-
-> Walker, D. (2005). *Substructural Type Systems.* In Advanced Topics in Types and Programming Languages.
-> Blackshear, S., et al. (2019). *Move: A Language With Programmable Resources.*
-
-Affine types enforce that certain values (signatures, preimages) are used at most once. This prevents a class of bugs where UTXO references are accidentally duplicated or preimages are checked multiple times. The Move language (Libra/Diem) popularized this approach for blockchain; TSOP applies it to the UTXO model.
-
-### Definitional Interpreter as Oracle
-
-> Reynolds, J. C. (1972). *Definitional Interpreters for Higher-Order Programming Languages.*
-> Amin, N. & Rompf, T. (2017). *Type Soundness Proofs with Definitional Interpreters.* POPL '17.
-
-The reference interpreter in `tsop-testing` is a direct, recursive evaluator of the ANF IR. It serves as an oracle: the compiled Bitcoin Script must produce the same result as the interpreter for all inputs. This is the foundation of the differential testing strategy.
-
-### Differential Testing / Program Fuzzing
-
-> Yang, X., Chen, Y., Eide, E., & Regehr, J. (2011). *Finding and Understanding Bugs in C Compilers.* PLDI '11 (CSmith).
-
-Differential testing generates random valid programs, compiles them, and checks that the compiled output matches the interpreter's result. TSOP's fuzzer (in `conformance/fuzzer`) is directly inspired by CSmith. If the compiler and interpreter disagree on any generated program, there is a bug in at least one of them.
-
-### Stack Scheduling
-
-> Koopman, P. (1989). *Stack Computers: The New Wave.*
-
-Converting named values (from ANF) to stack positions requires a scheduling algorithm that minimizes stack depth and alt-stack usage. The stack lowering pass (Pass 5) implements a variant of Koopman's approach, tracking where each named value lives on the main stack or alt-stack and inserting `OP_PICK`, `OP_ROLL`, `OP_TOALTSTACK`, and `OP_FROMALTSTACK` as needed.
+**Disallowed:** Unbounded loops, recursion, async/await, closures, exceptions, dynamic arrays, arbitrary function calls (`Math.floor`, `console.log`, etc.).
 
 ---
 
 ## Project Structure
 
 ```
-tsop/
-+-- package.json                 # Root workspace config
-+-- pnpm-workspace.yaml          # pnpm workspace definition
-+-- tsconfig.base.json           # Shared TypeScript config
-+-- turbo.json                   # Turborepo build pipeline
-|
-+-- packages/
-|   +-- tsop-lang/               # Contract author's import library
-|   |   +-- src/
-|   |       +-- types.ts         # Domain types (PubKey, Sig, ByteString, etc.)
-|   |
-|   +-- tsop-compiler/           # Reference compiler (TS -> Bitcoin Script)
-|   |   +-- src/
-|   |       +-- passes/          # 6 nanopass compiler passes
-|   |
-|   +-- tsop-ir-schema/          # IR type definitions & JSON schemas
-|   |   +-- src/
-|   |       +-- tsop-ast.ts      # TSOP AST node definitions
-|   |
-|   +-- tsop-testing/            # Script VM, interpreter, fuzzer
-|   |   +-- src/
-|   |
-|   +-- tsop-sdk/                # Deploy, call, interact with contracts
-|   |   +-- src/
-|   |
-|   +-- tsop-cli/                # CLI tool (compile, test, deploy)
-|       +-- src/
-|
-+-- spec/                        # Formal specifications
-|   +-- grammar.md               # Language grammar (EBNF)
-|   +-- type-system.md           # Type system rules
-|   +-- semantics.md             # Operational semantics
-|   +-- ir-format.md             # ANF IR canonical format
-|
-+-- conformance/                 # Cross-compiler conformance tests
-|   +-- tests/                   # Golden-file test cases
-|   |   +-- basic-p2pkh/         # Source + expected IR + expected script
-|   |   +-- arithmetic/
-|   |   +-- boolean-logic/
-|   |   +-- if-else/
-|   |   +-- bounded-loop/
-|   |   +-- multi-method/
-|   |   +-- stateful/
-|   +-- runner/                  # Conformance test runner
-|   +-- fuzzer/                  # CSmith-inspired program generator
-|
-+-- compilers/                   # Alternative compiler implementations
-|   +-- go/                      # Go compiler (tree-sitter frontend)
-|   +-- rust/                    # Rust compiler (SWC frontend)
-|
-+-- examples/                    # Example contracts
-|   +-- p2pkh/                   # Pay-to-Public-Key-Hash
-|   +-- escrow/                  # Multi-party escrow
-|   +-- stateful-counter/        # Stateful counter (OP_PUSH_TX)
-|   +-- token-ft/                # Fungible token
-|   +-- token-nft/               # Non-fungible token
-|   +-- oracle-price/            # Oracle price feed (Rabin signatures)
-|   +-- auction/                 # On-chain auction
-|   +-- covenant-vault/          # Covenant-enforced vault
-|
-+-- docs/                        # Additional documentation
+packages/
+  tsop-lang/          # Language types and builtins (developer imports)
+  tsop-compiler/      # TypeScript compiler (6 nanopass passes)
+  tsop-ir-schema/     # Shared IR type definitions and JSON schemas
+  tsop-testing/       # TestContract API, Script VM, interpreter
+  tsop-sdk/           # Deployment SDK (providers, signers)
+  tsop-cli/           # CLI tool
+  tsop-go/            # Go mock package (types, mock crypto, CompileCheck)
+  tsop-rs/            # Rust mock crate (prelude types, compile_check)
+  tsop-rs-macros/     # Rust proc-macros (#[tsop::contract], #[public], etc.)
+compilers/
+  go/                 # Go compiler (tree-sitter + native Go frontend)
+  rust/               # Rust compiler (SWC + native Rust frontend)
+conformance/          # Cross-compiler conformance test suite
+examples/
+  ts/                 # TypeScript contracts + tests
+  go/                 # Go contracts + tests
+  rust/               # Rust contracts + tests
+  sol/                # Solidity-like contracts + tests
+  move/               # Move-style contracts + tests
+spec/                 # Language specification
+docs/                 # Documentation + format guides
 ```
 
 ---
@@ -523,118 +313,40 @@ tsop/
 
 ### Prerequisites
 
-- **Node.js** >= 20.0.0
-- **pnpm** 9.15.0+
+- **Node.js** >= 20, **pnpm** 9.15+
+- **Go** 1.26+ (for Go compiler and Go contract tests)
+- **Rust** 1.75+ (for Rust compiler and Rust contract tests)
 
-### Setup
-
-```bash
-git clone https://github.com/example/tsop.git
-cd tsop
-pnpm install
-pnpm build
-pnpm test
-```
-
-### Useful Commands
+### Build & Test
 
 ```bash
-# Build all packages
-pnpm build
+git clone https://github.com/icellan/tsop.git && cd tsop
+pnpm install && pnpm build
 
-# Run all tests
-pnpm test
+# TypeScript (packages + all format examples)
+npx vitest run
 
-# Type-check all packages
-pnpm typecheck
+# Go compiler + Go contract tests
+cd compilers/go && go test ./...
+cd examples/go && go test ./...
 
-# Lint all packages
-pnpm lint
-
-# Clean all build artifacts
-pnpm clean
-```
-
-### Working on a Single Package
-
-```bash
-cd packages/tsop-compiler
-pnpm test              # Run compiler tests only
-pnpm build             # Build compiler only
+# Rust compiler + Rust contract tests
+cd compilers/rust && cargo test
+cd examples/rust && cargo test
 ```
 
 ---
 
-## Verification Plan
+## Academic Foundations
 
-TSOP employs a layered testing strategy, from unit tests through to differential fuzzing:
-
-### Layer 1: Unit Tests Per Pass
-
-Each compiler pass has its own test suite. Tests provide a specific input IR, run the pass, and assert properties of the output IR.
-
-```
-Pass 1 tests: source string -> TSOP AST assertions
-Pass 2 tests: TSOP AST -> validation error/success assertions
-Pass 3 tests: Validated AST -> type annotation assertions
-Pass 4 tests: Typed AST -> ANF IR structural assertions
-Pass 5 tests: ANF IR -> Stack IR stack-depth assertions
-Pass 6 tests: Stack IR -> hex script assertions
-```
-
-### Layer 2: End-to-End Compilation Tests
-
-Full pipeline tests: source file in, hex script out. The conformance suite provides the golden files.
-
-### Layer 3: VM Execution Tests
-
-The compiled script is loaded into the `tsop-testing` Script VM and executed with specific unlocking script inputs. The test asserts that the VM terminates with the expected success/failure state.
-
-### Layer 4: Interpreter Oracle Comparison
-
-For each test case, the reference interpreter evaluates the ANF IR with the same inputs. The interpreter's result must match the VM's result. Any disagreement is a bug.
-
-### Layer 5: Differential Fuzzing
-
-The fuzzer generates random valid TSOP programs, compiles them, runs them in the VM, and compares against the interpreter. This runs continuously in CI and has no fixed end -- it searches for compiler bugs indefinitely.
-
-### Layer 6: Cross-Compiler Conformance
-
-When the Go and Rust compilers are ready, they must produce byte-identical ANF IR for every test case in the conformance suite. The SHA-256 of the canonical JSON output must match across all implementations.
-
----
-
-## Implementation Phases
-
-| Phase | Description | Status |
-|-------|-------------|--------|
-| **Phase 0** | Project scaffold, spec documents, IR schema | Complete |
-| **Phase 1** | Pass 1 (Parse) + Pass 2 (Validate) | Complete |
-| **Phase 2** | Pass 3 (Type-check) with affine types | Complete |
-| **Phase 3** | Pass 4 (ANF Lower) + canonical serialization | Complete |
-| **Phase 4** | Pass 5 (Stack Lower) + Pass 6 (Emit) | Complete |
-| **Phase 5** | Script VM + reference interpreter + fuzzer | Complete |
-| **Phase 6** | SDK (deploy, call) + CLI | Complete |
-| **Phase 7** | Go compiler (IR consumer + tree-sitter frontend) | Complete |
-| **Phase 8** | Rust compiler (IR consumer + SWC frontend) | Complete |
-
----
-
-## Tech Stack
-
-| Technology | Version | Purpose |
-|---|---|---|
-| TypeScript | ^5.6.0 | Source language, compiler implementation |
-| Node.js | >=20.0.0 | Runtime |
-| pnpm | 9.15.0 | Package manager (workspace support) |
-| Turborepo | ^2.3.0 | Monorepo build orchestration |
-| ts-morph | ^24.0.0 | TypeScript AST parsing (Pass 1) |
-| Vitest | ^2.1.0 | Test runner |
-| fast-check | ^3.22.0 | Property-based testing / fuzzer |
-| Commander | ^12.1.0 | CLI argument parsing |
-| AJV | ^8.18.0 | JSON Schema validation (IR schemas) |
-| Go | 1.22+ | Alternative compiler (tree-sitter frontend) |
-| Rust / SWC | 1.75+ | Alternative compiler (SWC frontend) |
+| Technique | Reference | Used In |
+|-----------|-----------|---------|
+| Nanopass compilation | Sarkar, Waddell & Dybvig (ICFP 2004) | 6-pass pipeline architecture |
+| Administrative Normal Form | Flanagan, Sabry, Duba & Felleisen (PLDI 1993) | IR between typed AST and stack machine |
+| Affine types | Walker (2005), Move language (2019) | Compile-time resource safety |
+| Definitional interpreter | Reynolds (1972), Amin & Rompf (POPL 2017) | Reference interpreter oracle |
+| Differential testing | Yang, Chen, Eide & Regehr (PLDI 2011, CSmith) | Cross-compiler fuzzing |
+| Stack scheduling | Koopman (1989) | ANF → Bitcoin Script stack mapping |
 
 ---
 
