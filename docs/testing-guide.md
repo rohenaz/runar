@@ -289,6 +289,337 @@ If the results disagree, the failing program is saved for reproduction. This is 
 
 ---
 
+## Testing Go Contracts
+
+Go contracts are tested as native Go code using Go's standard `testing` package. The `tsop` mock package (`packages/tsop-go`) provides type aliases, mock crypto functions, and real hash functions so contracts execute as plain Go.
+
+### Project Setup
+
+Go examples live in `examples/go/`, with one directory per contract. The module resolution relies on a `go.work` file at the project root:
+
+```
+go.work
+├── compilers/go         # Go compiler
+├── examples/go          # Go contract examples + tests
+├── packages/tsop-go     # Mock types, crypto, CompileCheck()
+└── conformance          # Cross-compiler tests
+```
+
+This workspace allows `import "tsop"` to resolve to the mock package everywhere.
+
+### Basic Test Structure
+
+```go
+package contract
+
+import (
+	"testing"
+	"tsop"
+)
+
+func TestP2PKH_Unlock(t *testing.T) {
+	pk := tsop.MockPubKey()
+	c := &P2PKH{PubKeyHash: tsop.Hash160(pk)}
+	c.Unlock(tsop.MockSig(), pk)
+}
+
+func TestP2PKH_Unlock_WrongKey(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected assertion failure for wrong public key")
+		}
+	}()
+	pk := tsop.MockPubKey()
+	wrongPk := tsop.PubKey("\x03" + string(make([]byte, 32)))
+	c := &P2PKH{PubKeyHash: tsop.Hash160(pk)}
+	c.Unlock(tsop.MockSig(), wrongPk)
+}
+
+func TestP2PKH_Compile(t *testing.T) {
+	if err := tsop.CompileCheck("P2PKH.tsop.go"); err != nil {
+		t.Fatalf("TSOP compile check failed: %v", err)
+	}
+}
+```
+
+Contracts call `tsop.Assert()` which panics on failure. Tests that expect a failure use `defer/recover` to catch the panic.
+
+### Testing Stateful Contracts
+
+Stateful contracts mutate struct fields directly. After calling a method, inspect the fields:
+
+```go
+func TestCounter_Increment(t *testing.T) {
+	c := &Counter{Count: 0}
+	c.Increment()
+	if c.Count != 1 {
+		t.Errorf("expected Count=1, got %d", c.Count)
+	}
+}
+
+func TestCounter_DecrementAtZero_Fails(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected assertion failure")
+		}
+	}()
+	c := &Counter{Count: 0}
+	c.Decrement()
+}
+```
+
+### Multi-Output Contracts
+
+Contracts that call `AddOutput()` track outputs via the embedded `StatefulSmartContract` base. Use `Outputs()` to inspect them:
+
+```go
+func TestFungibleToken_Transfer(t *testing.T) {
+	c := newToken(alice, 100)
+	c.Transfer(tsop.MockSig(), bob, 30, 1000)
+	out := c.Outputs()
+	if len(out) != 2 {
+		t.Fatalf("expected 2 outputs, got %d", len(out))
+	}
+	if out[0].Values[0] != bob {
+		t.Error("output[0] owner should be bob")
+	}
+	if out[0].Values[1] != tsop.Bigint(30) {
+		t.Errorf("output[0] balance: expected 30, got %v", out[0].Values[1])
+	}
+}
+```
+
+The `OutputSnapshot` struct holds `Satoshis int64` and `Values []any` (mutable properties in declaration order).
+
+### Mock Types and Functions
+
+The `tsop` package provides:
+
+| Category | Functions |
+|----------|-----------|
+| **Types** | `Int`, `Bigint` (`int64`), `Bool` (`bool`), `PubKey`, `Sig`, `ByteString`, `Sha256`, `Addr` (all `string`-backed) |
+| **Mock crypto** | `CheckSig`, `CheckMultiSig`, `CheckPreimage`, `VerifyRabinSig`, `VerifyWOTS` — always return `true` |
+| **Real hashes** | `Hash160`, `Hash256`, `Sha256Hash`, `Ripemd160Func` — compute real values |
+| **Math** | `Abs`, `Min`, `Max`, `Within`, `Safediv`, `Safemod`, `Clamp`, `Sign`, `Pow`, `MulDiv`, `PercentOf`, `Sqrt`, `Gcd`, `Log2`, `ToBool` |
+| **Test helpers** | `MockSig()`, `MockPubKey()`, `MockPreimage()` |
+| **Preimage extractors** | `ExtractLocktime`, `ExtractOutputHash`, `ExtractAmount`, etc. — return fixed test values |
+
+Byte-backed types use `string` (not `[]byte`) so that `==` comparison works naturally in Go.
+
+### CompileCheck
+
+`tsop.CompileCheck(filename)` runs the contract source through the Go compiler frontend (parse → validate → typecheck) and returns an error if anything fails. Always include a compile check test alongside your business logic tests:
+
+```go
+func TestMyContract_Compile(t *testing.T) {
+	if err := tsop.CompileCheck("MyContract.tsop.go"); err != nil {
+		t.Fatalf("TSOP compile check failed: %v", err)
+	}
+}
+```
+
+### Running Go Tests
+
+```bash
+cd examples/go
+go test ./...                    # Run all Go contract tests
+go test ./p2pkh/...              # Run a specific contract
+go test -v ./stateful-counter/   # Verbose output
+```
+
+---
+
+## Testing Rust Contracts
+
+Rust contracts are tested as native Rust code using `#[test]` attributes. The `tsop` mock crate (`packages/tsop-rs`) provides a prelude with type aliases, mock crypto, and real hash functions.
+
+### Project Setup
+
+Rust examples live in `examples/rust/`, with one directory per contract. A single `Cargo.toml` defines the workspace with `[[test]]` entries for each contract:
+
+```toml
+[package]
+name = "tsop-example-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tsop = { path = "../../packages/tsop-rs" }
+
+[[test]]
+name = "p2pkh"
+path = "p2pkh/P2PKH_test.rs"
+
+[[test]]
+name = "counter"
+path = "stateful-counter/Counter_test.rs"
+
+# ... one entry per contract
+```
+
+### Basic Test Structure
+
+```rust
+#[path = "P2PKH.tsop.rs"]
+mod contract;
+
+use contract::*;
+use tsop::prelude::*;
+
+#[test]
+fn test_unlock() {
+    let pk = mock_pub_key();
+    let c = P2PKH { pub_key_hash: hash160(&pk) };
+    c.unlock(&mock_sig(), &pk);
+}
+
+#[test]
+#[should_panic]
+fn test_unlock_wrong_key() {
+    let pk = mock_pub_key();
+    let wrong_pk = vec![0x03; 33];
+    let c = P2PKH { pub_key_hash: hash160(&pk) };
+    c.unlock(&mock_sig(), &wrong_pk);
+}
+
+#[test]
+fn test_compile() {
+    tsop::compile_check(
+        include_str!("P2PKH.tsop.rs"),
+        "P2PKH.tsop.rs",
+    ).unwrap();
+}
+```
+
+Key patterns:
+- **`#[path = "Contract.tsop.rs"] mod contract;`** imports the contract source as a Rust module.
+- **`use tsop::prelude::*;`** brings all mock types and functions into scope.
+- **`#[should_panic]`** cleanly asserts that a contract method panics (no need for `catch_unwind`).
+- **`include_str!()`** embeds the contract source for `compile_check()`.
+
+### Testing Stateful Contracts
+
+Stateful contracts take `&mut self` and mutate fields directly:
+
+```rust
+#[test]
+fn test_increment() {
+    let mut c = Counter { count: 0 };
+    c.increment();
+    assert_eq!(c.count, 1);
+}
+
+#[test]
+fn test_multiple_operations() {
+    let mut c = Counter { count: 0 };
+    c.increment();
+    c.increment();
+    c.increment();
+    c.decrement();
+    assert_eq!(c.count, 2);
+}
+
+#[test]
+#[should_panic]
+fn test_decrement_at_zero_fails() {
+    Counter { count: 0 }.decrement();
+}
+```
+
+### Multi-Output Contracts
+
+Rust's borrow checker requires `.clone()` when passing owned fields to `add_output()`. Test files typically define a local output struct:
+
+```rust
+#[derive(Clone)]
+struct FtOutput { satoshis: Bigint, owner: PubKey, balance: Bigint }
+
+struct FungibleToken {
+    owner: PubKey,
+    balance: Bigint,
+    token_id: ByteString,
+    outputs: Vec<FtOutput>,
+}
+
+impl FungibleToken {
+    fn add_output(&mut self, satoshis: Bigint, owner: PubKey, balance: Bigint) {
+        self.outputs.push(FtOutput { satoshis, owner, balance });
+    }
+}
+
+#[test]
+fn test_transfer() {
+    let mut c = new_token(alice(), 100);
+    c.transfer(&mock_sig(), bob(), 30, 1000);
+    assert_eq!(c.outputs.len(), 2);
+    assert_eq!(c.outputs[0].owner, bob());
+    assert_eq!(c.outputs[0].balance, 30);
+}
+```
+
+Note: The `.tsop.rs` contract file itself needs `.clone()` on owned values passed to `add_output()`. This is a no-op for Bitcoin Script compilation but satisfies the Rust borrow checker.
+
+### Mock Types and Functions
+
+The `tsop::prelude` provides:
+
+| Category | Functions |
+|----------|-----------|
+| **Types** | `Int`, `Bigint` (`i64`), `PubKey`, `Sig`, `ByteString`, `Sha256`, `Addr` (all `Vec<u8>`) |
+| **Mock crypto** | `check_sig`, `check_multi_sig`, `check_preimage`, `verify_rabin_sig`, `verify_wots` — always return `true` |
+| **Real hashes** | `hash160`, `hash256`, `sha256`, `ripemd160` — compute real values |
+| **Math** | `safediv`, `safemod`, `clamp`, `sign`, `pow`, `mul_div`, `percent_of`, `sqrt`, `gcd`, `log2`, `bool_cast` |
+| **Byte ops** | `num2bin`, `len`, `cat`, `substr` |
+| **Test helpers** | `mock_sig()`, `mock_pub_key()`, `mock_preimage()` |
+| **Preimage extractors** | `extract_locktime`, `extract_output_hash`, etc. — return fixed test values |
+
+Byte-backed types use `Vec<u8>`, so equality comparisons with `==` work via `PartialEq`.
+
+### compile_check
+
+`tsop::compile_check(source, filename)` runs the contract through the Rust compiler frontend (parse → validate → typecheck) and returns `Result<(), String>`:
+
+```rust
+#[test]
+fn test_compile() {
+    tsop::compile_check(
+        include_str!("Counter.tsop.rs"),
+        "Counter.tsop.rs",
+    ).unwrap();
+}
+```
+
+Always include a compile check test. This catches TSOP language errors (invalid types, unknown functions, recursion, etc.) that the Rust compiler itself would not flag.
+
+### Running Rust Tests
+
+```bash
+cd examples/rust
+cargo test                           # Run all Rust contract tests
+cargo test --test p2pkh              # Run a specific contract
+cargo test --test counter -- --nocapture  # Verbose output
+```
+
+---
+
+## Cross-Language Testing Comparison
+
+| Aspect | TypeScript | Go | Rust |
+|--------|-----------|----|----|
+| **Test framework** | vitest | `testing.T` | `#[test]` |
+| **Failure assertion** | `expectScriptFailure(result)` | `defer/recover` | `#[should_panic]` |
+| **Contract loading** | `TestSmartContract.fromArtifact(artifact, args)` | Struct literal in same package | `#[path = "..."] mod contract;` |
+| **Type imports** | `import { ... } from 'tsop-testing'` | `import "tsop"` | `use tsop::prelude::*;` |
+| **Byte types** | Hex strings / `Uint8Array` | `string` (for `==`) | `Vec<u8>` (for `==` via `PartialEq`) |
+| **Scalar types** | `bigint` | `int64` aliases | `i64` aliases |
+| **Output tracking** | `contract.state` after `call()` | `c.Outputs()` method | Manual `Vec<Output>` field |
+| **Compile check** | Built into `fromArtifact` / `fromSource` | `tsop.CompileCheck("file.tsop.go")` | `tsop::compile_check(include_str!("file"), "file")` |
+| **Borrow workarounds** | N/A | None needed | `.clone()` for owned fields in `add_output` |
+| **Run command** | `npx vitest run` | `go test ./...` | `cargo test` |
+
+---
+
 ## Conformance Testing Across Compilers
 
 The conformance suite in `conformance/` ensures all TSOP compilers (TypeScript, Go, Rust) produce identical output.

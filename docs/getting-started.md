@@ -30,7 +30,7 @@ go version       # go1.22.x or higher (optional)
 ### From Source (Monorepo)
 
 ```bash
-git clone https://github.com/example/tsop.git
+git clone https://github.com/icellan/tsop.git
 cd tsop
 pnpm install
 pnpm build
