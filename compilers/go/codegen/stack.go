@@ -217,7 +217,11 @@ func collectRefs(value *ir.ANFValue) []string {
 	var refs []string
 
 	switch value.Kind {
-	case "load_param", "load_prop", "get_state_script":
+	case "load_param":
+		// Track param name so last-use analysis keeps the param on the stack
+		// (via PICK) until its final load_param, then consumes it (via ROLL).
+		refs = append(refs, value.Name)
+	case "load_prop", "get_state_script":
 		// no refs
 	case "load_const":
 		// load_const with @ref: values reference another binding
@@ -356,11 +360,27 @@ func (ctx *loweringContext) isLastUse(ref string, currentIndex int, lastUses map
 // Lower bindings
 // ---------------------------------------------------------------------------
 
-func (ctx *loweringContext) lowerBindings(bindings []ir.ANFBinding) {
+func (ctx *loweringContext) lowerBindings(bindings []ir.ANFBinding, terminalAssert bool) {
 	lastUses := computeLastUses(bindings)
 
+	// Find the index of the last assert binding (if terminalAssert is set)
+	lastAssertIdx := -1
+	if terminalAssert {
+		for i := len(bindings) - 1; i >= 0; i-- {
+			if bindings[i].Value.Kind == "assert" {
+				lastAssertIdx = i
+				break
+			}
+		}
+	}
+
 	for i, binding := range bindings {
-		ctx.lowerBinding(&binding, i, lastUses)
+		if binding.Value.Kind == "assert" && i == lastAssertIdx {
+			// Terminal assert: leave value on stack instead of OP_VERIFY
+			ctx.lowerAssert(binding.Value.ValueRef, i, lastUses, true)
+		} else {
+			ctx.lowerBinding(&binding, i, lastUses)
+		}
 	}
 }
 
@@ -410,7 +430,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "loop":
 		ctx.lowerLoop(name, value.Count, value.Body, value.IterVar)
 	case "assert":
-		ctx.lowerAssert(value.ValueRef, bindingIndex, lastUses)
+		ctx.lowerAssert(value.ValueRef, bindingIndex, lastUses, false)
 	case "update_prop":
 		ctx.lowerUpdateProp(value.Name, value.ValueRef, bindingIndex, lastUses)
 	case "get_state_script":
@@ -711,7 +731,7 @@ func (ctx *loweringContext) inlineMethodCall(bindingName string, method *ir.ANFM
 	}
 
 	// Lower the method body
-	ctx.lowerBindings(method.Body)
+	ctx.lowerBindings(method.Body, false)
 
 	// The last binding's result should be on top of the stack.
 	// Rename it to the calling binding name.
@@ -736,13 +756,13 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	// Lower then-branch
 	thenCtx := newLoweringContext(nil, ctx.properties)
 	thenCtx.sm = ctx.sm.clone()
-	thenCtx.lowerBindings(thenBindings)
+	thenCtx.lowerBindings(thenBindings, false)
 	thenOps := thenCtx.ops
 
 	// Lower else-branch
 	elseCtx := newLoweringContext(nil, ctx.properties)
 	elseCtx.sm = ctx.sm.clone()
-	elseCtx.lowerBindings(elseBindings)
+	elseCtx.lowerBindings(elseBindings, false)
 	elseOps := elseCtx.ops
 
 	ifOp := StackOp{
@@ -766,23 +786,47 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 }
 
 func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.ANFBinding, iterVar string) {
-	// Match the TS reference: simply unroll the loop, lowering the body
-	// each iteration with regular last-use analysis. Outer-scope variables
-	// may be consumed and must be re-established by the body (e.g. via @ref aliases).
+	// Collect outer-scope param names referenced in the loop body.
+	// These must not be consumed in non-final iterations.
+	outerParams := make(map[string]bool)
+	for _, b := range body {
+		if b.Value.Kind == "load_param" && b.Value.Name != iterVar {
+			outerParams[b.Value.Name] = true
+		}
+	}
+
 	for i := 0; i < count; i++ {
 		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(i))})
 		ctx.sm.push(iterVar)
-		ctx.lowerBindings(body)
+
+		lastUses := computeLastUses(body)
+
+		// In non-final iterations, prevent outer-scope params from being
+		// consumed by setting their last-use beyond any body binding index.
+		if i < count-1 {
+			for paramName := range outerParams {
+				lastUses[paramName] = len(body)
+			}
+		}
+
+		for j, binding := range body {
+			ctx.lowerBinding(&binding, j, lastUses)
+		}
 	}
 	ctx.sm.push(bindingName)
 	ctx.trackDepth()
 }
 
-func (ctx *loweringContext) lowerAssert(valueRef string, bindingIndex int, lastUses map[string]int) {
+func (ctx *loweringContext) lowerAssert(valueRef string, bindingIndex int, lastUses map[string]int, terminal bool) {
 	isLast := ctx.isLastUse(valueRef, bindingIndex, lastUses)
 	ctx.bringToTop(valueRef, isLast)
-	ctx.sm.pop()
-	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_VERIFY"})
+	if terminal {
+		// Terminal assert: leave value on stack for Bitcoin Script's
+		// final truthiness check (no OP_VERIFY).
+	} else {
+		ctx.sm.pop()
+		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_VERIFY"})
+	}
 	ctx.trackDepth()
 }
 
@@ -1798,7 +1842,9 @@ func lowerMethodWithPrivateMethods(method *ir.ANFMethod, properties []ir.ANFProp
 
 	ctx := newLoweringContext(paramNames, properties)
 	ctx.privateMethods = privateMethods
-	ctx.lowerBindings(method.Body)
+	// Pass terminalAssert=true for public methods so the last assert leaves
+	// its value on the stack (Bitcoin Script requires a truthy top-of-stack).
+	ctx.lowerBindings(method.Body, method.IsPublic)
 
 	if ctx.maxDepth > maxStackDepth {
 		return nil, fmt.Errorf(
@@ -1826,7 +1872,9 @@ func lowerMethod(method *ir.ANFMethod, properties []ir.ANFProperty) (*StackMetho
 	}
 
 	ctx := newLoweringContext(paramNames, properties)
-	ctx.lowerBindings(method.Body)
+	// Pass terminalAssert=true for public methods so the last assert leaves
+	// its value on the stack (Bitcoin Script requires a truthy top-of-stack).
+	ctx.lowerBindings(method.Body, method.IsPublic)
 
 	if ctx.maxDepth > maxStackDepth {
 		return nil, fmt.Errorf(

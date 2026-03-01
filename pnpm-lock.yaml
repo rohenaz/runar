@@ -109,6 +109,9 @@ importers:
 
   packages/tsop-testing:
     dependencies:
+      '@bsv/sdk':
+        specifier: ^2.0.5
+        version: 2.0.5
       tsop-compiler:
         specifier: workspace:*
         version: link:../tsop-compiler

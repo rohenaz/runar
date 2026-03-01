@@ -12,7 +12,7 @@
 //! - @this is a compile-time placeholder (push 0)
 //! - super() is a no-op at stack level
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::{ANFBinding, ANFMethod, ANFProgram, ANFProperty, ANFValue, ConstValue};
 
@@ -208,8 +208,12 @@ fn compute_last_uses(bindings: &[ANFBinding]) -> HashMap<String, usize> {
 fn collect_refs(value: &ANFValue) -> Vec<String> {
     let mut refs = Vec::new();
     match value {
-        ANFValue::LoadParam { .. }
-        | ANFValue::LoadProp { .. }
+        ANFValue::LoadParam { name } => {
+            // Track param name so last-use analysis keeps the param on the stack
+            // (via PICK) until its final load_param, then consumes it (via ROLL).
+            refs.push(name.clone());
+        }
+        ANFValue::LoadProp { .. }
         | ANFValue::GetStateScript { .. } => {}
 
         ANFValue::LoadConst { value: v } => {
@@ -368,10 +372,32 @@ impl LoweringContext {
     // Lower bindings
     // -----------------------------------------------------------------------
 
-    fn lower_bindings(&mut self, bindings: &[ANFBinding]) {
+    fn lower_bindings(&mut self, bindings: &[ANFBinding], terminal_assert: bool) {
         let last_uses = compute_last_uses(bindings);
+
+        // Find the index of the last assert binding (if terminal_assert is set)
+        let last_assert_idx: isize = if terminal_assert {
+            let mut idx: isize = -1;
+            for i in (0..bindings.len()).rev() {
+                if matches!(&bindings[i].value, ANFValue::Assert { .. }) {
+                    idx = i as isize;
+                    break;
+                }
+            }
+            idx
+        } else {
+            -1
+        };
+
         for (i, binding) in bindings.iter().enumerate() {
-            self.lower_binding(binding, i, &last_uses);
+            if matches!(&binding.value, ANFValue::Assert { .. }) && i as isize == last_assert_idx {
+                // Terminal assert: leave value on stack instead of OP_VERIFY
+                if let ANFValue::Assert { value } = &binding.value {
+                    self.lower_assert(value, i, &last_uses, true);
+                }
+            } else {
+                self.lower_binding(binding, i, &last_uses);
+            }
         }
     }
 
@@ -432,7 +458,7 @@ impl LoweringContext {
                 self.lower_loop(name, *count, body, iter_var);
             }
             ANFValue::Assert { value } => {
-                self.lower_assert(value, binding_index, last_uses);
+                self.lower_assert(value, binding_index, last_uses, false);
             }
             ANFValue::UpdateProp {
                 name: prop_name,
@@ -798,7 +824,7 @@ impl LoweringContext {
         }
 
         // Lower the method body
-        self.lower_bindings(&method.body);
+        self.lower_bindings(&method.body, false);
 
         // The last binding's result should be on top of the stack.
         // Rename it to the calling binding name.
@@ -830,13 +856,13 @@ impl LoweringContext {
         // Lower then-branch
         let mut then_ctx = LoweringContext::new(&[], &self.properties);
         then_ctx.sm = self.sm.clone();
-        then_ctx.lower_bindings(then_bindings);
+        then_ctx.lower_bindings(then_bindings, false);
         let then_ops = then_ctx.ops;
 
         // Lower else-branch
         let mut else_ctx = LoweringContext::new(&[], &self.properties);
         else_ctx.sm = self.sm.clone();
-        else_ctx.lower_bindings(else_bindings);
+        else_ctx.lower_bindings(else_bindings, false);
         let else_ops = else_ctx.ops;
 
         self.emit_op(StackOp::If {
@@ -866,13 +892,34 @@ impl LoweringContext {
         body: &[ANFBinding],
         iter_var: &str,
     ) {
-        // Match the TS reference: simply unroll the loop, lowering the body
-        // each iteration with regular last-use analysis. Outer-scope variables
-        // may be consumed and must be re-established by the body (e.g. via @ref aliases).
+        // Collect outer-scope param names referenced in the loop body.
+        // These must not be consumed in non-final iterations.
+        let mut outer_params = HashSet::new();
+        for b in body {
+            if let ANFValue::LoadParam { name } = &b.value {
+                if name != iter_var {
+                    outer_params.insert(name.clone());
+                }
+            }
+        }
+
         for i in 0..count {
             self.emit_op(StackOp::Push(PushValue::Int(i as i64)));
             self.sm.push(iter_var);
-            self.lower_bindings(body);
+
+            let mut last_uses = compute_last_uses(body);
+
+            // In non-final iterations, prevent outer-scope params from being
+            // consumed by setting their last-use beyond any body binding index.
+            if i < count - 1 {
+                for param_name in &outer_params {
+                    last_uses.insert(param_name.clone(), body.len());
+                }
+            }
+
+            for (j, binding) in body.iter().enumerate() {
+                self.lower_binding(binding, j, &last_uses);
+            }
         }
         self.sm.push(binding_name);
         self.track_depth();
@@ -883,11 +930,17 @@ impl LoweringContext {
         value_ref: &str,
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
+        terminal: bool,
     ) {
         let is_last = self.is_last_use(value_ref, binding_index, last_uses);
         self.bring_to_top(value_ref, is_last);
-        self.sm.pop();
-        self.emit_op(StackOp::Opcode("OP_VERIFY".to_string()));
+        if terminal {
+            // Terminal assert: leave value on stack for Bitcoin Script's
+            // final truthiness check (no OP_VERIFY).
+        } else {
+            self.sm.pop();
+            self.emit_op(StackOp::Opcode("OP_VERIFY".to_string()));
+        }
         self.track_depth();
     }
 
@@ -1943,7 +1996,9 @@ fn lower_method_with_private_methods(
 
     let mut ctx = LoweringContext::new(&param_names, properties);
     ctx.private_methods = private_methods.clone();
-    ctx.lower_bindings(&method.body);
+    // Pass terminal_assert=true for public methods so the last assert leaves
+    // its value on the stack (Bitcoin Script requires a truthy top-of-stack).
+    ctx.lower_bindings(&method.body, method.is_public);
 
     if ctx.max_depth > MAX_STACK_DEPTH {
         return Err(format!(

@@ -209,6 +209,10 @@ function collectRefs(value: ANFValue): string[] {
 
   switch (value.kind) {
     case 'load_param':
+      // Track param name so last-use analysis keeps the param on the stack
+      // (via PICK) until its final load_param, then consumes it (via ROLL).
+      refs.push(value.name);
+      break;
     case 'load_prop':
     case 'load_const':
     case 'get_state_script':
@@ -354,13 +358,33 @@ class LoweringContext {
 
   /**
    * Lower a sequence of ANF bindings.
+   *
+   * When `terminalAssert` is true, the final assert in the sequence omits
+   * OP_VERIFY so its result stays on the stack — required by Bitcoin Script
+   * which checks the top-of-stack for truthiness after execution.
    */
-  lowerBindings(bindings: ANFBinding[]): void {
+  lowerBindings(bindings: ANFBinding[], terminalAssert = false): void {
     const lastUses = computeLastUses(bindings);
+
+    // Find the index of the last assert binding (if terminalAssert is set)
+    let lastAssertIdx = -1;
+    if (terminalAssert) {
+      for (let i = bindings.length - 1; i >= 0; i--) {
+        if (bindings[i]!.value.kind === 'assert') {
+          lastAssertIdx = i;
+          break;
+        }
+      }
+    }
 
     for (let i = 0; i < bindings.length; i++) {
       const binding = bindings[i]!;
-      this.lowerBinding(binding, i, lastUses);
+      if (binding.value.kind === 'assert' && i === lastAssertIdx) {
+        // Terminal assert: leave value on stack instead of OP_VERIFY
+        this.lowerAssert(binding.value.value, i, lastUses, true);
+      } else {
+        this.lowerBinding(binding, i, lastUses);
+      }
     }
   }
 
@@ -810,12 +834,34 @@ class LoweringContext {
     body: ANFBinding[],
     _iterVar: string,
   ): void {
+    // Collect outer-scope param names referenced in the loop body.
+    // These must not be consumed in non-final iterations.
+    const outerParams = new Set<string>();
+    for (const b of body) {
+      if (b.value.kind === 'load_param' && b.value.name !== _iterVar) {
+        outerParams.add(b.value.name);
+      }
+    }
+
     // Loops are unrolled at compile time. Repeat the body `count` times.
     for (let i = 0; i < count; i++) {
       // Push the iteration index as a constant (in case the loop body uses it)
       this.emitOp({ op: 'push', value: BigInt(i) });
       this.stackMap.push(_iterVar);
-      this.lowerBindings(body);
+
+      const lastUses = computeLastUses(body);
+
+      // In non-final iterations, prevent outer-scope params from being
+      // consumed by setting their last-use beyond any body binding index.
+      if (i < count - 1) {
+        for (const paramName of outerParams) {
+          lastUses.set(paramName, body.length);
+        }
+      }
+
+      for (let j = 0; j < body.length; j++) {
+        this.lowerBinding(body[j]!, j, lastUses);
+      }
     }
     // Loop produces a dummy value
     this.stackMap.push(bindingName);
@@ -826,11 +872,17 @@ class LoweringContext {
     value: string,
     bindingIndex: number,
     lastUses: Map<string, number>,
+    terminal = false,
   ): void {
     const isLast = this.isLastUse(value, bindingIndex, lastUses);
     this.bringToTop(value, isLast);
-    this.stackMap.pop();
-    this.emitOp({ op: 'opcode', code: 'OP_VERIFY' });
+    if (terminal) {
+      // Terminal assert: leave value on stack for Bitcoin Script's
+      // final truthiness check (no OP_VERIFY).
+    } else {
+      this.stackMap.pop();
+      this.emitOp({ op: 'opcode', code: 'OP_VERIFY' });
+    }
     this.trackDepth();
   }
 
@@ -2040,7 +2092,9 @@ function lowerMethod(
   }
 
   const ctx = new LoweringContext(paramNames, properties, privateMethods);
-  ctx.lowerBindings(method.body);
+  // Pass terminalAssert=true for public methods so the last assert leaves
+  // its value on the stack (Bitcoin Script requires a truthy top-of-stack).
+  ctx.lowerBindings(method.body, method.isPublic);
 
   const { ops, maxStackDepth } = ctx.result;
 

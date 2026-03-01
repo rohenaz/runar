@@ -41,3 +41,7 @@ export {
 // TestContract API
 export { TestContract } from './test-contract.js';
 export type { TestCallResult, OutputSnapshot, MockPreimage } from './test-contract.js';
+
+// Script execution (BSV SDK)
+export { ScriptExecutionContract } from './script-execution.js';
+export type { ScriptExecResult } from './script-execution.js';

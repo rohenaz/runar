@@ -52,6 +52,9 @@ export interface CompileOptions {
 
   /** If true, stop after type-checking (Pass 3). */
   typecheckOnly?: boolean;
+
+  /** Bake property values into the locking script (replaces placeholders). */
+  constructorArgs?: Record<string, bigint | boolean | string>;
 }
 
 export interface CompileResult {
@@ -166,6 +169,16 @@ export function compile(source: string, options?: CompileOptions): CompileResult
 
   // Pass 4: ANF Lower
   const anf = lowerToANF(parseResult.contract);
+
+  // Bake constructor args into ANF properties so stack lowering emits real
+  // values instead of OP_0 placeholders.
+  if (opts.constructorArgs) {
+    for (const prop of anf.properties) {
+      if (prop.name in opts.constructorArgs) {
+        prop.initialValue = opts.constructorArgs[prop.name];
+      }
+    }
+  }
 
   // Keep ANF canonical for conformance: do not apply ANF optimizations in
   // the default compile path.

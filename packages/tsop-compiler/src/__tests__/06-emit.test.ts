@@ -129,7 +129,7 @@ describe('Pass 6: Emit', () => {
       expect(result.scriptAsm).toContain('OP_CHECKSIG');
     });
 
-    it('ASM contains OP_VERIFY for assert', () => {
+    it('terminal assert leaves value on stack (no OP_VERIFY for last assert)', () => {
       const source = `
         class C extends SmartContract {
           readonly pk: PubKey;
@@ -140,7 +140,9 @@ describe('Pass 6: Emit', () => {
         }
       `;
       const result = compileToEmit(source);
-      expect(result.scriptAsm).toContain('OP_VERIFY');
+      // Terminal assert: OP_CHECKSIG is the last opcode, no OP_VERIFY
+      expect(result.scriptAsm).toContain('OP_CHECKSIG');
+      expect(result.scriptAsm).not.toContain('OP_VERIFY');
     });
 
     it('ASM contains OP_ADD for addition operation', () => {

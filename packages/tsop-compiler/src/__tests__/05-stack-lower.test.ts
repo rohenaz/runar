@@ -139,7 +139,9 @@ describe('Pass 5: Stack Lower', () => {
       const unlock = findStackMethod(program, 'unlock');
       const allOps = flattenOps(unlock.ops);
       const opcodes = allOps.filter(o => o.op === 'opcode').map(o => (o as { code: string }).code);
-      expect(opcodes).toContain('OP_VERIFY');
+      // Terminal assert leaves value on stack (no OP_VERIFY), but the
+      // contract still compiles OP_CHECKSIG as the terminal operation.
+      expect(opcodes).toContain('OP_CHECKSIG');
     });
 
     it('contains push ops for constants', () => {

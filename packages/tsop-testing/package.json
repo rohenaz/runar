@@ -15,7 +15,8 @@
   "dependencies": {
     "tsop-lang": "workspace:*",
     "tsop-ir-schema": "workspace:*",
-    "tsop-compiler": "workspace:*"
+    "tsop-compiler": "workspace:*",
+    "@bsv/sdk": "^2.0.5"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

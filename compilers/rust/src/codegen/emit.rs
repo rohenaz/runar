@@ -222,6 +222,77 @@ fn emit_if(
 }
 
 // ---------------------------------------------------------------------------
+// Peephole optimization
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+/// Maps opcodes that can be combined with a following OP_VERIFY into a single
+/// *VERIFY opcode.
+fn verify_combinations() -> HashMap<&'static str, &'static str> {
+    let mut m = HashMap::new();
+    m.insert("OP_EQUAL", "OP_EQUALVERIFY");
+    m.insert("OP_NUMEQUAL", "OP_NUMEQUALVERIFY");
+    m.insert("OP_CHECKSIG", "OP_CHECKSIGVERIFY");
+    m.insert("OP_CHECKMULTISIG", "OP_CHECKMULTISIGVERIFY");
+    m
+}
+
+/// Peephole optimizer: combines adjacent opcode pairs into single opcodes
+/// (e.g. OP_EQUAL + OP_VERIFY -> OP_EQUALVERIFY) and eliminates no-op
+/// OP_SWAP OP_SWAP pairs. Recurses into If/Else blocks.
+fn peephole_optimize(ops: &[StackOp]) -> Vec<StackOp> {
+    let combinations = verify_combinations();
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < ops.len() {
+        let op = &ops[i];
+
+        // Combine OP_X + OP_VERIFY -> OP_XVERIFY
+        if i + 1 < ops.len() {
+            let next = &ops[i + 1];
+            if let (StackOp::Opcode(code), StackOp::Opcode(next_code)) = (op, next) {
+                if next_code == "OP_VERIFY" {
+                    if let Some(&combined) = combinations.get(code.as_str()) {
+                        result.push(StackOp::Opcode(combined.to_string()));
+                        i += 2; // skip the OP_VERIFY
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Eliminate OP_SWAP OP_SWAP (no-op pair)
+        if i + 1 < ops.len() {
+            if matches!((&ops[i], &ops[i + 1]), (StackOp::Swap, StackOp::Swap)) {
+                i += 2; // skip both swaps
+                continue;
+            }
+        }
+
+        // Recurse into if/else blocks
+        if let StackOp::If { then_ops, else_ops } = op {
+            result.push(StackOp::If {
+                then_ops: peephole_optimize(then_ops),
+                else_ops: if else_ops.is_empty() {
+                    Vec::new()
+                } else {
+                    peephole_optimize(else_ops)
+                },
+            });
+            i += 1;
+            continue;
+        }
+
+        result.push(op.clone());
+        i += 1;
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -232,10 +303,15 @@ fn emit_if(
 pub fn emit(methods: &[StackMethod]) -> Result<EmitResult, String> {
     let mut ctx = EmitContext::new();
 
-    // Filter to public methods (exclude constructor)
-    let public_methods: Vec<&StackMethod> = methods
+    // Filter to public methods (exclude constructor) and apply peephole optimizations
+    let public_methods: Vec<StackMethod> = methods
         .iter()
         .filter(|m| m.name != "constructor")
+        .map(|m| StackMethod {
+            name: m.name.clone(),
+            ops: peephole_optimize(&m.ops),
+            max_stack_depth: m.max_stack_depth,
+        })
         .collect();
 
     if public_methods.is_empty() {
@@ -250,7 +326,8 @@ pub fn emit(methods: &[StackMethod]) -> Result<EmitResult, String> {
             emit_stack_op(op, &mut ctx)?;
         }
     } else {
-        emit_method_dispatch(&public_methods, &mut ctx)?;
+        let refs: Vec<&StackMethod> = public_methods.iter().collect();
+        emit_method_dispatch(&refs, &mut ctx)?;
     }
 
     Ok(EmitResult {
