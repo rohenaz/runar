@@ -69,14 +69,19 @@ export class TestContract {
   }
 
   /**
-   * Create a test contract from TypeScript source code.
+   * Create a test contract from source code in any supported format.
+   *
+   * Pass `fileName` with the appropriate extension to select the parser:
+   * - `.tsop.ts` — TypeScript (default)
+   * - `.tsop.sol` — Solidity-like
+   * - `.tsop.move` — Move-style
    */
-  static fromSource(source: string, initialState: Record<string, unknown> = {}): TestContract {
+  static fromSource(source: string, initialState: Record<string, unknown> = {}, fileName?: string): TestContract {
     // Dynamic import to avoid hard dependency at module level
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { compile } = require('tsop-compiler') as { compile: (source: string, options?: { typecheckOnly?: boolean }) => { success: boolean; contract: ContractNode | null; diagnostics: { severity: string; message: string }[] } };
+    const { compile } = require('tsop-compiler') as { compile: (source: string, options?: { typecheckOnly?: boolean; fileName?: string }) => { success: boolean; contract: ContractNode | null; diagnostics: { severity: string; message: string }[] } };
 
-    const result = compile(source, { typecheckOnly: true });
+    const result = compile(source, { typecheckOnly: true, fileName });
     if (!result.success || !result.contract) {
       const errors = result.diagnostics
         .filter(d => d.severity === 'error')

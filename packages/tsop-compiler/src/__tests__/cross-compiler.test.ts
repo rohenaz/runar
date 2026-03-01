@@ -235,7 +235,7 @@ describe.skipIf(!hasGo)('Cross-compiler: TS IR -> Go Script', () => {
 // ---------------------------------------------------------------------------
 
 function findExampleContracts(): { name: string; source: string }[] {
-  const examplesDir = join(__dirname, '..', '..', '..', '..', 'examples');
+  const examplesDir = join(__dirname, '..', '..', '..', '..', 'examples', 'ts');
   const contracts: { name: string; source: string }[] = [];
 
   try {

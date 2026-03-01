@@ -21,6 +21,25 @@ type ParseResult struct {
 	Errors   []string
 }
 
+// ParseSource detects the file extension and routes to the appropriate parser.
+//   - .tsop.sol -> ParseSolidity
+//   - .tsop.move -> ParseMove
+//   - .tsop.go -> ParseGoContract
+//   - default -> Parse (existing TypeScript parser)
+func ParseSource(source []byte, fileName string) *ParseResult {
+	lower := strings.ToLower(fileName)
+	switch {
+	case strings.HasSuffix(lower, ".tsop.sol"):
+		return ParseSolidity(source, fileName)
+	case strings.HasSuffix(lower, ".tsop.move"):
+		return ParseMove(source, fileName)
+	case strings.HasSuffix(lower, ".tsop.go"):
+		return ParseGoContract(source, fileName)
+	default:
+		return Parse(source, fileName)
+	}
+}
+
 // Parse parses a TypeScript source string and extracts the TSOP contract AST.
 func Parse(source []byte, fileName string) *ParseResult {
 	parser := sitter.NewParser()

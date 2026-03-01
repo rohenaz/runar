@@ -1,0 +1,646 @@
+package frontend
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
+	"strings"
+	"unicode"
+)
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// ParseGoContract parses a Go contract syntax (.tsop.go) source file and
+// produces the standard TSOP AST. Uses Go's built-in go/parser.
+func ParseGoContract(source []byte, fileName string) *ParseResult {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, fileName, source, parser.ParseComments)
+	if err != nil {
+		return &ParseResult{Errors: []string{fmt.Sprintf("Go parse error: %v", err)}}
+	}
+
+	p := &goContractParser{
+		fset:     fset,
+		file:     file,
+		fileName: fileName,
+	}
+
+	contract := p.extractContract()
+	if contract == nil && len(p.errors) == 0 {
+		p.errors = append(p.errors, "no TSOP contract struct found in Go source")
+	}
+
+	return &ParseResult{
+		Contract: contract,
+		Errors:   p.errors,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Parser internals
+// ---------------------------------------------------------------------------
+
+type goContractParser struct {
+	fset     *token.FileSet
+	file     *ast.File
+	fileName string
+	errors   []string
+}
+
+func (p *goContractParser) extractContract() *ContractNode {
+	var contractName string
+	var parentClass string
+	var properties []PropertyNode
+	var methods []MethodNode
+
+	// Find the struct type that embeds tsop.SmartContract or tsop.StatefulSmartContract
+	for _, decl := range p.file.Decls {
+		genDecl, ok := decl.(*ast.GenDecl)
+		if !ok || genDecl.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range genDecl.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			structType, ok := typeSpec.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+
+			// Check for tsop.SmartContract / tsop.StatefulSmartContract embed
+			found := false
+			for _, field := range structType.Fields.List {
+				if sel, ok := field.Type.(*ast.SelectorExpr); ok {
+					if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "tsop" {
+						switch sel.Sel.Name {
+						case "SmartContract":
+							parentClass = "SmartContract"
+							found = true
+						case "StatefulSmartContract":
+							parentClass = "StatefulSmartContract"
+							found = true
+						}
+					}
+				}
+			}
+			if !found {
+				continue
+			}
+
+			contractName = typeSpec.Name.Name
+
+			// Extract properties (non-embed fields)
+			for _, field := range structType.Fields.List {
+				// Skip the embed
+				if _, ok := field.Type.(*ast.SelectorExpr); ok && len(field.Names) == 0 {
+					continue
+				}
+				if len(field.Names) == 0 {
+					continue
+				}
+
+				for _, name := range field.Names {
+					propName := goFieldToCamel(name.Name)
+					propType := p.resolveType(field.Type)
+
+					// Check struct tag for readonly
+					readonly := false
+					if field.Tag != nil {
+						tagStr := field.Tag.Value
+						if strings.Contains(tagStr, `tsop:"readonly"`) {
+							readonly = true
+						}
+					}
+
+					pos := p.fset.Position(field.Pos())
+					properties = append(properties, PropertyNode{
+						Name:     propName,
+						Type:     propType,
+						Readonly: readonly,
+						SourceLocation: SourceLocation{
+							File:   p.fileName,
+							Line:   pos.Line,
+							Column: pos.Column,
+						},
+					})
+				}
+			}
+		}
+	}
+
+	if contractName == "" {
+		return nil
+	}
+
+	// Find methods on this contract type
+	for _, decl := range p.file.Decls {
+		funcDecl, ok := decl.(*ast.FuncDecl)
+		if !ok || funcDecl.Recv == nil {
+			continue
+		}
+
+		// Check receiver is *ContractName
+		if len(funcDecl.Recv.List) == 0 {
+			continue
+		}
+		recvType := funcDecl.Recv.List[0].Type
+		if star, ok := recvType.(*ast.StarExpr); ok {
+			if ident, ok := star.X.(*ast.Ident); ok {
+				if ident.Name != contractName {
+					continue
+				}
+			}
+		}
+
+		methodName := goFieldToCamel(funcDecl.Name.Name)
+		// Exported (capitalized) = public
+		visibility := "private"
+		if funcDecl.Name.IsExported() {
+			visibility = "public"
+		}
+
+		params := p.extractParams(funcDecl.Type.Params)
+		body := p.extractStatements(funcDecl.Body)
+
+		pos := p.fset.Position(funcDecl.Pos())
+		methods = append(methods, MethodNode{
+			Name:       methodName,
+			Params:     params,
+			Body:       body,
+			Visibility: visibility,
+			SourceLocation: SourceLocation{
+				File:   p.fileName,
+				Line:   pos.Line,
+				Column: pos.Column,
+			},
+		})
+	}
+
+	// Build constructor
+	constructorParams := make([]ParamNode, len(properties))
+	for i, prop := range properties {
+		constructorParams[i] = ParamNode{Name: prop.Name, Type: prop.Type}
+	}
+
+	// super(...) call as first statement
+	superArgs := make([]Expression, len(properties))
+	for i, prop := range properties {
+		superArgs[i] = Identifier{Name: prop.Name}
+	}
+	superCall := ExpressionStmt{
+		Expr: CallExpr{
+			Callee: Identifier{Name: "super"},
+			Args:   superArgs,
+		},
+		SourceLocation: SourceLocation{File: p.fileName, Line: 1, Column: 1},
+	}
+
+	// Property assignments
+	constructorBody := make([]Statement, 0, 1+len(properties))
+	constructorBody = append(constructorBody, superCall)
+	for _, prop := range properties {
+		constructorBody = append(constructorBody, AssignmentStmt{
+			Target:         PropertyAccessExpr{Property: prop.Name},
+			Value:          Identifier{Name: prop.Name},
+			SourceLocation: SourceLocation{File: p.fileName, Line: 1, Column: 1},
+		})
+	}
+
+	return &ContractNode{
+		Name:        contractName,
+		ParentClass: parentClass,
+		Properties:  properties,
+		Constructor: MethodNode{
+			Name:           "constructor",
+			Params:         constructorParams,
+			Body:           constructorBody,
+			Visibility:     "public",
+			SourceLocation: SourceLocation{File: p.fileName, Line: 1, Column: 1},
+		},
+		Methods:    methods,
+		SourceFile: p.fileName,
+	}
+}
+
+func (p *goContractParser) resolveType(expr ast.Expr) TypeNode {
+	switch e := expr.(type) {
+	case *ast.SelectorExpr:
+		if ident, ok := e.X.(*ast.Ident); ok && ident.Name == "tsop" {
+			return mapGoType(e.Sel.Name)
+		}
+		return CustomType{Name: fmt.Sprintf("%v.%s", e.X, e.Sel.Name)}
+	case *ast.Ident:
+		return mapGoType(e.Name)
+	case *ast.ArrayType:
+		if e.Len != nil {
+			if lit, ok := e.Len.(*ast.BasicLit); ok {
+				length, _ := strconv.Atoi(lit.Value)
+				return FixedArrayType{Element: p.resolveType(e.Elt), Length: length}
+			}
+		}
+		return p.resolveType(e.Elt)
+	}
+	return CustomType{Name: "unknown"}
+}
+
+func mapGoType(name string) TypeNode {
+	typeMap := map[string]string{
+		"Int":             "bigint",
+		"Bigint":          "bigint",
+		"Bool":            "boolean",
+		"ByteString":      "ByteString",
+		"PubKey":          "PubKey",
+		"Sig":             "Sig",
+		"Sha256":          "Sha256",
+		"Ripemd160":       "Ripemd160",
+		"Addr":            "Addr",
+		"SigHashPreimage": "SigHashPreimage",
+		"RabinSig":        "RabinSig",
+		"RabinPubKey":     "RabinPubKey",
+	}
+	if mapped, ok := typeMap[name]; ok {
+		if IsPrimitiveType(mapped) {
+			return PrimitiveType{Name: mapped}
+		}
+	}
+	if IsPrimitiveType(name) {
+		return PrimitiveType{Name: name}
+	}
+	return CustomType{Name: name}
+}
+
+func (p *goContractParser) extractParams(fieldList *ast.FieldList) []ParamNode {
+	if fieldList == nil {
+		return nil
+	}
+	var params []ParamNode
+	for _, field := range fieldList.List {
+		paramType := p.resolveType(field.Type)
+		for _, name := range field.Names {
+			params = append(params, ParamNode{
+				Name: goFieldToCamel(name.Name),
+				Type: paramType,
+			})
+		}
+	}
+	return params
+}
+
+func (p *goContractParser) extractStatements(block *ast.BlockStmt) []Statement {
+	if block == nil {
+		return nil
+	}
+	var stmts []Statement
+	for _, stmt := range block.List {
+		s := p.convertStatement(stmt)
+		if s != nil {
+			stmts = append(stmts, s)
+		} else {
+			pos := p.fset.Position(stmt.Pos())
+			p.errors = append(p.errors, fmt.Sprintf(
+				"unsupported Go statement at %s:%d:%d — not valid in TSOP contract",
+				p.fileName, pos.Line, pos.Column))
+		}
+	}
+	return stmts
+}
+
+func (p *goContractParser) convertStatement(stmt ast.Stmt) Statement {
+	pos := p.fset.Position(stmt.Pos())
+	loc := SourceLocation{File: p.fileName, Line: pos.Line, Column: pos.Column}
+
+	switch s := stmt.(type) {
+	case *ast.ExprStmt:
+		expr := p.convertExpression(s.X)
+		if expr == nil {
+			return nil
+		}
+		return ExpressionStmt{Expr: expr, SourceLocation: loc}
+
+	case *ast.AssignStmt:
+		if len(s.Lhs) == 1 && len(s.Rhs) == 1 {
+			if s.Tok == token.DEFINE { // :=
+				target := p.convertExpression(s.Lhs[0])
+				init := p.convertExpression(s.Rhs[0])
+				if target == nil || init == nil {
+					return nil
+				}
+				name := ""
+				if ident, ok := target.(Identifier); ok {
+					name = ident.Name
+				}
+				return VariableDeclStmt{
+					Name:           name,
+					Mutable:        true,
+					Init:           init,
+					SourceLocation: loc,
+				}
+			}
+			target := p.convertExpression(s.Lhs[0])
+			value := p.convertExpression(s.Rhs[0])
+			if target == nil || value == nil {
+				return nil
+			}
+			return AssignmentStmt{Target: target, Value: value, SourceLocation: loc}
+		}
+
+	case *ast.DeclStmt:
+		genDecl, ok := s.Decl.(*ast.GenDecl)
+		if !ok {
+			return nil
+		}
+		for _, spec := range genDecl.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			if len(valueSpec.Names) > 0 && len(valueSpec.Values) > 0 {
+				name := goFieldToCamel(valueSpec.Names[0].Name)
+				init := p.convertExpression(valueSpec.Values[0])
+				if init == nil {
+					return nil
+				}
+				mutable := genDecl.Tok == token.VAR
+				var typeNode TypeNode
+				if valueSpec.Type != nil {
+					typeNode = p.resolveType(valueSpec.Type)
+				}
+				return VariableDeclStmt{
+					Name:           name,
+					Type:           typeNode,
+					Mutable:        mutable,
+					Init:           init,
+					SourceLocation: loc,
+				}
+			}
+		}
+
+	case *ast.IfStmt:
+		cond := p.convertExpression(s.Cond)
+		if cond == nil {
+			return nil
+		}
+		thenBlock := p.extractStatements(s.Body)
+		var elseBlock []Statement
+		if s.Else != nil {
+			if block, ok := s.Else.(*ast.BlockStmt); ok {
+				elseBlock = p.extractStatements(block)
+			}
+		}
+		return IfStmt{
+			Condition:      cond,
+			Then:           thenBlock,
+			Else:           elseBlock,
+			SourceLocation: loc,
+		}
+
+	case *ast.ForStmt:
+		var initStmt VariableDeclStmt
+		if s.Init != nil {
+			if init := p.convertStatement(s.Init); init != nil {
+				if vd, ok := init.(VariableDeclStmt); ok {
+					initStmt = vd
+				}
+			}
+		}
+		cond := p.convertExpression(s.Cond)
+		var update Statement
+		if s.Post != nil {
+			update = p.convertStatement(s.Post)
+		}
+		body := p.extractStatements(s.Body)
+		return ForStmt{
+			Init:           initStmt,
+			Condition:      cond,
+			Update:         update,
+			Body:           body,
+			SourceLocation: loc,
+		}
+
+	case *ast.ReturnStmt:
+		var value Expression
+		if len(s.Results) > 0 {
+			value = p.convertExpression(s.Results[0])
+		}
+		return ReturnStmt{Value: value, SourceLocation: loc}
+
+	case *ast.IncDecStmt:
+		operand := p.convertExpression(s.X)
+		if operand == nil {
+			return nil
+		}
+		if s.Tok == token.INC {
+			return ExpressionStmt{
+				Expr:           IncrementExpr{Operand: operand, Prefix: false},
+				SourceLocation: loc,
+			}
+		}
+		return ExpressionStmt{
+			Expr:           DecrementExpr{Operand: operand, Prefix: false},
+			SourceLocation: loc,
+		}
+	}
+
+	return nil
+}
+
+func (p *goContractParser) convertExpression(expr ast.Expr) Expression {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		switch e.Kind {
+		case token.INT:
+			val, _ := strconv.ParseInt(e.Value, 10, 64)
+			return BigIntLiteral{Value: val}
+		case token.STRING:
+			s, _ := strconv.Unquote(e.Value)
+			return ByteStringLiteral{Value: s}
+		}
+
+	case *ast.Ident:
+		name := goFieldToCamel(e.Name)
+		if name == "true" {
+			return BoolLiteral{Value: true}
+		}
+		if name == "false" {
+			return BoolLiteral{Value: false}
+		}
+		return Identifier{Name: name}
+
+	case *ast.SelectorExpr:
+		// tsop.FuncName -> function call identifier
+		if ident, ok := e.X.(*ast.Ident); ok {
+			if ident.Name == "tsop" {
+				return Identifier{Name: mapGoBuiltin(e.Sel.Name)}
+			}
+			// c.Field -> property access
+			if ident.Name == "c" || ident.Name == "self" {
+				return PropertyAccessExpr{Property: goFieldToCamel(e.Sel.Name)}
+			}
+			// Any other package selector (math.Log, fmt.Println, etc.) is not valid TSOP
+			pos := p.fset.Position(e.Pos())
+			p.errors = append(p.errors, fmt.Sprintf(
+				"unsupported expression '%s.%s' at %s:%d:%d — only tsop.* builtins and contract field access are allowed",
+				ident.Name, e.Sel.Name, p.fileName, pos.Line, pos.Column))
+			return nil
+		}
+		obj := p.convertExpression(e.X)
+		return MemberExpr{Object: obj, Property: goFieldToCamel(e.Sel.Name)}
+
+	case *ast.CallExpr:
+		// Handle type conversions: tsop.Int(0), tsop.Bigint(x) -> inner value
+		if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
+			if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "tsop" {
+				typeName := sel.Sel.Name
+				if (typeName == "Int" || typeName == "Bigint" || typeName == "Bool") && len(e.Args) == 1 {
+					return p.convertExpression(e.Args[0])
+				}
+			}
+		}
+
+		callee := p.convertExpression(e.Fun)
+		var args []Expression
+		for _, arg := range e.Args {
+			a := p.convertExpression(arg)
+			if a != nil {
+				args = append(args, a)
+			}
+		}
+		// tsop.Assert(expr) -> assert(expr)
+		if ident, ok := callee.(Identifier); ok && ident.Name == "assert" {
+			return CallExpr{Callee: Identifier{Name: "assert"}, Args: args}
+		}
+		// tsop.FuncName(args) -> funcName(args) for builtins
+		return CallExpr{Callee: callee, Args: args}
+
+	case *ast.BinaryExpr:
+		left := p.convertExpression(e.X)
+		right := p.convertExpression(e.Y)
+		op := mapGoOp(e.Op)
+		if left == nil || right == nil {
+			return nil
+		}
+		return BinaryExpr{Op: op, Left: left, Right: right}
+
+	case *ast.UnaryExpr:
+		operand := p.convertExpression(e.X)
+		if operand == nil {
+			return nil
+		}
+		switch e.Op {
+		case token.NOT:
+			return UnaryExpr{Op: "!", Operand: operand}
+		case token.SUB:
+			return UnaryExpr{Op: "-", Operand: operand}
+		case token.XOR:
+			return UnaryExpr{Op: "~", Operand: operand}
+		}
+
+	case *ast.ParenExpr:
+		return p.convertExpression(e.X)
+
+	case *ast.IndexExpr:
+		obj := p.convertExpression(e.X)
+		idx := p.convertExpression(e.Index)
+		return IndexAccessExpr{Object: obj, Index: idx}
+	}
+
+	return nil
+}
+
+func mapGoOp(op token.Token) string {
+	switch op {
+	case token.ADD:
+		return "+"
+	case token.SUB:
+		return "-"
+	case token.MUL:
+		return "*"
+	case token.QUO:
+		return "/"
+	case token.REM:
+		return "%"
+	case token.EQL:
+		return "==="
+	case token.NEQ:
+		return "!=="
+	case token.LSS:
+		return "<"
+	case token.LEQ:
+		return "<="
+	case token.GTR:
+		return ">"
+	case token.GEQ:
+		return ">="
+	case token.LAND:
+		return "&&"
+	case token.LOR:
+		return "||"
+	case token.AND:
+		return "&"
+	case token.OR:
+		return "|"
+	case token.XOR:
+		return "^"
+	}
+	return "+"
+}
+
+func mapGoBuiltin(name string) string {
+	builtinMap := map[string]string{
+		"Assert":            "assert",
+		"Hash160":           "hash160",
+		"Hash256":           "hash256",
+		"Sha256":            "sha256",
+		"Ripemd160":         "ripemd160",
+		"CheckSig":          "checkSig",
+		"CheckMultiSig":     "checkMultiSig",
+		"CheckPreimage":     "checkPreimage",
+		"VerifyRabinSig":    "verifyRabinSig",
+		"Num2Bin":           "num2bin",
+		"ExtractLocktime":   "extractLocktime",
+		"ExtractOutputHash": "extractOutputHash",
+		"AddOutput":         "addOutput",
+		"GetStateScript":    "getStateScript",
+	}
+	if mapped, ok := builtinMap[name]; ok {
+		return mapped
+	}
+	return goFieldToCamel(name)
+}
+
+// goFieldToCamel converts a Go-style exported name to camelCase.
+// e.g., "PubKeyHash" -> "pubKeyHash", "AddOutput" -> "addOutput"
+func goFieldToCamel(name string) string {
+	if len(name) == 0 {
+		return name
+	}
+	// If it starts with lowercase, it's already camelCase
+	r := []rune(name)
+	if !unicode.IsUpper(r[0]) {
+		return name
+	}
+	// Find the prefix of uppercase runes
+	i := 0
+	for i < len(r) && unicode.IsUpper(r[i]) {
+		i++
+	}
+	if i == 0 {
+		return name
+	}
+	if i == 1 {
+		// Simple case: just lowercase the first letter
+		r[0] = unicode.ToLower(r[0])
+		return string(r)
+	}
+	// Multiple uppercase: lowercase all but the last one
+	// e.g., "HTTPServer" -> "httpServer", "PubKeyHash" -> stays as-is since P is single
+	// Actually for Go exported names, just lowercase the first letter
+	r[0] = unicode.ToLower(r[0])
+	return string(r)
+}

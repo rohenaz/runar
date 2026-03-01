@@ -14,7 +14,7 @@ const __dirname = dirname(__filename);
 // Find example contracts
 // ---------------------------------------------------------------------------
 
-const EXAMPLES_DIR = join(__dirname, '..', '..', '..', '..', 'examples');
+const EXAMPLES_DIR = join(__dirname, '..', '..', '..', '..', 'examples', 'ts');
 
 interface ExampleContract {
   name: string;

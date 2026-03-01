@@ -77,6 +77,7 @@ export interface BinOp {
   op: string;
   left: string;   // reference to a temp name
   right: string;  // reference to a temp name
+  result_type?: string; // operand type hint: "bytes" for ByteString/PubKey/Sig/Sha256 etc., omitted for numeric
 }
 
 export interface UnaryOp {
@@ -132,6 +133,12 @@ export interface CheckPreimage {
   preimage: string; // reference to a temp name
 }
 
+export interface AddOutput {
+  kind: 'add_output';
+  satoshis: string;       // reference to a temp holding satoshis bigint
+  stateValues: string[];  // references to temps, one per mutable property in declaration order
+}
+
 export type ANFValue =
   | LoadParam
   | LoadProp
@@ -145,4 +152,5 @@ export type ANFValue =
   | Assert
   | UpdateProp
   | GetStateScript
-  | CheckPreimage;
+  | CheckPreimage
+  | AddOutput;

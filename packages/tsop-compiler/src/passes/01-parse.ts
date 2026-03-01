@@ -1,8 +1,12 @@
 /**
  * Pass 1: Parse
  *
- * Uses ts-morph to parse a TypeScript source file and extract the
- * SmartContract subclass into a TSOP AST.
+ * Multi-format parser dispatcher. Detects the source format by file extension
+ * and routes to the appropriate parser:
+ *   - `.tsop.ts`   → TypeScript (ts-morph)
+ *   - `.tsop.yaml`  → YAML declarative templates
+ *   - `.tsop.sol`  → Solidity-like syntax
+ *   - `.tsop.move` → Move-style resource language
  */
 
 import {
@@ -37,6 +41,8 @@ import type {
 } from '../ir/index.js';
 import type { CompilerDiagnostic } from '../errors.js';
 import { makeDiagnostic } from '../errors.js';
+import { parseSolSource } from './01-parse-sol.js';
+import { parseMoveSource } from './01-parse-move.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -48,11 +54,24 @@ export interface ParseResult {
 }
 
 /**
- * Parse a TypeScript source string and extract the TSOP contract AST.
+ * Parse a TSOP source string and extract the contract AST.
+ *
+ * Auto-detects the source format by file extension and dispatches to the
+ * appropriate parser. All parsers produce the same TSOP AST.
  */
 export function parse(source: string, fileName?: string): ParseResult {
   const errors: CompilerDiagnostic[] = [];
   const file = fileName ?? 'contract.ts';
+
+  // Multi-format dispatch based on file extension
+  if (file.endsWith('.tsop.sol')) {
+    return parseSolSource(source, file);
+  }
+  if (file.endsWith('.tsop.move')) {
+    return parseMoveSource(source, file);
+  }
+
+  // Default: TypeScript parser (for .tsop.ts and any unrecognized extension)
 
   const project = new Project({
     useInMemoryFileSystem: true,

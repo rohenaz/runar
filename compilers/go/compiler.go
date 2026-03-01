@@ -169,7 +169,7 @@ func CompileFromSource(sourcePath string) (*Artifact, error) {
 	}
 
 	// Pass 1: Parse
-	parseResult := frontend.Parse(source, sourcePath)
+	parseResult := frontend.ParseSource(source, sourcePath)
 	if len(parseResult.Errors) > 0 {
 		return nil, fmt.Errorf("parse errors:\n  %s", strings.Join(parseResult.Errors, "\n  "))
 	}
@@ -203,7 +203,7 @@ func CompileSourceToIR(sourcePath string) (*ir.ANFProgram, error) {
 		return nil, fmt.Errorf("reading source file: %w", err)
 	}
 
-	parseResult := frontend.Parse(source, sourcePath)
+	parseResult := frontend.ParseSource(source, sourcePath)
 	if len(parseResult.Errors) > 0 {
 		return nil, fmt.Errorf("parse errors:\n  %s", strings.Join(parseResult.Errors, "\n  "))
 	}

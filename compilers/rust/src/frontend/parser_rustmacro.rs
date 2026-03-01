@@ -1,0 +1,944 @@
+//! Rust DSL parser for TSOP contracts (.tsop.rs).
+//!
+//! Parses Rust-style contract definitions using a hand-written tokenizer
+//! and recursive descent parser. Produces the same AST as the TypeScript parser.
+
+use super::ast::{
+    self, BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName,
+    PropertyNode, SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
+};
+use super::parser::ParseResult;
+
+// ---------------------------------------------------------------------------
+// Token types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum TokenType {
+    Use, Struct, Impl, Fn, Pub, Let, Mut, If, Else, For, Return, In,
+    True, False, Self_,
+    AssertMacro, AssertEqMacro,
+    Ident(String), Number(String), HexString(String),
+    // Attributes
+    HashBracket, // #[
+    // Punctuation
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket,
+    Semi, Comma, Dot, Colon, ColonColon, Arrow,
+    // Operators
+    Plus, Minus, Star, Slash, Percent,
+    EqEq, BangEq, Lt, LtEq, Gt, GtEq,
+    AmpAmp, PipePipe,
+    Amp, Pipe, Caret, Tilde, Bang,
+    Eq, PlusEq, MinusEq,
+    // End
+    Eof,
+}
+
+#[derive(Debug, Clone)]
+struct Token {
+    typ: TokenType,
+    line: usize,
+    col: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer
+// ---------------------------------------------------------------------------
+
+fn tokenize(source: &str) -> Vec<Token> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut tokens = Vec::new();
+    let mut pos = 0;
+    let mut line = 1usize;
+    let mut col = 1usize;
+
+    while pos < chars.len() {
+        let ch = chars[pos];
+        let l = line;
+        let c = col;
+
+        // Whitespace
+        if ch.is_whitespace() {
+            if ch == '\n' { line += 1; col = 1; } else { col += 1; }
+            pos += 1;
+            continue;
+        }
+
+        // Line comments
+        if ch == '/' && pos + 1 < chars.len() && chars[pos + 1] == '/' {
+            while pos < chars.len() && chars[pos] != '\n' { pos += 1; }
+            continue;
+        }
+
+        // Block comments
+        if ch == '/' && pos + 1 < chars.len() && chars[pos + 1] == '*' {
+            pos += 2; col += 2;
+            while pos + 1 < chars.len() {
+                if chars[pos] == '\n' { line += 1; col = 1; }
+                if chars[pos] == '*' && chars[pos + 1] == '/' { pos += 2; col += 2; break; }
+                pos += 1; col += 1;
+            }
+            continue;
+        }
+
+        // #[ attribute
+        if ch == '#' && pos + 1 < chars.len() && chars[pos + 1] == '[' {
+            tokens.push(Token { typ: TokenType::HashBracket, line: l, col: c });
+            pos += 2; col += 2;
+            continue;
+        }
+
+        // Two-char operators
+        if pos + 1 < chars.len() {
+            let two = format!("{}{}", ch, chars[pos + 1]);
+            let tok = match two.as_str() {
+                "::" => Some(TokenType::ColonColon),
+                "->" => Some(TokenType::Arrow),
+                "==" => Some(TokenType::EqEq),
+                "!=" => Some(TokenType::BangEq),
+                "<=" => Some(TokenType::LtEq),
+                ">=" => Some(TokenType::GtEq),
+                "&&" => Some(TokenType::AmpAmp),
+                "||" => Some(TokenType::PipePipe),
+                "+=" => Some(TokenType::PlusEq),
+                "-=" => Some(TokenType::MinusEq),
+                _ => None,
+            };
+            if let Some(t) = tok {
+                tokens.push(Token { typ: t, line: l, col: c });
+                pos += 2; col += 2;
+                continue;
+            }
+        }
+
+        // Single-char tokens
+        let single = match ch {
+            '(' => Some(TokenType::LParen),
+            ')' => Some(TokenType::RParen),
+            '{' => Some(TokenType::LBrace),
+            '}' => Some(TokenType::RBrace),
+            '[' => Some(TokenType::LBracket),
+            ']' => Some(TokenType::RBracket),
+            ';' => Some(TokenType::Semi),
+            ',' => Some(TokenType::Comma),
+            '.' => Some(TokenType::Dot),
+            ':' => Some(TokenType::Colon),
+            '+' => Some(TokenType::Plus),
+            '-' => Some(TokenType::Minus),
+            '*' => Some(TokenType::Star),
+            '/' => Some(TokenType::Slash),
+            '%' => Some(TokenType::Percent),
+            '<' => Some(TokenType::Lt),
+            '>' => Some(TokenType::Gt),
+            '&' => Some(TokenType::Amp),
+            '|' => Some(TokenType::Pipe),
+            '^' => Some(TokenType::Caret),
+            '~' => Some(TokenType::Tilde),
+            '!' => Some(TokenType::Bang),
+            '=' => Some(TokenType::Eq),
+            _ => None,
+        };
+        if let Some(t) = single {
+            tokens.push(Token { typ: t, line: l, col: c });
+            pos += 1; col += 1;
+            continue;
+        }
+
+        // Hex literal
+        if ch == '0' && pos + 1 < chars.len() && chars[pos + 1] == 'x' {
+            let mut val = String::new();
+            pos += 2; col += 2;
+            while pos < chars.len() && chars[pos].is_ascii_hexdigit() {
+                val.push(chars[pos]);
+                pos += 1; col += 1;
+            }
+            tokens.push(Token { typ: TokenType::HexString(val), line: l, col: c });
+            continue;
+        }
+
+        // Number
+        if ch.is_ascii_digit() {
+            let mut val = String::new();
+            while pos < chars.len() && (chars[pos].is_ascii_digit() || chars[pos] == '_') {
+                if chars[pos] != '_' { val.push(chars[pos]); }
+                pos += 1; col += 1;
+            }
+            tokens.push(Token { typ: TokenType::Number(val), line: l, col: c });
+            continue;
+        }
+
+        // Identifier / keyword
+        if ch.is_alphabetic() || ch == '_' {
+            let mut val = String::new();
+            while pos < chars.len() && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
+                val.push(chars[pos]);
+                pos += 1; col += 1;
+            }
+            // Check for assert!/assert_eq!
+            if (val == "assert" || val == "assert_eq") && pos < chars.len() && chars[pos] == '!' {
+                pos += 1; col += 1;
+                let tok = if val == "assert" { TokenType::AssertMacro } else { TokenType::AssertEqMacro };
+                tokens.push(Token { typ: tok, line: l, col: c });
+                continue;
+            }
+            let tok = match val.as_str() {
+                "use" => TokenType::Use,
+                "struct" => TokenType::Struct,
+                "impl" => TokenType::Impl,
+                "fn" => TokenType::Fn,
+                "pub" => TokenType::Pub,
+                "let" => TokenType::Let,
+                "mut" => TokenType::Mut,
+                "if" => TokenType::If,
+                "else" => TokenType::Else,
+                "for" => TokenType::For,
+                "return" => TokenType::Return,
+                "in" => TokenType::In,
+                "true" => TokenType::True,
+                "false" => TokenType::False,
+                "self" => TokenType::Self_,
+                _ => TokenType::Ident(val),
+            };
+            tokens.push(Token { typ: tok, line: l, col: c });
+            continue;
+        }
+
+        pos += 1; col += 1;
+    }
+
+    tokens.push(Token { typ: TokenType::Eof, line, col });
+    tokens
+}
+
+// ---------------------------------------------------------------------------
+// Parser
+// ---------------------------------------------------------------------------
+
+struct RustDslParser {
+    tokens: Vec<Token>,
+    pos: usize,
+    file: String,
+    errors: Vec<String>,
+}
+
+impl RustDslParser {
+    fn new(tokens: Vec<Token>, file: String) -> Self {
+        Self { tokens, pos: 0, file, errors: Vec::new() }
+    }
+
+    fn current(&self) -> &Token {
+        self.tokens.get(self.pos).unwrap_or(self.tokens.last().unwrap())
+    }
+
+    fn advance_clone(&mut self) -> Token {
+        let t = self.current().clone();
+        if self.pos < self.tokens.len() - 1 { self.pos += 1; }
+        t
+    }
+
+    fn expect(&mut self, expected: &TokenType) {
+        if std::mem::discriminant(&self.current().typ) != std::mem::discriminant(expected) {
+            self.errors.push(format!("Expected {:?}, got {:?} at {}:{}", expected, self.current().typ, self.current().line, self.current().col));
+        }
+        self.advance_clone();
+    }
+
+    fn match_tok(&mut self, expected: &TokenType) -> bool {
+        if std::mem::discriminant(&self.current().typ) == std::mem::discriminant(expected) {
+            self.advance_clone();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn loc(&self) -> SourceLocation {
+        SourceLocation { file: self.file.clone(), line: self.current().line, column: self.current().col }
+    }
+
+    fn parse(mut self) -> ParseResult {
+        // Skip use declarations
+        while matches!(self.current().typ, TokenType::Use) {
+            while !matches!(self.current().typ, TokenType::Semi | TokenType::Eof) { self.advance_clone(); }
+            if matches!(self.current().typ, TokenType::Semi) { self.advance_clone(); }
+        }
+
+        // Look for #[tsop::contract] struct
+        let mut properties: Vec<PropertyNode> = Vec::new();
+        let mut contract_name = String::new();
+        let mut parent_class = "SmartContract".to_string();
+        let mut methods: Vec<MethodNode> = Vec::new();
+
+        while !matches!(self.current().typ, TokenType::Eof) {
+            // Attribute: #[...]
+            if matches!(self.current().typ, TokenType::HashBracket) {
+                let attr = self.parse_attribute();
+
+                if attr == "tsop::contract" || attr == "tsop::stateful_contract" {
+                    if attr == "tsop::stateful_contract" {
+                        parent_class = "StatefulSmartContract".to_string();
+                    }
+                    // Parse struct
+                    if matches!(self.current().typ, TokenType::Pub) { self.advance_clone(); }
+                    self.expect(&TokenType::Struct);
+                    if let TokenType::Ident(name) = self.current().typ.clone() {
+                        contract_name = name;
+                        self.advance_clone();
+                    }
+                    self.expect(&TokenType::LBrace);
+
+                    while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
+                        // Check for #[readonly] attribute
+                        let mut readonly = false;
+                        if matches!(self.current().typ, TokenType::HashBracket) {
+                            let field_attr = self.parse_attribute();
+                            if field_attr == "readonly" { readonly = true; }
+                        }
+
+                        let loc = self.loc();
+                        if let TokenType::Ident(field_name) = self.current().typ.clone() {
+                            self.advance_clone();
+                            self.expect(&TokenType::Colon);
+                            let field_type = self.parse_rust_type();
+                            self.match_tok(&TokenType::Comma);
+
+                            if !readonly {
+                                // Check later if any field is mutable
+                            }
+
+                            properties.push(PropertyNode {
+                                name: snake_to_camel(&field_name),
+                                prop_type: field_type,
+                                readonly,
+                                source_location: loc,
+                            });
+                        } else {
+                            self.advance_clone();
+                        }
+                    }
+                    self.expect(&TokenType::RBrace);
+                } else if attr.starts_with("tsop::methods") {
+                    // Parse impl block
+                    if matches!(self.current().typ, TokenType::Impl) { self.advance_clone(); }
+                    // Skip type name
+                    if let TokenType::Ident(_) = self.current().typ { self.advance_clone(); }
+                    self.expect(&TokenType::LBrace);
+
+                    while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
+                        // Check for #[public] attribute
+                        let mut visibility = Visibility::Private;
+                        if matches!(self.current().typ, TokenType::HashBracket) {
+                            let method_attr = self.parse_attribute();
+                            if method_attr == "public" { visibility = Visibility::Public; }
+                        }
+                        if matches!(self.current().typ, TokenType::Pub) {
+                            self.advance_clone();
+                            visibility = Visibility::Public;
+                        }
+                        methods.push(self.parse_function(visibility));
+                    }
+                    self.expect(&TokenType::RBrace);
+                } else {
+                    // Unknown attribute, skip
+                    continue;
+                }
+            } else {
+                self.advance_clone();
+            }
+        }
+
+        // Determine parent class from property mutability
+        if properties.iter().any(|p| !p.readonly) {
+            parent_class = "StatefulSmartContract".to_string();
+        }
+
+        if contract_name.is_empty() {
+            self.errors.push("No TSOP contract struct found".to_string());
+            return ParseResult { contract: None, errors: self.errors };
+        }
+
+        // Build constructor
+        let loc = SourceLocation { file: self.file.clone(), line: 1, column: 1 };
+
+        // super(...) call as first statement
+        let super_args: Vec<Expression> = properties.iter()
+            .map(|p| Expression::Identifier { name: p.name.clone() })
+            .collect();
+        let super_call = Statement::ExpressionStatement {
+            expression: Expression::CallExpr {
+                callee: Box::new(Expression::Identifier { name: "super".to_string() }),
+                args: super_args,
+            },
+            source_location: loc.clone(),
+        };
+
+        // Property assignments
+        let mut ctor_body = vec![super_call];
+        for p in &properties {
+            ctor_body.push(Statement::Assignment {
+                target: Expression::PropertyAccess { property: p.name.clone() },
+                value: Expression::Identifier { name: p.name.clone() },
+                source_location: loc.clone(),
+            });
+        }
+
+        let constructor = MethodNode {
+            name: "constructor".to_string(),
+            params: properties.iter().map(|p| ParamNode {
+                name: p.name.clone(),
+                param_type: p.prop_type.clone(),
+            }).collect(),
+            body: ctor_body,
+            visibility: Visibility::Public,
+            source_location: loc,
+        };
+
+        let contract = ContractNode {
+            name: contract_name,
+            parent_class,
+            properties,
+            constructor,
+            methods,
+            source_file: self.file.clone(),
+        };
+
+        ParseResult { contract: Some(contract), errors: self.errors }
+    }
+
+    fn parse_attribute(&mut self) -> String {
+        // Already consumed #[
+        self.advance_clone(); // skip #[
+        let mut attr = String::new();
+        let mut depth = 1;
+        while depth > 0 && !matches!(self.current().typ, TokenType::Eof) {
+            match &self.current().typ {
+                TokenType::LBracket => { depth += 1; self.advance_clone(); }
+                TokenType::RBracket => {
+                    depth -= 1;
+                    if depth == 0 { self.advance_clone(); break; }
+                    self.advance_clone();
+                }
+                TokenType::Ident(name) => { attr.push_str(name); self.advance_clone(); }
+                TokenType::ColonColon => { attr.push_str("::"); self.advance_clone(); }
+                TokenType::LParen => { attr.push('('); self.advance_clone(); }
+                TokenType::RParen => { attr.push(')'); self.advance_clone(); }
+                _ => { self.advance_clone(); }
+            }
+        }
+        attr
+    }
+
+    fn parse_rust_type(&mut self) -> TypeNode {
+        if let TokenType::Ident(name) = self.current().typ.clone() {
+            self.advance_clone();
+            let mapped = map_rust_type(&name);
+            if let Some(prim) = PrimitiveTypeName::from_str(&mapped) {
+                TypeNode::Primitive(prim)
+            } else {
+                TypeNode::Custom(mapped)
+            }
+        } else {
+            self.advance_clone();
+            TypeNode::Custom("unknown".to_string())
+        }
+    }
+
+    fn parse_function(&mut self, visibility: Visibility) -> MethodNode {
+        let loc = self.loc();
+        self.expect(&TokenType::Fn);
+
+        let raw_name = if let TokenType::Ident(name) = self.current().typ.clone() {
+            self.advance_clone();
+            name
+        } else {
+            self.advance_clone();
+            "unknown".to_string()
+        };
+        let name = snake_to_camel(&raw_name);
+
+        self.expect(&TokenType::LParen);
+        let mut params: Vec<ParamNode> = Vec::new();
+
+        while !matches!(self.current().typ, TokenType::RParen | TokenType::Eof) {
+            // Skip &self, &mut self
+            if matches!(self.current().typ, TokenType::Amp) {
+                self.advance_clone();
+                if matches!(self.current().typ, TokenType::Mut) { self.advance_clone(); }
+                if matches!(self.current().typ, TokenType::Self_) {
+                    self.advance_clone();
+                    if matches!(self.current().typ, TokenType::Comma) { self.advance_clone(); }
+                    continue;
+                }
+            }
+            if matches!(self.current().typ, TokenType::Self_) {
+                self.advance_clone();
+                if matches!(self.current().typ, TokenType::Comma) { self.advance_clone(); }
+                continue;
+            }
+
+            if let TokenType::Ident(param_name) = self.current().typ.clone() {
+                self.advance_clone();
+                self.expect(&TokenType::Colon);
+                // Skip & and &mut before type
+                if matches!(self.current().typ, TokenType::Amp) {
+                    self.advance_clone();
+                    if matches!(self.current().typ, TokenType::Mut) { self.advance_clone(); }
+                }
+                let param_type = self.parse_rust_type();
+                params.push(ParamNode {
+                    name: snake_to_camel(&param_name),
+                    param_type,
+                });
+            } else {
+                self.advance_clone();
+            }
+            if matches!(self.current().typ, TokenType::Comma) { self.advance_clone(); }
+        }
+        self.expect(&TokenType::RParen);
+
+        // Optional return type
+        if matches!(self.current().typ, TokenType::Arrow) {
+            self.advance_clone();
+            self.parse_rust_type();
+        }
+
+        self.expect(&TokenType::LBrace);
+        let mut body: Vec<Statement> = Vec::new();
+        while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
+            if let Some(stmt) = self.parse_statement() {
+                body.push(stmt);
+            }
+        }
+        self.expect(&TokenType::RBrace);
+
+        MethodNode { name, params, body, visibility, source_location: loc }
+    }
+
+    fn parse_statement(&mut self) -> Option<Statement> {
+        let loc = self.loc();
+
+        // assert!(expr)
+        if matches!(self.current().typ, TokenType::AssertMacro) {
+            self.advance_clone();
+            self.expect(&TokenType::LParen);
+            let expr = self.parse_expression();
+            self.expect(&TokenType::RParen);
+            self.match_tok(&TokenType::Semi);
+            return Some(Statement::ExpressionStatement {
+                expression: Expression::CallExpr {
+                    callee: Box::new(Expression::Identifier { name: "assert".to_string() }),
+                    args: vec![expr],
+                },
+                source_location: loc,
+            });
+        }
+
+        // assert_eq!(a, b)
+        if matches!(self.current().typ, TokenType::AssertEqMacro) {
+            self.advance_clone();
+            self.expect(&TokenType::LParen);
+            let left = self.parse_expression();
+            self.expect(&TokenType::Comma);
+            let right = self.parse_expression();
+            self.expect(&TokenType::RParen);
+            self.match_tok(&TokenType::Semi);
+            return Some(Statement::ExpressionStatement {
+                expression: Expression::CallExpr {
+                    callee: Box::new(Expression::Identifier { name: "assert".to_string() }),
+                    args: vec![Expression::BinaryExpr {
+                        op: BinaryOp::StrictEq,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    }],
+                },
+                source_location: loc,
+            });
+        }
+
+        // let [mut] name [: type] = expr;
+        if matches!(self.current().typ, TokenType::Let) {
+            self.advance_clone();
+            let mutable = self.match_tok(&TokenType::Mut);
+            let var_name = if let TokenType::Ident(name) = self.current().typ.clone() {
+                self.advance_clone();
+                snake_to_camel(&name)
+            } else {
+                self.advance_clone();
+                "unknown".to_string()
+            };
+            let var_type = if matches!(self.current().typ, TokenType::Colon) {
+                self.advance_clone();
+                if matches!(self.current().typ, TokenType::Amp) { self.advance_clone(); }
+                if matches!(self.current().typ, TokenType::Mut) { self.advance_clone(); }
+                Some(self.parse_rust_type())
+            } else {
+                None
+            };
+            self.expect(&TokenType::Eq);
+            let init = self.parse_expression();
+            self.match_tok(&TokenType::Semi);
+            return Some(Statement::VariableDecl {
+                name: var_name, var_type, mutable, init, source_location: loc,
+            });
+        }
+
+        // if
+        if matches!(self.current().typ, TokenType::If) {
+            self.advance_clone();
+            let condition = self.parse_expression();
+            self.expect(&TokenType::LBrace);
+            let mut then_branch = Vec::new();
+            while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
+                if let Some(s) = self.parse_statement() { then_branch.push(s); }
+            }
+            self.expect(&TokenType::RBrace);
+            let else_branch = if matches!(self.current().typ, TokenType::Else) {
+                self.advance_clone();
+                self.expect(&TokenType::LBrace);
+                let mut eb = Vec::new();
+                while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
+                    if let Some(s) = self.parse_statement() { eb.push(s); }
+                }
+                self.expect(&TokenType::RBrace);
+                Some(eb)
+            } else {
+                None
+            };
+            return Some(Statement::IfStatement { condition, then_branch, else_branch, source_location: loc });
+        }
+
+        // return
+        if matches!(self.current().typ, TokenType::Return) {
+            self.advance_clone();
+            let value = if !matches!(self.current().typ, TokenType::Semi | TokenType::RBrace) {
+                Some(self.parse_expression())
+            } else {
+                None
+            };
+            self.match_tok(&TokenType::Semi);
+            return Some(Statement::ReturnStatement { value, source_location: loc });
+        }
+
+        // Expression statement
+        let expr = self.parse_expression();
+
+        // Assignment
+        if matches!(self.current().typ, TokenType::Eq) {
+            self.advance_clone();
+            let value = self.parse_expression();
+            self.match_tok(&TokenType::Semi);
+            return Some(Statement::Assignment {
+                target: self.convert_self_access(expr),
+                value,
+                source_location: loc,
+            });
+        }
+
+        // Compound assignments
+        if matches!(self.current().typ, TokenType::PlusEq) {
+            self.advance_clone();
+            let rhs = self.parse_expression();
+            self.match_tok(&TokenType::Semi);
+            let target = self.convert_self_access(expr.clone());
+            return Some(Statement::Assignment {
+                target: target.clone(),
+                value: Expression::BinaryExpr { op: BinaryOp::Add, left: Box::new(target), right: Box::new(rhs) },
+                source_location: loc,
+            });
+        }
+        if matches!(self.current().typ, TokenType::MinusEq) {
+            self.advance_clone();
+            let rhs = self.parse_expression();
+            self.match_tok(&TokenType::Semi);
+            let target = self.convert_self_access(expr.clone());
+            return Some(Statement::Assignment {
+                target: target.clone(),
+                value: Expression::BinaryExpr { op: BinaryOp::Sub, left: Box::new(target), right: Box::new(rhs) },
+                source_location: loc,
+            });
+        }
+
+        self.match_tok(&TokenType::Semi);
+        Some(Statement::ExpressionStatement { expression: expr, source_location: loc })
+    }
+
+    fn convert_self_access(&self, expr: Expression) -> Expression {
+        if let Expression::MemberExpr { ref object, ref property } = expr {
+            if let Expression::Identifier { ref name } = **object {
+                if name == "self" {
+                    return Expression::PropertyAccess { property: snake_to_camel(property) };
+                }
+            }
+        }
+        expr
+    }
+
+    // Expression parsing with precedence climbing
+    fn parse_expression(&mut self) -> Expression { self.parse_or() }
+
+    fn parse_or(&mut self) -> Expression {
+        let mut left = self.parse_and();
+        while matches!(self.current().typ, TokenType::PipePipe) {
+            self.advance_clone();
+            let right = self.parse_and();
+            left = Expression::BinaryExpr { op: BinaryOp::Or, left: Box::new(left), right: Box::new(right) };
+        }
+        left
+    }
+
+    fn parse_and(&mut self) -> Expression {
+        let mut left = self.parse_bit_or();
+        while matches!(self.current().typ, TokenType::AmpAmp) {
+            self.advance_clone();
+            let right = self.parse_bit_or();
+            left = Expression::BinaryExpr { op: BinaryOp::And, left: Box::new(left), right: Box::new(right) };
+        }
+        left
+    }
+
+    fn parse_bit_or(&mut self) -> Expression {
+        let mut left = self.parse_bit_xor();
+        while matches!(self.current().typ, TokenType::Pipe) {
+            self.advance_clone();
+            left = Expression::BinaryExpr { op: BinaryOp::BitOr, left: Box::new(left), right: Box::new(self.parse_bit_xor()) };
+        }
+        left
+    }
+
+    fn parse_bit_xor(&mut self) -> Expression {
+        let mut left = self.parse_bit_and();
+        while matches!(self.current().typ, TokenType::Caret) {
+            self.advance_clone();
+            left = Expression::BinaryExpr { op: BinaryOp::BitXor, left: Box::new(left), right: Box::new(self.parse_bit_and()) };
+        }
+        left
+    }
+
+    fn parse_bit_and(&mut self) -> Expression {
+        let mut left = self.parse_equality();
+        while matches!(self.current().typ, TokenType::Amp) {
+            self.advance_clone();
+            left = Expression::BinaryExpr { op: BinaryOp::BitAnd, left: Box::new(left), right: Box::new(self.parse_equality()) };
+        }
+        left
+    }
+
+    fn parse_equality(&mut self) -> Expression {
+        let mut left = self.parse_comparison();
+        loop {
+            let op = match self.current().typ {
+                TokenType::EqEq => BinaryOp::StrictEq,
+                TokenType::BangEq => BinaryOp::StrictNe,
+                _ => break,
+            };
+            self.advance_clone();
+            left = Expression::BinaryExpr { op, left: Box::new(left), right: Box::new(self.parse_comparison()) };
+        }
+        left
+    }
+
+    fn parse_comparison(&mut self) -> Expression {
+        let mut left = self.parse_add_sub();
+        loop {
+            let op = match self.current().typ {
+                TokenType::Lt => BinaryOp::Lt,
+                TokenType::LtEq => BinaryOp::Le,
+                TokenType::Gt => BinaryOp::Gt,
+                TokenType::GtEq => BinaryOp::Ge,
+                _ => break,
+            };
+            self.advance_clone();
+            left = Expression::BinaryExpr { op, left: Box::new(left), right: Box::new(self.parse_add_sub()) };
+        }
+        left
+    }
+
+    fn parse_add_sub(&mut self) -> Expression {
+        let mut left = self.parse_mul_div();
+        loop {
+            let op = match self.current().typ {
+                TokenType::Plus => BinaryOp::Add,
+                TokenType::Minus => BinaryOp::Sub,
+                _ => break,
+            };
+            self.advance_clone();
+            left = Expression::BinaryExpr { op, left: Box::new(left), right: Box::new(self.parse_mul_div()) };
+        }
+        left
+    }
+
+    fn parse_mul_div(&mut self) -> Expression {
+        let mut left = self.parse_unary();
+        loop {
+            let op = match self.current().typ {
+                TokenType::Star => BinaryOp::Mul,
+                TokenType::Slash => BinaryOp::Div,
+                TokenType::Percent => BinaryOp::Mod,
+                _ => break,
+            };
+            self.advance_clone();
+            left = Expression::BinaryExpr { op, left: Box::new(left), right: Box::new(self.parse_unary()) };
+        }
+        left
+    }
+
+    fn parse_unary(&mut self) -> Expression {
+        match self.current().typ {
+            TokenType::Bang => { self.advance_clone(); Expression::UnaryExpr { op: UnaryOp::Not, operand: Box::new(self.parse_unary()) } }
+            TokenType::Minus => { self.advance_clone(); Expression::UnaryExpr { op: UnaryOp::Neg, operand: Box::new(self.parse_unary()) } }
+            TokenType::Tilde => { self.advance_clone(); Expression::UnaryExpr { op: UnaryOp::BitNot, operand: Box::new(self.parse_unary()) } }
+            TokenType::Amp => {
+                self.advance_clone();
+                if matches!(self.current().typ, TokenType::Mut) { self.advance_clone(); }
+                self.parse_postfix()
+            }
+            _ => self.parse_postfix(),
+        }
+    }
+
+    fn parse_postfix(&mut self) -> Expression {
+        let mut expr = self.parse_primary();
+        loop {
+            if matches!(self.current().typ, TokenType::LParen) {
+                self.advance_clone();
+                let mut args = Vec::new();
+                while !matches!(self.current().typ, TokenType::RParen | TokenType::Eof) {
+                    args.push(self.parse_expression());
+                    if matches!(self.current().typ, TokenType::Comma) { self.advance_clone(); }
+                }
+                self.expect(&TokenType::RParen);
+                expr = Expression::CallExpr { callee: Box::new(expr), args };
+            } else if matches!(self.current().typ, TokenType::Dot) {
+                self.advance_clone();
+                let prop = if let TokenType::Ident(name) = self.current().typ.clone() {
+                    self.advance_clone();
+                    snake_to_camel(&name)
+                } else {
+                    self.advance_clone();
+                    "unknown".to_string()
+                };
+                // self.field -> PropertyAccess
+                if let Expression::Identifier { ref name } = expr {
+                    if name == "self" {
+                        expr = Expression::PropertyAccess { property: prop };
+                        continue;
+                    }
+                }
+                expr = Expression::MemberExpr { object: Box::new(expr), property: prop };
+            } else if matches!(self.current().typ, TokenType::ColonColon) {
+                self.advance_clone();
+                if let TokenType::Ident(name) = self.current().typ.clone() {
+                    self.advance_clone();
+                    expr = Expression::Identifier { name: snake_to_camel(&name) };
+                }
+            } else if matches!(self.current().typ, TokenType::LBracket) {
+                self.advance_clone();
+                let index = self.parse_expression();
+                self.expect(&TokenType::RBracket);
+                expr = Expression::IndexAccess { object: Box::new(expr), index: Box::new(index) };
+            } else {
+                break;
+            }
+        }
+        expr
+    }
+
+    fn parse_primary(&mut self) -> Expression {
+        match self.current().typ.clone() {
+            TokenType::Number(val) => {
+                self.advance_clone();
+                let n: i64 = val.parse().unwrap_or(0);
+                Expression::BigIntLiteral { value: n }
+            }
+            TokenType::HexString(val) => {
+                self.advance_clone();
+                Expression::ByteStringLiteral { value: val }
+            }
+            TokenType::True => { self.advance_clone(); Expression::BoolLiteral { value: true } }
+            TokenType::False => { self.advance_clone(); Expression::BoolLiteral { value: false } }
+            TokenType::Self_ => {
+                self.advance_clone();
+                Expression::Identifier { name: "self".to_string() }
+            }
+            TokenType::LParen => {
+                self.advance_clone();
+                let expr = self.parse_expression();
+                self.expect(&TokenType::RParen);
+                expr
+            }
+            TokenType::Ident(name) => {
+                self.advance_clone();
+                let mapped = map_rust_builtin(&name);
+                Expression::Identifier { name: mapped }
+            }
+            _ => {
+                let tok = self.current().clone();
+                self.advance_clone();
+                self.errors.push(format!(
+                    "unsupported token '{:?}' at {}:{} — not valid in TSOP contract",
+                    tok.typ, tok.line, tok.col));
+                Expression::Identifier { name: "unknown".to_string() }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn snake_to_camel(name: &str) -> String {
+    let parts: Vec<&str> = name.split('_').collect();
+    if parts.len() <= 1 {
+        return name.to_string();
+    }
+    let mut result = parts[0].to_string();
+    for part in &parts[1..] {
+        if !part.is_empty() {
+            let mut chars = part.chars();
+            if let Some(first) = chars.next() {
+                result.push(first.to_uppercase().next().unwrap());
+                result.extend(chars);
+            }
+        }
+    }
+    result
+}
+
+fn map_rust_type(name: &str) -> String {
+    match name {
+        "Bigint" | "i64" | "u64" | "i128" | "u128" => "bigint".to_string(),
+        "Bool" | "bool" => "boolean".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+fn map_rust_builtin(name: &str) -> String {
+    let camel = snake_to_camel(name);
+    // Map specific Rust builtins
+    match camel.as_str() {
+        "hash160" => "hash160".to_string(),
+        "hash256" => "hash256".to_string(),
+        "sha256" => "sha256".to_string(),
+        "ripemd160" => "ripemd160".to_string(),
+        "checkSig" => "checkSig".to_string(),
+        "checkMultiSig" => "checkMultiSig".to_string(),
+        "checkPreimage" => "checkPreimage".to_string(),
+        "verifyRabinSig" => "verifyRabinSig".to_string(),
+        "num2bin" => "num2bin".to_string(),
+        "extractLocktime" => "extractLocktime".to_string(),
+        "extractOutputHash" => "extractOutputHash".to_string(),
+        _ => camel,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+pub fn parse_rust_dsl(source: &str, file_name: Option<&str>) -> ParseResult {
+    let file = file_name.unwrap_or("contract.tsop.rs").to_string();
+    let tokens = tokenize(source);
+    let parser = RustDslParser::new(tokens, file);
+    parser.parse()
+}

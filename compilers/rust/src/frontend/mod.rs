@@ -9,5 +9,8 @@
 pub mod anf_lower;
 pub mod ast;
 pub mod parser;
+pub mod parser_move;
+pub mod parser_rustmacro;
+pub mod parser_sol;
 pub mod typecheck;
 pub mod validator;

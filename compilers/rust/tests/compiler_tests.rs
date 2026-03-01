@@ -775,6 +775,7 @@ fn example_source(contract_dir: &str, file_name: &str) -> String {
         .join("..")
         .join("..")
         .join("examples")
+        .join("ts")
         .join(contract_dir)
         .join(file_name);
     std::fs::read_to_string(&path)

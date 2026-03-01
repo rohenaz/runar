@@ -44,8 +44,8 @@ pub fn compile_from_source_str(
     source: &str,
     file_name: Option<&str>,
 ) -> Result<TSOPArtifact, String> {
-    // Pass 1: Parse
-    let parse_result = frontend::parser::parse(source, file_name);
+    // Pass 1: Parse (auto-selects parser based on file extension)
+    let parse_result = frontend::parser::parse_source(source, file_name);
     if !parse_result.errors.is_empty() {
         let error_msgs: Vec<String> = parse_result.errors.iter().map(|e| e.to_string()).collect();
         return Err(format!("Parse errors:\n  {}", error_msgs.join("\n  ")));
@@ -99,7 +99,7 @@ pub fn compile_source_str_to_ir(
     source: &str,
     file_name: Option<&str>,
 ) -> Result<ir::ANFProgram, String> {
-    let parse_result = frontend::parser::parse(source, file_name);
+    let parse_result = frontend::parser::parse_source(source, file_name);
     if !parse_result.errors.is_empty() {
         let error_msgs: Vec<String> = parse_result.errors.iter().map(|e| e.to_string()).collect();
         return Err(format!("Parse errors:\n  {}", error_msgs.join("\n  ")));

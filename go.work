@@ -1,0 +1,8 @@
+go 1.26
+
+use (
+	./compilers/go
+	./conformance
+	./examples/go
+	./packages/tsop-go
+)

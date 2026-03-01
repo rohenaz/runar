@@ -519,6 +519,19 @@ func (tc *typeChecker) checkCallExpr(e CallExpr, env *typeEnv) string {
 		if sig, ok := builtinFunctions[id.Name]; ok {
 			return tc.checkCallArgs(id.Name, sig, e.Args, env)
 		}
+		// Check if it's a known contract method
+		if sig, ok := tc.methodSigs[id.Name]; ok {
+			return tc.checkCallArgs(id.Name, sig, e.Args, env)
+		}
+		// Check if it's a local variable
+		if _, found := env.lookup(id.Name); found {
+			for _, arg := range e.Args {
+				tc.inferExprType(arg, env)
+			}
+			return "<unknown>"
+		}
+		tc.errors = append(tc.errors, fmt.Sprintf(
+			"unknown function '%s' — only TSOP built-in functions and contract methods are allowed", id.Name))
 		for _, arg := range e.Args {
 			tc.inferExprType(arg, env)
 		}
@@ -530,9 +543,17 @@ func (tc *typeChecker) checkCallExpr(e CallExpr, env *typeEnv) string {
 		if pa.Property == "getStateScript" {
 			return "ByteString"
 		}
+		if pa.Property == "addOutput" {
+			for _, arg := range e.Args {
+				tc.inferExprType(arg, env)
+			}
+			return "void"
+		}
 		if sig, ok := tc.methodSigs[pa.Property]; ok {
 			return tc.checkCallArgs(pa.Property, sig, e.Args, env)
 		}
+		tc.errors = append(tc.errors, fmt.Sprintf(
+			"unknown method 'this.%s' — only TSOP built-in methods and contract methods are allowed", pa.Property))
 		for _, arg := range e.Args {
 			tc.inferExprType(arg, env)
 		}
@@ -553,13 +574,22 @@ func (tc *typeChecker) checkCallExpr(e CallExpr, env *typeEnv) string {
 				return tc.checkCallArgs(me.Property, sig, e.Args, env)
 			}
 		}
+		// Not this.method — reject (e.g. Math.floor)
+		objName := "<expr>"
+		if id, ok := me.Object.(Identifier); ok {
+			objName = id.Name
+		}
+		tc.errors = append(tc.errors, fmt.Sprintf(
+			"unknown function '%s.%s' — only TSOP built-in functions and contract methods are allowed",
+			objName, me.Property))
 		for _, arg := range e.Args {
 			tc.inferExprType(arg, env)
 		}
 		return "<unknown>"
 	}
 
-	// Fallback
+	// Fallback — unknown callee shape
+	tc.errors = append(tc.errors, "unsupported function call expression — only TSOP built-in functions and contract methods are allowed")
 	tc.inferExprType(e.Callee, env)
 	for _, arg := range e.Args {
 		tc.inferExprType(arg, env)

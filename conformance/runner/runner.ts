@@ -29,6 +29,8 @@ function cargoAwareEnv(): NodeJS.ProcessEnv {
 
 export interface ConformanceResult {
   testName: string;
+  /** Source format used (e.g. '.tsop.ts', '.tsop.yaml', '.tsop.sol', '.tsop.move', '.tsop.go', '.tsop.rs') */
+  format?: string;
   tsCompiler: CompilerOutput;
   goCompiler?: CompilerOutput;
   rustCompiler?: CompilerOutput;
@@ -36,6 +38,17 @@ export interface ConformanceResult {
   scriptMatch: boolean;
   errors: string[];
 }
+
+/**
+ * Known input format extensions and which compilers support them.
+ */
+export const INPUT_FORMATS = [
+  { ext: '.tsop.ts',   compilers: ['ts', 'go', 'rust'] as const },
+  { ext: '.tsop.sol',  compilers: ['ts', 'go', 'rust'] as const },
+  { ext: '.tsop.move', compilers: ['ts', 'go', 'rust'] as const },
+  { ext: '.tsop.go',   compilers: ['go'] as const },
+  { ext: '.tsop.rs',   compilers: ['rust'] as const },
+] as const;
 
 export interface CompilerOutput {
   irJson: string;        // canonical JSON of ANF IR
@@ -531,4 +544,197 @@ export async function updateGoldenFiles(testDir: string): Promise<void> {
   if (tsResult.scriptHex) {
     writeFileSync(join(testDir, 'expected-script.hex'), tsResult.scriptHex + '\n', 'utf-8');
   }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-format conformance testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Discover all input format source files in a test directory.
+ *
+ * Returns an array of { ext, sourceFile } for each format found.
+ */
+function discoverFormats(testDir: string, testName: string): { ext: string; sourceFile: string }[] {
+  const found: { ext: string; sourceFile: string }[] = [];
+  for (const { ext } of INPUT_FORMATS) {
+    const sourceFile = join(testDir, `${testName}${ext}`);
+    if (existsSync(sourceFile)) {
+      found.push({ ext, sourceFile });
+    }
+  }
+  return found;
+}
+
+/**
+ * Run a single conformance test for a specific format variant.
+ *
+ * Only runs compilers that support the given format. Results are compared
+ * against the same golden files and against each other.
+ */
+export async function runConformanceTestForFormat(
+  testDir: string,
+  format: { ext: string; sourceFile: string },
+): Promise<ConformanceResult> {
+  const testName = basename(testDir);
+  const expectedIrFile = join(testDir, 'expected-ir.json');
+  const expectedScriptFile = join(testDir, 'expected-script.hex');
+
+  const source = readFileSync(format.sourceFile, 'utf-8');
+  const errors: string[] = [];
+
+  // Determine which compilers support this format
+  const formatDef = INPUT_FORMATS.find(f => f.ext === format.ext);
+  const supportedCompilers = formatDef?.compilers ?? [];
+
+  // Run compilers that support this format
+  const tsResult = supportedCompilers.includes('ts')
+    ? runTsCompiler(source, format.sourceFile)
+    : { irJson: '', scriptHex: '', scriptAsm: '', success: false, error: 'Format not supported by TS compiler', durationMs: 0 } as CompilerOutput;
+
+  const goResult = supportedCompilers.includes('go')
+    ? runGoCompiler(source, format.sourceFile)
+    : undefined;
+
+  const rustResult = supportedCompilers.includes('rust')
+    ? runRustCompiler(source, format.sourceFile)
+    : undefined;
+
+  if (supportedCompilers.includes('ts') && !tsResult.success) {
+    errors.push(`TypeScript compiler failed on ${format.ext}: ${tsResult.error ?? 'unknown error'}`);
+  }
+  if (goResult && !goResult.success) {
+    errors.push(`Go compiler failed on ${format.ext}: ${goResult.error ?? 'unknown error'}`);
+  }
+  if (rustResult && !rustResult.success) {
+    errors.push(`Rust compiler failed on ${format.ext}: ${rustResult.error ?? 'unknown error'}`);
+  }
+
+  // Cross-compiler comparison within this format
+  const irMatch = compareIR(
+    supportedCompilers.includes('ts') ? tsResult : undefined,
+    goResult,
+    rustResult,
+  );
+  if (!irMatch) {
+    errors.push(`IR mismatch between compilers for ${format.ext}`);
+  }
+
+  const scriptMatch = compareScript(
+    supportedCompilers.includes('ts') ? tsResult : undefined,
+    goResult,
+    rustResult,
+  );
+  if (!scriptMatch) {
+    errors.push(`Script hex mismatch between compilers for ${format.ext}`);
+  }
+
+  // Golden file comparison (use any successful compiler output)
+  if (existsSync(expectedIrFile)) {
+    const expectedIr = canonicalizeJson(readFileSync(expectedIrFile, 'utf-8'));
+    const allOutputs = [
+      supportedCompilers.includes('ts') ? tsResult : undefined,
+      goResult,
+      rustResult,
+    ].filter((o): o is CompilerOutput => o !== undefined && o.success && o.irJson !== '');
+
+    for (const output of allOutputs) {
+      if (output.irJson !== expectedIr) {
+        errors.push(`IR does not match golden file for ${format.ext}`);
+        break;
+      }
+    }
+  }
+
+  if (existsSync(expectedScriptFile)) {
+    const expectedScript = readFileSync(expectedScriptFile, 'utf-8').trim().toLowerCase();
+    const allOutputs = [
+      supportedCompilers.includes('ts') ? tsResult : undefined,
+      goResult,
+      rustResult,
+    ].filter((o): o is CompilerOutput => o !== undefined && o.success && o.scriptHex !== '');
+
+    for (const output of allOutputs) {
+      const normalized = output.scriptHex.toLowerCase().replace(/\s/g, '');
+      if (normalized !== expectedScript) {
+        errors.push(`Script does not match golden file for ${format.ext}`);
+        break;
+      }
+    }
+  }
+
+  return {
+    testName: `${testName} [${format.ext}]`,
+    format: format.ext,
+    tsCompiler: tsResult,
+    goCompiler: goResult,
+    rustCompiler: rustResult,
+    irMatch,
+    scriptMatch,
+    errors,
+  };
+}
+
+/**
+ * Run conformance tests for all discovered formats in a single test directory.
+ *
+ * For each format variant found (e.g., .tsop.ts, .tsop.yaml, .tsop.sol),
+ * run the test independently. Also checks cross-format consistency: all
+ * formats must produce the same output.
+ */
+export async function runMultiFormatConformanceTest(
+  testDir: string,
+): Promise<ConformanceResult[]> {
+  const testName = basename(testDir);
+  const formats = discoverFormats(testDir, testName);
+
+  if (formats.length === 0) {
+    return [{
+      testName,
+      tsCompiler: { irJson: '', scriptHex: '', scriptAsm: '', success: false, error: 'No source files found', durationMs: 0 },
+      irMatch: false,
+      scriptMatch: false,
+      errors: ['No source files found in test directory'],
+    }];
+  }
+
+  const results: ConformanceResult[] = [];
+  for (const format of formats) {
+    results.push(await runConformanceTestForFormat(testDir, format));
+  }
+
+  return results;
+}
+
+/**
+ * Discover and run multi-format conformance tests across all test directories.
+ */
+export async function runAllMultiFormatConformanceTests(
+  testsDir: string,
+  options?: { filter?: string; format?: string },
+): Promise<ConformanceResult[]> {
+  const entries = readdirSync(testsDir, { withFileTypes: true });
+  let testDirs = entries
+    .filter((e) => e.isDirectory())
+    .map((e) => join(testsDir, e.name))
+    .sort();
+
+  if (options?.filter) {
+    const filterLower = options.filter.toLowerCase();
+    testDirs = testDirs.filter((d) => basename(d).toLowerCase().includes(filterLower));
+  }
+
+  const allResults: ConformanceResult[] = [];
+  for (const testDir of testDirs) {
+    const results = await runMultiFormatConformanceTest(testDir);
+
+    // If a specific format filter is requested, only include matching results
+    if (options?.format) {
+      allResults.push(...results.filter(r => r.format === options.format));
+    } else {
+      allResults.push(...results);
+    }
+  }
+
+  return allResults;
 }

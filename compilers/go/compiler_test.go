@@ -1080,7 +1080,7 @@ func TestSourceCompile_AllConformanceFromSource(t *testing.T) {
 }
 
 func TestSourceCompile_ExampleP2PKH(t *testing.T) {
-	source := filepath.Join(conformanceDir(), "..", "..", "examples", "p2pkh", "P2PKH.tsop.ts")
+	source := filepath.Join(conformanceDir(), "..", "..", "examples", "ts", "p2pkh", "P2PKH.tsop.ts")
 	artifact, err := CompileFromSource(source)
 	if err != nil {
 		t.Fatalf("source compilation failed: %v", err)
@@ -1094,7 +1094,7 @@ func TestSourceCompile_ExampleP2PKH(t *testing.T) {
 }
 
 func TestSourceCompile_ExampleEscrow(t *testing.T) {
-	source := filepath.Join(conformanceDir(), "..", "..", "examples", "escrow", "Escrow.tsop.ts")
+	source := filepath.Join(conformanceDir(), "..", "..", "examples", "ts", "escrow", "Escrow.tsop.ts")
 	artifact, err := CompileFromSource(source)
 	if err != nil {
 		t.Fatalf("source compilation failed: %v", err)

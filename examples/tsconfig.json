@@ -23,6 +23,6 @@
   "include": [
     "**/*.tsop.ts",
     "**/*.test.ts",
-    "sdk-usage-typescript.ts"
+    "sdk-usage/sdk-usage-typescript.ts"
   ]
 }

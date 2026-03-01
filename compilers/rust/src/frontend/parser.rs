@@ -1104,3 +1104,29 @@ fn bigint_to_i64(bigint_lit: &swc::BigInt) -> i64 {
     let s = bigint_lit.value.to_string();
     i64::from_str(&s).unwrap_or(0)
 }
+
+// ---------------------------------------------------------------------------
+// Multi-format dispatch
+// ---------------------------------------------------------------------------
+
+/// Parse a source string, automatically selecting the parser based on file extension.
+///
+/// Supported extensions:
+/// - `.tsop.sol` -> Solidity-like parser
+/// - `.tsop.move` -> Move-style parser
+/// - `.tsop.rs` -> Rust DSL parser
+/// - anything else (including `.tsop.ts`) -> TypeScript parser (default)
+pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
+    let name = file_name.unwrap_or("contract.ts");
+    if name.ends_with(".tsop.sol") {
+        return super::parser_sol::parse_solidity(source, file_name);
+    }
+    if name.ends_with(".tsop.move") {
+        return super::parser_move::parse_move(source, file_name);
+    }
+    if name.ends_with(".tsop.rs") {
+        return super::parser_rustmacro::parse_rust_dsl(source, file_name);
+    }
+    // Default: TypeScript parser
+    parse(source, file_name)
+}

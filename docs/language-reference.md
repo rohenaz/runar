@@ -386,6 +386,7 @@ The following TypeScript features are explicitly excluded from TSOP, with ration
 | Dynamic arrays (`T[]`) | No heap allocation |
 | `number` | Ambiguous precision; use `bigint` |
 | Decorators | Not representable in Script |
+| Arbitrary function calls | Only TSOP built-in functions and contract methods are allowed |
 | Arbitrary imports | Sandboxed compilation |
 | Multiple classes per file | One contract = one locking script |
 | Enums | Use `bigint` constants |

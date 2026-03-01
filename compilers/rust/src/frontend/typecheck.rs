@@ -716,7 +716,24 @@ impl<'a> TypeChecker<'a> {
                 return self.check_call_args(name, &sig_params, sig_return_type, args, env);
             }
 
-            // Could be a locally scoped function variable
+            // Check if it's a known contract method
+            if let Some((params, return_type)) = self.method_sigs.get(name).cloned() {
+                let param_strs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
+                return self.check_call_args(name, &param_strs, &return_type, args, env);
+            }
+
+            // Check if it's a local variable
+            if env.lookup(name).is_some() {
+                for arg in args {
+                    self.infer_expr_type(arg, env);
+                }
+                return "<unknown>".to_string();
+            }
+
+            self.errors.push(format!(
+                "unknown function '{}' — only TSOP built-in functions and contract methods are allowed",
+                name
+            ));
             for arg in args {
                 self.infer_expr_type(arg, env);
             }
@@ -733,12 +750,23 @@ impl<'a> TypeChecker<'a> {
                 return BYTESTRING.to_string();
             }
 
+            if property == "addOutput" {
+                for arg in args {
+                    self.infer_expr_type(arg, env);
+                }
+                return VOID.to_string();
+            }
+
             // Check contract method signatures
             if let Some((params, return_type)) = self.method_sigs.get(property).cloned() {
                 let param_strs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
                 return self.check_call_args(property, &param_strs, &return_type, args, env);
             }
 
+            self.errors.push(format!(
+                "unknown method 'self.{}' — only TSOP built-in methods and contract methods are allowed",
+                property
+            ));
             for arg in args {
                 self.infer_expr_type(arg, env);
             }
@@ -747,6 +775,11 @@ impl<'a> TypeChecker<'a> {
 
         // member_expr call: obj.method(...)
         if let Expression::MemberExpr { object, property } = callee {
+            // .clone() is a Rust idiom — allow it as a no-op
+            if property == "clone" {
+                return self.infer_expr_type(object, env);
+            }
+
             let obj_type = self.infer_expr_type(object, env);
 
             if obj_type == "<this>"
@@ -768,13 +801,25 @@ impl<'a> TypeChecker<'a> {
                 }
             }
 
+            // Not this.method — reject (e.g. std::process::exit)
+            let obj_name = match object.as_ref() {
+                Expression::Identifier { name } => name.clone(),
+                _ => "<expr>".to_string(),
+            };
+            self.errors.push(format!(
+                "unknown function '{}.{}' — only TSOP built-in functions and contract methods are allowed",
+                obj_name, property
+            ));
             for arg in args {
                 self.infer_expr_type(arg, env);
             }
             return "<unknown>".to_string();
         }
 
-        // Fallback
+        // Fallback — unknown callee shape
+        self.errors.push(
+            "unsupported function call expression — only TSOP built-in functions and contract methods are allowed".to_string()
+        );
         self.infer_expr_type(callee, env);
         for arg in args {
             self.infer_expr_type(arg, env);

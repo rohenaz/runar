@@ -1,0 +1,40 @@
+{
+  "description": "Registry of TSOP input formats and which compilers support them.",
+  "formats": [
+    {
+      "extension": ".tsop.ts",
+      "name": "TypeScript",
+      "description": "Primary TypeScript contract syntax",
+      "compilers": ["ts", "go", "rust"],
+      "status": "stable"
+    },
+    {
+      "extension": ".tsop.sol",
+      "name": "Solidity-like",
+      "description": "Solidity-inspired contract syntax",
+      "compilers": ["ts", "go", "rust"],
+      "status": "experimental"
+    },
+    {
+      "extension": ".tsop.move",
+      "name": "Move-style",
+      "description": "Move-inspired resource language syntax",
+      "compilers": ["ts", "go", "rust"],
+      "status": "experimental"
+    },
+    {
+      "extension": ".tsop.go",
+      "name": "Go Contracts",
+      "description": "Go struct/method contract syntax",
+      "compilers": ["go"],
+      "status": "experimental"
+    },
+    {
+      "extension": ".tsop.rs",
+      "name": "Rust DSL",
+      "description": "Rust attribute-macro contract syntax",
+      "compilers": ["rust"],
+      "status": "experimental"
+    }
+  ]
+}

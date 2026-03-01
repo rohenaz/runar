@@ -825,4 +825,85 @@ describe('Pass 3: Type-Check', () => {
       expect(result.errors).toEqual([]);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Unknown function rejection
+  // ---------------------------------------------------------------------------
+
+  describe('unknown function rejection', () => {
+    it('rejects Math.floor (non-TSOP member expression call)', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(a: bigint) {
+            const b: bigint = Math.floor(a);
+            assert(b > 0n);
+          }
+        }
+      `;
+      const result = typecheckSource(source);
+      expect(hasError(result, "Unknown function 'Math.floor'")).toBe(true);
+    });
+
+    it('rejects console.log (non-TSOP member expression call)', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(a: bigint) {
+            console.log(a);
+            assert(a > 0n);
+          }
+        }
+      `;
+      const result = typecheckSource(source);
+      expect(hasError(result, "Unknown function 'console.log'")).toBe(true);
+    });
+
+    it('rejects unknown standalone function calls', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(a: bigint) {
+            const b: bigint = someRandomFunc(a);
+            assert(b > 0n);
+          }
+        }
+      `;
+      const result = typecheckSource(source);
+      expect(hasError(result, "Unknown function 'someRandomFunc'")).toBe(true);
+    });
+
+    it('allows known TSOP builtins', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly pk: PubKey;
+          constructor(pk: PubKey) { super(pk); this.pk = pk; }
+          public m(sig: Sig) {
+            assert(checkSig(sig, this.pk));
+          }
+        }
+      `;
+      const result = typecheckSource(source);
+      expect(result.errors).toEqual([]);
+    });
+
+    it('allows calls to private contract methods', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          helper(a: bigint): bigint { return a + 1n; }
+          public m(a: bigint) {
+            const b: bigint = this.helper(a);
+            assert(b > 0n);
+          }
+        }
+      `;
+      const result = typecheckSource(source);
+      expect(result.errors).toEqual([]);
+    });
+  });
 });

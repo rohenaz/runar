@@ -670,7 +670,25 @@ class TypeChecker {
         return this.checkCallArgs(callee.name, sig, args, env);
       }
 
-      // Could be a locally scoped function variable -- just infer args
+      // Check if it's a known contract method (called without this.)
+      const methodSig = this.methodSigs.get(callee.name);
+      if (methodSig) {
+        return this.checkCallArgs(callee.name, methodSig, args, env);
+      }
+
+      // Check if it's a local variable in the environment
+      const localType = env.lookup(callee.name);
+      if (localType) {
+        for (const arg of args) {
+          this.inferExprType(arg, env);
+        }
+        return '<unknown>';
+      }
+
+      this.errors.push(makeDiagnostic(
+        `Unknown function '${callee.name}'. Only TSOP built-in functions and contract methods are allowed.`,
+        'error',
+      ));
       for (const arg of args) {
         this.inferExprType(arg, env);
       }
@@ -741,7 +759,10 @@ class TypeChecker {
         return this.checkCallArgs(methodName, methodSig, args, env);
       }
 
-      // Might be a property method (unlikely in TSOP) -- just infer args
+      this.errors.push(makeDiagnostic(
+        `Unknown method 'this.${methodName}'. Only TSOP built-in methods (addOutput, getStateScript) and contract methods are allowed.`,
+        'error',
+      ));
       for (const arg of args) {
         this.inferExprType(arg, env);
       }
@@ -765,7 +786,12 @@ class TypeChecker {
         }
       }
 
-      // Builtin call via import name (e.g., someModule.func)
+      // Object is not this/self — reject (e.g., Math.floor, console.log)
+      const objName = callee.object.kind === 'identifier' ? callee.object.name : '<expr>';
+      this.errors.push(makeDiagnostic(
+        `Unknown function '${objName}.${callee.property}'. Only TSOP built-in functions and contract methods are allowed.`,
+        'error',
+      ));
       for (const arg of args) {
         this.inferExprType(arg, env);
       }

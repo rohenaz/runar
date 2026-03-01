@@ -1,0 +1,40 @@
+[package]
+name = "tsop-example-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tsop = { path = "../../packages/tsop-rs" }
+
+[[test]]
+name = "p2pkh"
+path = "p2pkh/P2PKH_test.rs"
+
+[[test]]
+name = "escrow"
+path = "escrow/Escrow_test.rs"
+
+[[test]]
+name = "counter"
+path = "stateful-counter/Counter_test.rs"
+
+[[test]]
+name = "fungible_token"
+path = "token-ft/FungibleToken_test.rs"
+
+[[test]]
+name = "simple_nft"
+path = "token-nft/NFT_test.rs"
+
+[[test]]
+name = "auction"
+path = "auction/Auction_test.rs"
+
+[[test]]
+name = "covenant_vault"
+path = "covenant-vault/CovenantVault_test.rs"
+
+[[test]]
+name = "oracle_price"
+path = "oracle-price/OraclePriceFeed_test.rs"
