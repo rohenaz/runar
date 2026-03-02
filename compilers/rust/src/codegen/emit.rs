@@ -428,3 +428,163 @@ pub fn emit_method(method: &StackMethod) -> Result<EmitResult, String> {
         constructor_slots: ctx.constructor_slots,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_emit_placeholder_produces_constructor_slot() {
+        let method = StackMethod {
+            name: "unlock".to_string(),
+            ops: vec![StackOp::Placeholder {
+                param_index: 0,
+                param_name: "pubKeyHash".to_string(),
+            }],
+            max_stack_depth: 1,
+        };
+
+        let result = emit_method(&method).expect("emit should succeed");
+        assert_eq!(
+            result.constructor_slots.len(),
+            1,
+            "should produce exactly one constructor slot"
+        );
+        assert_eq!(result.constructor_slots[0].param_index, 0);
+        assert_eq!(result.constructor_slots[0].byte_offset, 0);
+    }
+
+    #[test]
+    fn test_multiple_placeholders_produce_distinct_byte_offsets() {
+        let method = StackMethod {
+            name: "test".to_string(),
+            ops: vec![
+                StackOp::Placeholder {
+                    param_index: 0,
+                    param_name: "a".to_string(),
+                },
+                StackOp::Placeholder {
+                    param_index: 1,
+                    param_name: "b".to_string(),
+                },
+            ],
+            max_stack_depth: 2,
+        };
+
+        let result = emit_method(&method).expect("emit should succeed");
+        assert_eq!(
+            result.constructor_slots.len(),
+            2,
+            "should produce two constructor slots"
+        );
+
+        // First placeholder at byte 0
+        assert_eq!(result.constructor_slots[0].param_index, 0);
+        assert_eq!(result.constructor_slots[0].byte_offset, 0);
+
+        // Second placeholder at byte 1 (after the first OP_0 byte)
+        assert_eq!(result.constructor_slots[1].param_index, 1);
+        assert_eq!(result.constructor_slots[1].byte_offset, 1);
+
+        // Byte offsets should be distinct
+        assert_ne!(
+            result.constructor_slots[0].byte_offset,
+            result.constructor_slots[1].byte_offset
+        );
+    }
+
+    #[test]
+    fn test_placeholder_byte_offset_position_is_op_0() {
+        let method = StackMethod {
+            name: "test".to_string(),
+            ops: vec![
+                StackOp::Push(PushValue::Int(42)), // some bytes before
+                StackOp::Placeholder {
+                    param_index: 0,
+                    param_name: "x".to_string(),
+                },
+            ],
+            max_stack_depth: 2,
+        };
+
+        let result = emit_method(&method).expect("emit should succeed");
+        assert_eq!(result.constructor_slots.len(), 1);
+
+        let slot = &result.constructor_slots[0];
+        let hex = &result.script_hex;
+
+        // The byte at the placeholder offset should be "00" (OP_0)
+        let byte_hex = &hex[slot.byte_offset * 2..slot.byte_offset * 2 + 2];
+        assert_eq!(
+            byte_hex, "00",
+            "expected OP_0 at placeholder byte offset {}, got '{}' in hex '{}'",
+            slot.byte_offset, byte_hex, hex
+        );
+    }
+
+    #[test]
+    fn test_emit_single_method_produces_hex_and_asm() {
+        let method = StackMethod {
+            name: "check".to_string(),
+            ops: vec![
+                StackOp::Push(PushValue::Int(42)),
+                StackOp::Opcode("OP_NUMEQUAL".to_string()),
+                StackOp::Opcode("OP_VERIFY".to_string()),
+            ],
+            max_stack_depth: 1,
+        };
+
+        let result = emit(&[method]).expect("emit should succeed");
+        assert!(!result.script_hex.is_empty(), "hex should not be empty");
+        assert!(!result.script_asm.is_empty(), "asm should not be empty");
+        assert!(
+            result.script_asm.contains("OP_NUMEQUALVERIFY"),
+            "peephole optimizer should combine OP_NUMEQUAL + OP_VERIFY into OP_NUMEQUALVERIFY, got: {}",
+            result.script_asm
+        );
+    }
+
+    #[test]
+    fn test_emit_empty_methods_produces_empty_output() {
+        let result = emit(&[]).expect("emit with no methods should succeed");
+        assert!(
+            result.script_hex.is_empty(),
+            "empty methods should produce empty hex"
+        );
+        assert!(
+            result.constructor_slots.is_empty(),
+            "empty methods should produce no constructor slots"
+        );
+    }
+
+    #[test]
+    fn test_emit_push_bool_values() {
+        let method = StackMethod {
+            name: "test".to_string(),
+            ops: vec![
+                StackOp::Push(PushValue::Bool(true)),
+                StackOp::Push(PushValue::Bool(false)),
+            ],
+            max_stack_depth: 2,
+        };
+
+        let result = emit_method(&method).expect("emit should succeed");
+        // OP_TRUE = 0x51, OP_FALSE = 0x00
+        assert!(
+            result.script_hex.starts_with("51"),
+            "true should emit 0x51, got: {}",
+            result.script_hex
+        );
+        assert!(
+            result.script_hex.ends_with("00"),
+            "false should emit 0x00, got: {}",
+            result.script_hex
+        );
+        assert!(result.script_asm.contains("OP_TRUE"));
+        assert!(result.script_asm.contains("OP_FALSE"));
+    }
+}

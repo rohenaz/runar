@@ -524,3 +524,186 @@ fn has_cycle(
     stack.remove(method_name);
     false
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parser::parse_source;
+
+    /// Helper: parse a TypeScript source string and return the ContractNode.
+    fn parse_contract(source: &str) -> ContractNode {
+        let result = parse_source(source, Some("test.runar.ts"));
+        assert!(
+            result.errors.is_empty(),
+            "parse errors: {:?}",
+            result.errors
+        );
+        result.contract.expect("expected a contract from parse")
+    }
+
+    #[test]
+    fn test_valid_p2pkh_passes_validation() {
+        let source = r#"
+import { SmartContract, Addr, PubKey, Sig } from 'runar-lang';
+
+class P2PKH extends SmartContract {
+    readonly pubKeyHash: Addr;
+
+    constructor(pubKeyHash: Addr) {
+        super(pubKeyHash);
+        this.pubKeyHash = pubKeyHash;
+    }
+
+    public unlock(sig: Sig, pubKey: PubKey) {
+        assert(hash160(pubKey) === this.pubKeyHash);
+        assert(checkSig(sig, pubKey));
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            result.errors.is_empty(),
+            "expected no validation errors, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_missing_super_in_constructor_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Bad extends SmartContract {
+    readonly x: bigint;
+
+    constructor(x: bigint) {
+        this.x = x;
+    }
+
+    public check(v: bigint) {
+        assert(v === this.x);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result.errors.is_empty(),
+            "expected validation errors for missing super()"
+        );
+        let has_super_error = result
+            .errors
+            .iter()
+            .any(|e| e.to_lowercase().contains("super"));
+        assert!(
+            has_super_error,
+            "expected error about super(), got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_public_method_not_ending_with_assert_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class NoAssert extends SmartContract {
+    readonly x: bigint;
+
+    constructor(x: bigint) {
+        super(x);
+        this.x = x;
+    }
+
+    public check(v: bigint) {
+        const sum = v + this.x;
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result.errors.is_empty(),
+            "expected validation errors for missing assert at end of public method"
+        );
+        let has_assert_error = result
+            .errors
+            .iter()
+            .any(|e| e.to_lowercase().contains("assert"));
+        assert!(
+            has_assert_error,
+            "expected error about missing assert(), got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_direct_recursion_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Recursive extends SmartContract {
+    readonly x: bigint;
+
+    constructor(x: bigint) {
+        super(x);
+        this.x = x;
+    }
+
+    public check(v: bigint) {
+        this.check(v);
+        assert(v === this.x);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result.errors.is_empty(),
+            "expected validation errors for recursion"
+        );
+        let has_recursion_error = result
+            .errors
+            .iter()
+            .any(|e| e.to_lowercase().contains("recursion") || e.to_lowercase().contains("recursive"));
+        assert!(
+            has_recursion_error,
+            "expected error about recursion, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_stateful_contract_passes_validation() {
+        // StatefulSmartContract public methods don't need to end with assert
+        // because the compiler auto-injects the final assert.
+        let source = r#"
+import { StatefulSmartContract } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+    count: bigint;
+
+    constructor(count: bigint) {
+        super(count);
+        this.count = count;
+    }
+
+    public increment() {
+        this.count++;
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            result.errors.is_empty(),
+            "expected no validation errors for stateful contract, got: {:?}",
+            result.errors
+        );
+    }
+}

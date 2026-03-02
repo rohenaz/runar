@@ -968,3 +968,92 @@ fn test_source_vs_ir_both_produce_output() {
     println!("IR hex:     {}", ir_artifact.script);
     println!("Source hex: {}", source_artifact.script);
 }
+
+// ---------------------------------------------------------------------------
+// Conformance golden-file parity tests (all 9 test cases)
+//
+// Each test compiles the `.runar.ts` source via compile_from_source_str()
+// and compares the resulting script hex against expected-script.hex.
+// ---------------------------------------------------------------------------
+
+fn conformance_golden_test(test_name: &str) {
+    let source = conformance_source(test_name);
+    let artifact = compile_from_source_str(&source, Some(&format!("{}.runar.ts", test_name)))
+        .unwrap_or_else(|e| panic!("[{}] source compilation failed: {}", test_name, e));
+
+    assert!(
+        !artifact.script.is_empty(),
+        "[{}] script hex should not be empty",
+        test_name
+    );
+    assert!(
+        !artifact.asm.is_empty(),
+        "[{}] asm should not be empty",
+        test_name
+    );
+    assert!(
+        !artifact.contract_name.is_empty(),
+        "[{}] contract name should not be empty",
+        test_name
+    );
+
+    if let Some(expected_hex) = load_expected_script_hex(test_name) {
+        assert_eq!(
+            artifact.script, expected_hex,
+            "[{}] source-compiled script hex does not match golden expected-script.hex\n  actual len={}\n  expected len={}",
+            test_name,
+            artifact.script.len(),
+            expected_hex.len()
+        );
+    } else {
+        panic!(
+            "[{}] expected-script.hex not found in conformance directory",
+            test_name
+        );
+    }
+}
+
+#[test]
+fn test_conformance_golden_basic_p2pkh() {
+    conformance_golden_test("basic-p2pkh");
+}
+
+#[test]
+fn test_conformance_golden_arithmetic() {
+    conformance_golden_test("arithmetic");
+}
+
+#[test]
+fn test_conformance_golden_boolean_logic() {
+    conformance_golden_test("boolean-logic");
+}
+
+#[test]
+fn test_conformance_golden_if_else() {
+    conformance_golden_test("if-else");
+}
+
+#[test]
+fn test_conformance_golden_bounded_loop() {
+    conformance_golden_test("bounded-loop");
+}
+
+#[test]
+fn test_conformance_golden_multi_method() {
+    conformance_golden_test("multi-method");
+}
+
+#[test]
+fn test_conformance_golden_stateful() {
+    conformance_golden_test("stateful");
+}
+
+#[test]
+fn test_conformance_golden_post_quantum_wots() {
+    conformance_golden_test("post-quantum-wots");
+}
+
+#[test]
+fn test_conformance_golden_post_quantum_slhdsa() {
+    conformance_golden_test("post-quantum-slhdsa");
+}

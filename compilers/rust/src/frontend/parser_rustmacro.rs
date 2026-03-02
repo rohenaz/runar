@@ -942,3 +942,256 @@ pub fn parse_rust_dsl(source: &str, file_name: Option<&str>) -> ParseResult {
     let parser = RustDslParser::new(tokens, file);
     parser.parse()
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_basic_rust_contract() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct P2PKH {
+    pub_key_hash: Addr,
+}
+
+#[runar::methods]
+impl P2PKH {
+    #[public]
+    fn unlock(&self, sig: Sig, pub_key: PubKey) {
+        assert!(hash160(pub_key) == self.pub_key_hash);
+        assert!(check_sig(sig, pub_key));
+    }
+}
+"#;
+
+        let result = parse_rust_dsl(source, Some("P2PKH.runar.rs"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.name, "P2PKH");
+        assert_eq!(contract.properties.len(), 1);
+        assert_eq!(contract.methods.len(), 1);
+        assert_eq!(contract.methods[0].name, "unlock");
+        assert_eq!(contract.methods[0].visibility, Visibility::Public);
+        // self param should be excluded
+        assert_eq!(contract.methods[0].params.len(), 2);
+    }
+
+    #[test]
+    fn test_snake_to_camel_conversion() {
+        assert_eq!(snake_to_camel("pub_key_hash"), "pubKeyHash");
+        assert_eq!(snake_to_camel("check_sig"), "checkSig");
+        assert_eq!(snake_to_camel("already"), "already");
+        assert_eq!(snake_to_camel("a_b_c"), "aBC");
+        assert_eq!(snake_to_camel("hello_world"), "helloWorld");
+    }
+
+    #[test]
+    fn test_type_mapping_works() {
+        // i64 -> bigint
+        assert_eq!(map_rust_type("i64"), "bigint");
+        assert_eq!(map_rust_type("u64"), "bigint");
+        assert_eq!(map_rust_type("i128"), "bigint");
+        assert_eq!(map_rust_type("u128"), "bigint");
+        assert_eq!(map_rust_type("Bigint"), "bigint");
+        // bool -> boolean
+        assert_eq!(map_rust_type("bool"), "boolean");
+        assert_eq!(map_rust_type("Bool"), "boolean");
+        // Pass-through
+        assert_eq!(map_rust_type("PubKey"), "PubKey");
+        assert_eq!(map_rust_type("Sig"), "Sig");
+        assert_eq!(map_rust_type("Addr"), "Addr");
+    }
+
+    #[test]
+    fn test_public_attribute_makes_method_public() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct Test {
+    #[readonly]
+    x: bigint,
+}
+
+#[runar::methods]
+impl Test {
+    #[public]
+    fn public_method(&self, v: i64) {
+        assert!(v == self.x);
+    }
+
+    fn private_method(&self, v: i64) -> i64 {
+        return v + 1;
+    }
+}
+"#;
+
+        let result = parse_rust_dsl(source, Some("Test.runar.rs"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.methods.len(), 2);
+
+        // First method should be public (has #[public])
+        assert_eq!(contract.methods[0].name, "publicMethod");
+        assert_eq!(contract.methods[0].visibility, Visibility::Public);
+
+        // Second method should be private (no #[public])
+        assert_eq!(contract.methods[1].name, "privateMethod");
+        assert_eq!(contract.methods[1].visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn test_contract_name_extracted_correctly() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct MyFancyContract {
+    value: bigint,
+}
+
+#[runar::methods]
+impl MyFancyContract {
+    #[public]
+    fn check(&self, v: i64) {
+        assert!(v == self.value);
+    }
+}
+"#;
+
+        let result = parse_rust_dsl(source, Some("MyFancyContract.runar.rs"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.name, "MyFancyContract");
+    }
+
+    #[test]
+    fn test_property_names_are_camel_cased() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct Test {
+    pub_key_hash: Addr,
+    my_value: bigint,
+}
+
+#[runar::methods]
+impl Test {
+    #[public]
+    fn check(&self, v: i64) {
+        assert!(v == self.my_value);
+    }
+}
+"#;
+
+        let result = parse_rust_dsl(source, Some("Test.runar.rs"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.properties[0].name, "pubKeyHash");
+        assert_eq!(contract.properties[1].name, "myValue");
+    }
+
+    #[test]
+    fn test_stateful_contract_attribute() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::stateful_contract]
+pub struct Counter {
+    count: bigint,
+}
+
+#[runar::methods]
+impl Counter {
+    #[public]
+    fn increment(&mut self) {
+        self.count = self.count + 1;
+    }
+}
+"#;
+
+        let result = parse_rust_dsl(source, Some("Counter.runar.rs"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.name, "Counter");
+        assert_eq!(contract.parent_class, "StatefulSmartContract");
+    }
+
+    #[test]
+    fn test_constructor_auto_generated() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct Test {
+    a: bigint,
+    b: PubKey,
+}
+
+#[runar::methods]
+impl Test {
+    #[public]
+    fn check(&self) {
+        assert!(self.a > 0);
+    }
+}
+"#;
+
+        let result = parse_rust_dsl(source, None);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        // Constructor should have params for each property
+        assert_eq!(contract.constructor.params.len(), 2);
+        // Constructor body: super(a, b) + this.a = a + this.b = b
+        assert_eq!(contract.constructor.body.len(), 3);
+    }
+
+    #[test]
+    fn test_assert_eq_macro_maps_to_assert_strict_eq() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct Test {
+    #[readonly]
+    x: bigint,
+}
+
+#[runar::methods]
+impl Test {
+    #[public]
+    fn check(&self, v: i64) {
+        assert_eq!(self.x, v);
+    }
+}
+"#;
+
+        let result = parse_rust_dsl(source, Some("Test.runar.rs"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        let body = &contract.methods[0].body;
+        assert_eq!(body.len(), 1);
+
+        // Should be assert(self.x === v)
+        if let Statement::ExpressionStatement { expression, .. } = &body[0] {
+            if let Expression::CallExpr { callee, args } = expression {
+                if let Expression::Identifier { name } = callee.as_ref() {
+                    assert_eq!(name, "assert");
+                }
+                if let Expression::BinaryExpr { op, .. } = &args[0] {
+                    assert_eq!(*op, BinaryOp::StrictEq);
+                } else {
+                    panic!("Expected BinaryExpr inside assert_eq!, got {:?}", args[0]);
+                }
+            }
+        }
+    }
+}

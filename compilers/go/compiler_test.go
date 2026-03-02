@@ -1136,3 +1136,97 @@ func TestSourceCompile_IRvsSourceMatch(t *testing.T) {
 	t.Logf("IR hex:     %s", irArtifact.Script)
 	t.Logf("Source hex: %s", sourceArtifact.Script)
 }
+
+// ---------------------------------------------------------------------------
+// Test: ALL 9 conformance .runar.ts files compile and match golden hex
+// ---------------------------------------------------------------------------
+
+func TestCompilerParity_AllConformance(t *testing.T) {
+	// All 9 conformance test directories
+	testDirs := []string{
+		"arithmetic",
+		"basic-p2pkh",
+		"boolean-logic",
+		"bounded-loop",
+		"if-else",
+		"multi-method",
+		"post-quantum-slhdsa",
+		"post-quantum-wots",
+		"stateful",
+	}
+
+	for _, dir := range testDirs {
+		t.Run(dir, func(t *testing.T) {
+			sourcePath := filepath.Join(conformanceDir(), dir, dir+".runar.ts")
+			goldenPath := filepath.Join(conformanceDir(), dir, "expected-script.hex")
+
+			// Check that the source file exists
+			if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
+				t.Skipf("source file not found: %s", sourcePath)
+			}
+
+			// Compile from source
+			artifact, err := CompileFromSource(sourcePath)
+			if err != nil {
+				t.Fatalf("source compilation failed for %s: %v", dir, err)
+			}
+
+			// Verify basic artifact properties
+			if artifact.Script == "" {
+				t.Errorf("%s: empty script hex", dir)
+			}
+			if artifact.ASM == "" {
+				t.Errorf("%s: empty ASM", dir)
+			}
+			if artifact.ContractName == "" {
+				t.Errorf("%s: empty contract name", dir)
+			}
+
+			// Compare against golden expected-script.hex
+			goldenHex, err := os.ReadFile(goldenPath)
+			if err != nil {
+				t.Fatalf("%s: could not read golden file: %v", dir, err)
+			}
+
+			expected := strings.TrimSpace(string(goldenHex))
+			if artifact.Script != expected {
+				// Report a clear diff — show first 200 chars of each for long scripts
+				maxLen := 200
+				gotPreview := artifact.Script
+				if len(gotPreview) > maxLen {
+					gotPreview = gotPreview[:maxLen] + "..."
+				}
+				expectedPreview := expected
+				if len(expectedPreview) > maxLen {
+					expectedPreview = expectedPreview[:maxLen] + "..."
+				}
+				t.Errorf("%s: script hex mismatch (len expected=%d, got=%d)\n  expected: %s\n  got:      %s",
+					dir, len(expected), len(artifact.Script), expectedPreview, gotPreview)
+			} else {
+				t.Logf("%s: MATCH (hex=%d bytes)", dir, len(artifact.Script)/2)
+			}
+
+			// Also compile from IR and verify both paths produce the same output
+			irPath := filepath.Join(conformanceDir(), dir, "expected-ir.json")
+			if _, err := os.Stat(irPath); err == nil {
+				irArtifact, err := CompileFromIR(irPath)
+				if err != nil {
+					t.Logf("%s: IR compilation failed (may be expected for some tests): %v", dir, err)
+				} else {
+					// Compare IR path vs source path
+					if irArtifact.Script != artifact.Script {
+						t.Errorf("%s: IR-compiled script differs from source-compiled script\n  IR:     %s\n  Source: %s",
+							dir, truncate(irArtifact.Script, 200), truncate(artifact.Script, 200))
+					}
+				}
+			}
+		})
+	}
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
+}

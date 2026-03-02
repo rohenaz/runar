@@ -1115,3 +1115,194 @@ fn type_node_to_ttype(node: &TypeNode) -> TType {
         TypeNode::Custom(name) => name.clone(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parser::parse_source;
+    use crate::frontend::validator;
+
+    /// Helper: parse and validate a TypeScript source string, then return the ContractNode.
+    fn parse_and_validate(source: &str) -> ContractNode {
+        let result = parse_source(source, Some("test.runar.ts"));
+        assert!(
+            result.errors.is_empty(),
+            "parse errors: {:?}",
+            result.errors
+        );
+        let contract = result.contract.expect("expected a contract from parse");
+        let validation = validator::validate(&contract);
+        assert!(
+            validation.errors.is_empty(),
+            "validation errors: {:?}",
+            validation.errors
+        );
+        contract
+    }
+
+    #[test]
+    fn test_valid_p2pkh_passes_typecheck() {
+        let source = r#"
+import { SmartContract, Addr, PubKey, Sig } from 'runar-lang';
+
+class P2PKH extends SmartContract {
+    readonly pubKeyHash: Addr;
+
+    constructor(pubKeyHash: Addr) {
+        super(pubKeyHash);
+        this.pubKeyHash = pubKeyHash;
+    }
+
+    public unlock(sig: Sig, pubKey: PubKey) {
+        assert(hash160(pubKey) === this.pubKeyHash);
+        assert(checkSig(sig, pubKey));
+    }
+}
+"#;
+        let contract = parse_and_validate(source);
+        let result = typecheck(&contract);
+        assert!(
+            result.errors.is_empty(),
+            "expected no typecheck errors, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_unknown_function_call_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Bad extends SmartContract {
+    readonly x: bigint;
+
+    constructor(x: bigint) {
+        super(x);
+        this.x = x;
+    }
+
+    public check(v: bigint) {
+        const y = Math.floor(v);
+        assert(y === this.x);
+    }
+}
+"#;
+        let contract = parse_and_validate(source);
+        let result = typecheck(&contract);
+        assert!(
+            !result.errors.is_empty(),
+            "expected typecheck errors for unknown function Math.floor"
+        );
+        let has_unknown_error = result
+            .errors
+            .iter()
+            .any(|e| e.to_lowercase().contains("unknown"));
+        assert!(
+            has_unknown_error,
+            "expected error about unknown function, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_builtin_with_wrong_arg_count_produces_error() {
+        let source = r#"
+import { SmartContract, PubKey, Sig } from 'runar-lang';
+
+class Bad extends SmartContract {
+    readonly x: bigint;
+
+    constructor(x: bigint) {
+        super(x);
+        this.x = x;
+    }
+
+    public check(v: bigint) {
+        assert(min(v));
+    }
+}
+"#;
+        let contract = parse_and_validate(source);
+        let result = typecheck(&contract);
+        assert!(
+            !result.errors.is_empty(),
+            "expected typecheck errors for wrong arg count"
+        );
+        let has_arg_count_error = result
+            .errors
+            .iter()
+            .any(|e| e.contains("expects") && e.contains("argument"));
+        assert!(
+            has_arg_count_error,
+            "expected error about wrong argument count, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_on_boolean_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Bad extends SmartContract {
+    readonly x: bigint;
+
+    constructor(x: bigint) {
+        super(x);
+        this.x = x;
+    }
+
+    public check(v: bigint, flag: boolean) {
+        const sum = v + flag;
+        assert(sum === this.x);
+    }
+}
+"#;
+        let contract = parse_and_validate(source);
+        let result = typecheck(&contract);
+        assert!(
+            !result.errors.is_empty(),
+            "expected typecheck errors for arithmetic on boolean"
+        );
+        let has_type_error = result
+            .errors
+            .iter()
+            .any(|e| e.contains("bigint") || e.contains("boolean"));
+        assert!(
+            has_type_error,
+            "expected type mismatch error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_valid_stateful_contract_passes_typecheck() {
+        let source = r#"
+import { StatefulSmartContract } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+    count: bigint;
+
+    constructor(count: bigint) {
+        super(count);
+        this.count = count;
+    }
+
+    public increment() {
+        this.count++;
+    }
+}
+"#;
+        let contract = parse_and_validate(source);
+        let result = typecheck(&contract);
+        assert!(
+            result.errors.is_empty(),
+            "expected no typecheck errors for stateful contract, got: {:?}",
+            result.errors
+        );
+    }
+}

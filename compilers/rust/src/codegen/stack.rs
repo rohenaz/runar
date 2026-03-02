@@ -2042,13 +2042,11 @@ impl LoweringContext {
         // 16 iterations of Newton's method: guess = (guess + n/guess) / 2
         for _ in 0..16 {
             // Stack: n guess
-            self.emit_op(StackOp::Opcode("OP_TUCK".to_string()));     // guess n guess
-            self.emit_op(StackOp::Opcode("OP_OVER".to_string()));     // guess n guess n
-            self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));     // guess n n guess
-            self.emit_op(StackOp::Opcode("OP_DIV".to_string()));      // guess n (n/guess)
-            self.emit_op(StackOp::Opcode("OP_ROT".to_string()));      // n (n/guess) guess
-            self.emit_op(StackOp::Opcode("OP_ADD".to_string()));      // n (n/guess + guess)
-            self.emit_op(StackOp::Push(PushValue::Int(2)));            // n (n/guess + guess) 2
+            self.emit_op(StackOp::Over);                               // n guess n
+            self.emit_op(StackOp::Over);                               // n guess n guess
+            self.emit_op(StackOp::Opcode("OP_DIV".to_string()));      // n guess (n/guess)
+            self.emit_op(StackOp::Opcode("OP_ADD".to_string()));      // n (guess + n/guess)
+            self.emit_op(StackOp::Push(PushValue::Int(2)));            // n (guess + n/guess) 2
             self.emit_op(StackOp::Opcode("OP_DIV".to_string()));      // n new_guess
         }
 
@@ -2081,6 +2079,13 @@ impl LoweringContext {
         self.sm.pop();
 
         // Stack: a b
+        // Both should be absolute values
+        self.emit_op(StackOp::Opcode("OP_ABS".to_string()));
+        self.emit_op(StackOp::Swap);
+        self.emit_op(StackOp::Opcode("OP_ABS".to_string()));
+        self.emit_op(StackOp::Swap);
+        // Stack: |a| |b|
+
         // 256 iterations of Euclidean algorithm
         for _ in 0..256 {
             // Stack: a b
@@ -2262,4 +2267,205 @@ fn hex_to_bytes(hex_str: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).unwrap_or(0))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{ANFBinding, ANFMethod, ANFParam, ANFProgram, ANFProperty, ANFValue};
+
+    /// Build a minimal P2PKH IR program for testing stack lowering.
+    fn p2pkh_program() -> ANFProgram {
+        ANFProgram {
+            contract_name: "P2PKH".to_string(),
+            properties: vec![ANFProperty {
+                name: "pubKeyHash".to_string(),
+                prop_type: "Addr".to_string(),
+                readonly: true,
+                initial_value: None,
+            }],
+            methods: vec![ANFMethod {
+                name: "unlock".to_string(),
+                params: vec![
+                    ANFParam {
+                        name: "sig".to_string(),
+                        param_type: "Sig".to_string(),
+                    },
+                    ANFParam {
+                        name: "pubKey".to_string(),
+                        param_type: "PubKey".to_string(),
+                    },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam {
+                            name: "sig".to_string(),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t1".to_string(),
+                        value: ANFValue::LoadParam {
+                            name: "pubKey".to_string(),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t2".to_string(),
+                        value: ANFValue::LoadProp {
+                            name: "pubKeyHash".to_string(),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t3".to_string(),
+                        value: ANFValue::Call {
+                            func: "hash160".to_string(),
+                            args: vec!["t1".to_string()],
+                        },
+                    },
+                    ANFBinding {
+                        name: "t4".to_string(),
+                        value: ANFValue::BinOp {
+                            op: "===".to_string(),
+                            left: "t3".to_string(),
+                            right: "t2".to_string(),
+                            result_type: None,
+                        },
+                    },
+                    ANFBinding {
+                        name: "t5".to_string(),
+                        value: ANFValue::Assert {
+                            value: "t4".to_string(),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t6".to_string(),
+                        value: ANFValue::Call {
+                            func: "checkSig".to_string(),
+                            args: vec!["t0".to_string(), "t1".to_string()],
+                        },
+                    },
+                    ANFBinding {
+                        name: "t7".to_string(),
+                        value: ANFValue::Assert {
+                            value: "t6".to_string(),
+                        },
+                    },
+                ],
+                is_public: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_p2pkh_stack_lowering_produces_placeholder_ops() {
+        let program = p2pkh_program();
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].name, "unlock");
+
+        // There should be at least one Placeholder op (for the pubKeyHash property)
+        let has_placeholder = methods[0].ops.iter().any(|op| {
+            matches!(op, StackOp::Placeholder { .. })
+        });
+        assert!(
+            has_placeholder,
+            "P2PKH should have Placeholder ops for constructor params, ops: {:?}",
+            methods[0].ops
+        );
+    }
+
+    #[test]
+    fn test_placeholder_has_correct_param_index() {
+        let program = p2pkh_program();
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+
+        // Find the Placeholder op and check its param_index
+        let placeholders: Vec<&StackOp> = methods[0]
+            .ops
+            .iter()
+            .filter(|op| matches!(op, StackOp::Placeholder { .. }))
+            .collect();
+
+        assert!(
+            !placeholders.is_empty(),
+            "should have at least one Placeholder"
+        );
+
+        // pubKeyHash is the only property at index 0
+        if let StackOp::Placeholder {
+            param_index,
+            param_name,
+        } = placeholders[0]
+        {
+            assert_eq!(*param_index, 0);
+            assert_eq!(param_name, "pubKeyHash");
+        } else {
+            panic!("expected Placeholder op");
+        }
+    }
+
+    #[test]
+    fn test_with_initial_values_no_placeholder_ops() {
+        let mut program = p2pkh_program();
+        // Set an initial value for the property -- this bakes it in
+        program.properties[0].initial_value =
+            Some(serde_json::Value::String("aabbccdd".to_string()));
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        let has_placeholder = methods[0].ops.iter().any(|op| {
+            matches!(op, StackOp::Placeholder { .. })
+        });
+        assert!(
+            !has_placeholder,
+            "with initial values, there should be no Placeholder ops"
+        );
+    }
+
+    #[test]
+    fn test_stack_lowering_produces_standard_opcodes() {
+        let program = p2pkh_program();
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+
+        // Collect all Opcode strings
+        let opcodes: Vec<&str> = methods[0]
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                StackOp::Opcode(code) => Some(code.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // P2PKH should contain OP_HASH160, OP_NUMEQUAL (from ===), OP_VERIFY, OP_CHECKSIG
+        assert!(
+            opcodes.contains(&"OP_HASH160"),
+            "expected OP_HASH160 in opcodes: {:?}",
+            opcodes
+        );
+        assert!(
+            opcodes.contains(&"OP_CHECKSIG"),
+            "expected OP_CHECKSIG in opcodes: {:?}",
+            opcodes
+        );
+    }
+
+    #[test]
+    fn test_max_stack_depth_is_tracked() {
+        let program = p2pkh_program();
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        assert!(
+            methods[0].max_stack_depth > 0,
+            "max_stack_depth should be > 0"
+        );
+        // P2PKH has 2 params + some intermediates, so depth should be reasonable
+        assert!(
+            methods[0].max_stack_depth <= 10,
+            "max_stack_depth should be reasonable for P2PKH, got: {}",
+            methods[0].max_stack_depth
+        );
+    }
 }

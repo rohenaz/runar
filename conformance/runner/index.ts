@@ -18,7 +18,7 @@
 import { resolve, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { writeFileSync, readdirSync } from 'fs';
-import { runAllConformanceTests, runConformanceTest, updateGoldenFiles } from './runner.js';
+import { runAllConformanceTests, runConformanceTest, runAllMultiFormatConformanceTests, updateGoldenFiles } from './runner.js';
 import {
   generateReport,
   formatReportAsJSON,
@@ -39,6 +39,7 @@ interface CLIOptions {
   format: 'console' | 'json' | 'markdown';
   output?: string;
   updateGolden: boolean;
+  multiFormat: boolean;
   help: boolean;
 }
 
@@ -47,6 +48,7 @@ function parseArgs(argv: string[]): CLIOptions {
     testsDir: resolve(__dirname, '../tests'),
     format: 'console',
     updateGolden: false,
+    multiFormat: false,
     help: false,
   };
 
@@ -67,6 +69,9 @@ function parseArgs(argv: string[]): CLIOptions {
         break;
       case '--update-golden':
         opts.updateGolden = true;
+        break;
+      case '--multi-format':
+        opts.multiFormat = true;
         break;
       case '--help':
       case '-h':
@@ -99,6 +104,8 @@ Options:
   --output <path>       Write report to file instead of stdout
   --update-golden       Update golden files from TS compiler output
                         (overwrites expected-ir.json and expected-script.hex)
+  --multi-format        Test all format variants (.ts, .sol, .move, .go, .rs)
+                        instead of only .runar.ts
   --help, -h            Show this help message
 
 Test Directory Structure:
@@ -151,9 +158,9 @@ async function main(): Promise<void> {
   }
   console.log('');
 
-  const results = await runAllConformanceTests(opts.testsDir, {
-    filter: opts.filter,
-  });
+  const results = opts.multiFormat
+    ? await runAllMultiFormatConformanceTests(opts.testsDir, { filter: opts.filter })
+    : await runAllConformanceTests(opts.testsDir, { filter: opts.filter });
 
   const report = generateReport(results);
 

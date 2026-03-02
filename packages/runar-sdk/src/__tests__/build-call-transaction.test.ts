@@ -1,0 +1,475 @@
+import { describe, it, expect } from 'vitest';
+import { buildCallTransaction } from '../calling.js';
+import type { UTXO } from '../types.js';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeUtxo(satoshis: number, index = 0): UTXO {
+  return {
+    txid: 'aabbccdd'.repeat(8), // 64 hex chars = 32 bytes
+    outputIndex: index,
+    satoshis,
+    script: '76a914' + '00'.repeat(20) + '88ac',
+  };
+}
+
+/**
+ * Parse a raw transaction hex into its structural components.
+ * Minimal parser for verification purposes.
+ */
+function parseTxHex(hex: string) {
+  let offset = 0;
+
+  function readBytes(n: number): string {
+    const result = hex.slice(offset, offset + n * 2);
+    offset += n * 2;
+    return result;
+  }
+
+  function readUint32LE(): number {
+    const h = readBytes(4);
+    const bytes = [];
+    for (let i = 0; i < 8; i += 2) {
+      bytes.push(parseInt(h.slice(i, i + 2), 16));
+    }
+    return (bytes[0]! | (bytes[1]! << 8) | (bytes[2]! << 16) | (bytes[3]! << 24)) >>> 0;
+  }
+
+  function readUint64LE(): number {
+    const lo = readUint32LE();
+    const hi = readUint32LE();
+    return hi * 0x100000000 + lo;
+  }
+
+  function readVarInt(): number {
+    const first = parseInt(readBytes(1), 16);
+    if (first < 0xfd) return first;
+    if (first === 0xfd) {
+      const h = readBytes(2);
+      const lo = parseInt(h.slice(0, 2), 16);
+      const hi = parseInt(h.slice(2, 4), 16);
+      return lo | (hi << 8);
+    }
+    throw new Error('Unsupported varint');
+  }
+
+  // Version
+  const version = readUint32LE();
+
+  // Input count
+  const inputCount = readVarInt();
+
+  // Inputs
+  const inputs = [];
+  for (let i = 0; i < inputCount; i++) {
+    const prevTxid = readBytes(32);
+    const prevIndex = readUint32LE();
+    const scriptLen = readVarInt();
+    const script = readBytes(scriptLen);
+    const sequence = readUint32LE();
+    inputs.push({ prevTxid, prevIndex, script, sequence });
+  }
+
+  // Output count
+  const outputCount = readVarInt();
+
+  // Outputs
+  const outputs = [];
+  for (let i = 0; i < outputCount; i++) {
+    const satoshis = readUint64LE();
+    const scriptLen = readVarInt();
+    const script = readBytes(scriptLen);
+    outputs.push({ satoshis, script });
+  }
+
+  // Locktime
+  const locktime = readUint32LE();
+
+  return { version, inputCount, inputs, outputCount, outputs, locktime };
+}
+
+/**
+ * Reverse hex byte order (for txid wire format: internal byte order is reversed).
+ */
+function reverseHex(hex: string): string {
+  const pairs: string[] = [];
+  for (let i = 0; i < hex.length; i += 2) {
+    pairs.push(hex.slice(i, i + 2));
+  }
+  return pairs.reverse().join('');
+}
+
+// ---------------------------------------------------------------------------
+// Basic transaction structure (Bitcoin protocol rules)
+// ---------------------------------------------------------------------------
+
+describe('buildCallTransaction — transaction structure', () => {
+  it('produces version 1 and locktime 0 per Bitcoin protocol', () => {
+    const utxo = makeUtxo(100000);
+    const unlockingScript = '4830'.padEnd(144, 'aa'); // mock 72-byte sig push
+
+    const { txHex } = buildCallTransaction(utxo, unlockingScript);
+    const parsed = parseTxHex(txHex);
+
+    expect(parsed.version).toBe(1);
+    expect(parsed.locktime).toBe(0);
+  });
+
+  it('produces valid hex output', () => {
+    const utxo = makeUtxo(100000);
+    const { txHex } = buildCallTransaction(utxo, '51');
+
+    expect(txHex).toBeDefined();
+    expect(txHex.length).toBeGreaterThan(0);
+    expect(/^[0-9a-f]+$/.test(txHex)).toBe(true);
+  });
+
+  it('embeds the unlocking script in input 0 (not empty)', () => {
+    const utxo = makeUtxo(100000);
+    const unlockingScript = 'aabb';
+
+    const { txHex } = buildCallTransaction(utxo, unlockingScript);
+    const parsed = parseTxHex(txHex);
+
+    // Input 0 should contain the unlocking script
+    expect(parsed.inputs[0]!.script).toBe(unlockingScript);
+    expect(parsed.inputs[0]!.script.length).toBeGreaterThan(0);
+  });
+
+  it('sets all input sequences to 0xffffffff (final, no RBF)', () => {
+    const utxo = makeUtxo(100000);
+    const additional = [makeUtxo(50000, 1), makeUtxo(30000, 2)];
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '51',
+      undefined,
+      undefined,
+      'changeaddr',
+      '76a914' + 'ff'.repeat(20) + '88ac',
+      additional,
+    );
+    const parsed = parseTxHex(txHex);
+
+    for (const input of parsed.inputs) {
+      expect(input.sequence).toBe(0xffffffff);
+    }
+  });
+
+  it('encodes the contract UTXO txid in reversed byte order (Bitcoin wire format)', () => {
+    const utxo = makeUtxo(100000);
+    const { txHex } = buildCallTransaction(utxo, '51');
+    const parsed = parseTxHex(txHex);
+
+    // The prevTxid in the wire format should be the reverse of the UTXO txid
+    expect(parsed.inputs[0]!.prevTxid).toBe(reverseHex(utxo.txid));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Input handling
+// ---------------------------------------------------------------------------
+
+describe('buildCallTransaction — inputs', () => {
+  it('creates exactly 1 input for contract UTXO only (no additional UTXOs)', () => {
+    const utxo = makeUtxo(100000);
+    const { txHex, inputCount } = buildCallTransaction(utxo, '51');
+    const parsed = parseTxHex(txHex);
+
+    expect(inputCount).toBe(1);
+    expect(parsed.inputCount).toBe(1);
+    expect(parsed.inputs.length).toBe(1);
+  });
+
+  it('includes additional funding UTXOs as extra inputs with empty scriptSig', () => {
+    const utxo = makeUtxo(100000);
+    const additional = [makeUtxo(50000, 1), makeUtxo(30000, 2)];
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex, inputCount } = buildCallTransaction(
+      utxo,
+      '51',
+      undefined,
+      undefined,
+      'changeaddr',
+      changeScript,
+      additional,
+    );
+    const parsed = parseTxHex(txHex);
+
+    expect(inputCount).toBe(3);
+    expect(parsed.inputCount).toBe(3);
+
+    // Input 0 has the unlocking script
+    expect(parsed.inputs[0]!.script).toBe('51');
+
+    // Additional inputs have empty scriptSig (varint '00' → 0 bytes → empty string)
+    expect(parsed.inputs[1]!.script).toBe('');
+    expect(parsed.inputs[2]!.script).toBe('');
+  });
+
+  it('references the correct output index from the contract UTXO', () => {
+    const utxo = makeUtxo(100000, 3);
+    const { txHex } = buildCallTransaction(utxo, '51');
+    const parsed = parseTxHex(txHex);
+
+    expect(parsed.inputs[0]!.prevIndex).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Output handling — stateful contracts
+// ---------------------------------------------------------------------------
+
+describe('buildCallTransaction — stateful outputs', () => {
+  it('creates output 0 with newLockingScript and newSatoshis for stateful calls', () => {
+    const utxo = makeUtxo(100000);
+    const newLockingScript = '76a914' + 'dd'.repeat(20) + '88ac';
+    const newSatoshis = 50000;
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '51',
+      newLockingScript,
+      newSatoshis,
+      'changeaddr',
+      changeScript,
+    );
+    const parsed = parseTxHex(txHex);
+
+    // First output should be the contract continuation
+    expect(parsed.outputs[0]!.script).toBe(newLockingScript);
+    expect(parsed.outputs[0]!.satoshis).toBe(newSatoshis);
+  });
+
+  it('uses currentUtxo.satoshis as default when newSatoshis is undefined', () => {
+    const utxo = makeUtxo(75000);
+    const newLockingScript = '51';
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '00',
+      newLockingScript,
+      undefined,
+      'changeaddr',
+      changeScript,
+    );
+    const parsed = parseTxHex(txHex);
+
+    // Output 0 satoshis should default to the input UTXO satoshis
+    expect(parsed.outputs[0]!.satoshis).toBe(75000);
+  });
+
+  it('does NOT create contract output when newLockingScript is undefined (stateless)', () => {
+    const utxo = makeUtxo(100000);
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '51',
+      undefined,
+      undefined,
+      'changeaddr',
+      changeScript,
+    );
+    const parsed = parseTxHex(txHex);
+
+    // For stateless: only change output (no contract continuation output)
+    // The change output script should be the change script
+    if (parsed.outputCount > 0) {
+      expect(parsed.outputs[0]!.script).toBe(changeScript);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Change output and fee calculation
+// ---------------------------------------------------------------------------
+
+describe('buildCallTransaction — change and fees', () => {
+  it('calculates change as totalInput - contractOutput - fee', () => {
+    const utxo = makeUtxo(100000);
+    const newLockingScript = '51';
+    const newSatoshis = 50000;
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '00',
+      newLockingScript,
+      newSatoshis,
+      'changeaddr',
+      changeScript,
+    );
+    const parsed = parseTxHex(txHex);
+
+    // Fee estimation: 1 input * 148 + 2 outputs * 34 + 10 = 226 sats
+    // Change = 100000 - 50000 - 226 = 49774
+    expect(parsed.outputCount).toBe(2);
+    expect(parsed.outputs[0]!.satoshis).toBe(50000);
+    expect(parsed.outputs[1]!.satoshis).toBe(49774);
+    expect(parsed.outputs[1]!.script).toBe(changeScript);
+  });
+
+  it('omits change output when change is zero', () => {
+    // Fee for 1 input, 2 potential outputs: 1*148 + 2*34 + 10 = 226
+    // To get change = 0: totalInput = contractOutput + fee
+    // 50226 = 50000 + 226
+    const utxo = makeUtxo(50226);
+    const newLockingScript = '51';
+    const newSatoshis = 50000;
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '00',
+      newLockingScript,
+      newSatoshis,
+      'changeaddr',
+      changeScript,
+    );
+    const parsed = parseTxHex(txHex);
+
+    // Only the contract output, no change output
+    expect(parsed.outputCount).toBe(1);
+    expect(parsed.outputs[0]!.satoshis).toBe(50000);
+  });
+
+  it('omits change output when change is negative (all funds consumed by fee)', () => {
+    // Fee for 1 input, 2 potential outputs: 226
+    // Set up so totalInput - contractOutput < fee
+    // 50100 - 50000 = 100 < 226 → change = -126, negative
+    const utxo = makeUtxo(50100);
+    const newLockingScript = '51';
+    const newSatoshis = 50000;
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '00',
+      newLockingScript,
+      newSatoshis,
+      'changeaddr',
+      changeScript,
+    );
+    const parsed = parseTxHex(txHex);
+
+    // No change output since change <= 0
+    expect(parsed.outputCount).toBe(1);
+  });
+
+  it('accumulates satoshis from additional UTXOs in fee/change calculation', () => {
+    const utxo = makeUtxo(50000);
+    const additional = [makeUtxo(30000, 1)];
+    const newLockingScript = '51';
+    const newSatoshis = 40000;
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '00',
+      newLockingScript,
+      newSatoshis,
+      'changeaddr',
+      changeScript,
+      additional,
+    );
+    const parsed = parseTxHex(txHex);
+
+    // Fee: 2 inputs * 148 + 2 outputs * 34 + 10 = 296 + 68 + 10 = 374
+    // Total input: 50000 + 30000 = 80000
+    // Change: 80000 - 40000 - 374 = 39626
+    expect(parsed.outputCount).toBe(2);
+    expect(parsed.outputs[0]!.satoshis).toBe(40000);
+    expect(parsed.outputs[1]!.satoshis).toBe(39626);
+  });
+
+  it('fee scales linearly with input count (1 sat/byte estimate)', () => {
+    const utxo = makeUtxo(200000);
+    const threeAdditional = [makeUtxo(100000, 1), makeUtxo(100000, 2), makeUtxo(100000, 3)];
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex: txHex1 } = buildCallTransaction(
+      utxo,
+      '51',
+      undefined,
+      undefined,
+      'changeaddr',
+      changeScript,
+    );
+
+    const { txHex: txHex4 } = buildCallTransaction(
+      utxo,
+      '51',
+      undefined,
+      undefined,
+      'changeaddr',
+      changeScript,
+      threeAdditional,
+    );
+
+    const parsed1 = parseTxHex(txHex1);
+    const parsed4 = parseTxHex(txHex4);
+
+    // Both are stateless (no contract output), so just change output
+    // 1 input: fee = 1*148 + 1*34 + 10 = 192; change = 200000 - 0 - 192 = 199808
+    // 4 inputs: fee = 4*148 + 1*34 + 10 = 636; change = 500000 - 0 - 636 = 499364
+    expect(parsed1.outputs[0]!.satoshis).toBe(199808);
+    expect(parsed4.outputs[0]!.satoshis).toBe(499364);
+
+    // The fee difference should be exactly 3 * 148 = 444 sats
+    const feeDiff = (500000 - parsed4.outputs[0]!.satoshis) - (200000 - parsed1.outputs[0]!.satoshis);
+    expect(feeDiff).toBe(3 * 148);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stateless call (no new locking script)
+// ---------------------------------------------------------------------------
+
+describe('buildCallTransaction — stateless call', () => {
+  it('produces only a change output when no newLockingScript is provided', () => {
+    const utxo = makeUtxo(100000);
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '51',
+      undefined,
+      undefined,
+      'changeaddr',
+      changeScript,
+    );
+    const parsed = parseTxHex(txHex);
+
+    // Fee: 1*148 + 1*34 + 10 = 192
+    // Change: 100000 - 0 - 192 = 99808
+    expect(parsed.outputCount).toBe(1);
+    expect(parsed.outputs[0]!.script).toBe(changeScript);
+    expect(parsed.outputs[0]!.satoshis).toBe(99808);
+  });
+
+  it('produces no outputs when stateless and change is zero or negative', () => {
+    // Fee for 1 input, 1 output: 1*148 + 1*34 + 10 = 192
+    // To get exactly 0 change: satoshis = fee = 192
+    const utxo = makeUtxo(192);
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '51',
+      undefined,
+      undefined,
+      'changeaddr',
+      changeScript,
+    );
+    const parsed = parseTxHex(txHex);
+
+    // Change = 192 - 0 - 192 = 0 → no change output
+    expect(parsed.outputCount).toBe(0);
+  });
+});

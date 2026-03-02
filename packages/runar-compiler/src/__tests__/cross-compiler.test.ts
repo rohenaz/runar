@@ -22,6 +22,41 @@ try {
   // Go not available
 }
 
+// ---------------------------------------------------------------------------
+// Check if Rust (cargo) is available and the compiler is built
+// ---------------------------------------------------------------------------
+
+let hasRust = false;
+let rustBinaryPath: string | null = null;
+
+try {
+  execSync('cargo --version', { stdio: 'pipe' });
+  hasRust = true;
+} catch {
+  // Rust/cargo not available
+}
+
+if (hasRust) {
+  const candidatePath = join(__dirname, '..', '..', '..', '..', 'compilers', 'rust', 'target', 'release', 'runar-compiler-rust');
+  if (existsSync(candidatePath)) {
+    rustBinaryPath = candidatePath;
+  } else {
+    // Try building the release binary
+    try {
+      execSync('cargo build --release', {
+        cwd: join(__dirname, '..', '..', '..', '..', 'compilers', 'rust'),
+        timeout: 120000,
+        stdio: 'pipe',
+      });
+      if (existsSync(candidatePath)) {
+        rustBinaryPath = candidatePath;
+      }
+    } catch {
+      // Build failed; Rust tests will be skipped
+    }
+  }
+}
+
 function tsCompileErrors(sourceName: string, diagnostics: { severity?: string; message?: string }[]): string {
   const errors = diagnostics
     .filter((d) => d.severity === 'error')
@@ -37,6 +72,9 @@ function tsCompileErrors(sourceName: string, diagnostics: { severity?: string; m
 
 // Path to the Go compiler source
 const GO_COMPILER_DIR = join(__dirname, '..', '..', '..', '..', 'compilers', 'go');
+
+// Path to the Rust compiler source
+const RUST_COMPILER_DIR = join(__dirname, '..', '..', '..', '..', 'compilers', 'rust');
 
 // Path to the conformance tests directory
 const CONFORMANCE_DIR = join(__dirname, '..', '..', '..', '..', 'conformance', 'tests');
@@ -71,6 +109,27 @@ function runGoCompiler(irFilePath: string): string | null {
       `go run . --ir "${irFilePath}" --hex`,
       {
         cwd: GO_COMPILER_DIR,
+        timeout: 30000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      },
+    );
+    return result.toString().trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run the Rust compiler on an ANF IR JSON file, returning the hex output.
+ * Uses the pre-built release binary for speed. Returns null if the compiler fails.
+ */
+function runRustCompiler(irFilePath: string): string | null {
+  if (!rustBinaryPath) return null;
+  try {
+    const result = execSync(
+      `"${rustBinaryPath}" --ir "${irFilePath}" --hex`,
+      {
+        cwd: RUST_COMPILER_DIR,
         timeout: 30000,
         stdio: ['pipe', 'pipe', 'pipe'],
       },
@@ -231,6 +290,71 @@ describe.skipIf(!hasGo)('Cross-compiler: TS IR -> Go Script', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Cross-compiler: TS IR -> Rust Script
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!hasRust || !rustBinaryPath)('Cross-compiler: TS IR -> Rust Script', () => {
+  let tempDir: string;
+
+  beforeAll(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'runar-cross-rust-'));
+  });
+
+  afterAll(() => {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  for (const { name, source } of CONTRACT_SOURCES) {
+    it(`Rust compiler accepts ${name} ANF IR and produces hex matching TS`, () => {
+      const tsResult = compile(source);
+      if (!tsResult.success) {
+        throw new Error(tsCompileErrors(name, tsResult.diagnostics));
+      }
+
+      expect(tsResult.anf).not.toBeNull();
+      expect(tsResult.scriptHex).toBeTruthy();
+      const tsAnf = tsResult.anf!;
+
+      const irJson = anfToJson(tsAnf);
+      const irPath = join(tempDir, `${name}.anf.json`);
+      writeFileSync(irPath, irJson);
+
+      const hexOutput = runRustCompiler(irPath);
+
+      // The Rust compiler must produce output matching the TS reference byte-for-byte
+      expect(hexOutput).not.toBeNull();
+      expect(hexOutput!.length).toBeGreaterThan(0);
+      const tsHex = tsResult.scriptHex as string;
+      expect(hexOutput!.toLowerCase()).toBe(tsHex.toLowerCase());
+    });
+  }
+
+  it('both TS and Rust compilers accept the same P2PKH ANF IR and produce identical hex', () => {
+    const result = compile(P2PKH_SOURCE);
+    expect(result.success).toBe(true);
+    expect(result.anf).not.toBeNull();
+
+    const tsAnf = result.anf!;
+    expect(tsAnf.contractName).toBe('P2PKH');
+
+    const irJson = anfToJson(tsAnf);
+    const irPath = join(tempDir, 'p2pkh-both-rust.anf.json');
+    writeFileSync(irPath, irJson);
+
+    const rustHex = runRustCompiler(irPath);
+
+    expect(rustHex).not.toBeNull();
+    expect(rustHex!.length).toBeGreaterThan(0);
+    const tsHex = result.scriptHex as string;
+    expect(rustHex!.toLowerCase()).toBe(tsHex.toLowerCase());
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Test compilation of all example contracts through TS + Go pipeline
 // ---------------------------------------------------------------------------
 
@@ -383,4 +507,146 @@ describe.skipIf(!hasGo)('Cross-compiler conformance: Go output vs golden hex', (
       expect(goHex!.toLowerCase()).toBe(expectedHex.toLowerCase());
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Cross-compiler: all examples TS IR -> Rust
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!hasRust || !rustBinaryPath)('Cross-compiler: all examples TS IR -> Rust', () => {
+  let tempDir: string;
+
+  beforeAll(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'runar-cross-examples-rust-'));
+  });
+
+  afterAll(() => {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  const examples = findExampleContracts();
+
+  for (const example of examples) {
+    it(`compiles ${example.name} through TS -> Rust pipeline`, () => {
+      const result = compile(example.source);
+
+      if (!result.success) {
+        throw new Error(tsCompileErrors(example.name, result.diagnostics));
+      }
+
+      expect(result.anf).not.toBeNull();
+      expect(result.scriptHex).toBeTruthy();
+      const exampleAnf = result.anf!;
+
+      const irJson = anfToJson(exampleAnf);
+      const irPath = join(tempDir, `${example.name}.anf.json`);
+      writeFileSync(irPath, irJson);
+
+      const rustHex = runRustCompiler(irPath);
+
+      expect(rustHex).not.toBeNull();
+      expect(rustHex!.length).toBeGreaterThan(0);
+      expect(rustHex!.toLowerCase()).toBe(result.scriptHex!.toLowerCase());
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Conformance golden file tests: Rust output must match expected-script.hex
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!hasRust || !rustBinaryPath)('Cross-compiler conformance: Rust output vs golden hex', () => {
+  let tempDir: string;
+
+  beforeAll(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'runar-cross-conformance-rust-'));
+  });
+
+  afterAll(() => {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  const conformanceTests = findConformanceTests();
+
+  for (const test of conformanceTests) {
+    it(`${test.name}: Rust hex output matches expected-script.hex`, () => {
+      const source = readFileSync(test.sourceFile, 'utf-8');
+      const expectedHex = readFileSync(test.hexFile, 'utf-8').trim();
+
+      const result = compile(source);
+      if (!result.success) {
+        throw new Error(tsCompileErrors(test.name, result.diagnostics));
+      }
+
+      expect(result.anf).not.toBeNull();
+      const conformanceAnf = result.anf!;
+
+      const irJson = anfToJson(conformanceAnf);
+      const irPath = join(tempDir, `${test.name}.anf.json`);
+      writeFileSync(irPath, irJson);
+
+      const rustHex = runRustCompiler(irPath);
+
+      expect(rustHex).not.toBeNull();
+      expect(rustHex!.length).toBeGreaterThan(0);
+      expect(rustHex!.toLowerCase()).toBe(expectedHex.toLowerCase());
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Cross-compiler: all three compilers produce identical hex
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!hasGo || !hasRust || !rustBinaryPath)('Cross-compiler: all three compilers produce identical hex', () => {
+  let tempDir: string;
+
+  beforeAll(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'runar-cross-all-'));
+  });
+
+  afterAll(() => {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('TS, Go, and Rust all produce identical hex for P2PKH', () => {
+    const result = compile(P2PKH_SOURCE);
+    expect(result.success).toBe(true);
+    expect(result.anf).not.toBeNull();
+    expect(result.scriptHex).toBeTruthy();
+
+    const tsAnf = result.anf!;
+    const tsHex = (result.scriptHex as string).toLowerCase();
+
+    const irJson = anfToJson(tsAnf);
+    const irPath = join(tempDir, 'p2pkh-all-three.anf.json');
+    writeFileSync(irPath, irJson);
+
+    // Run Go compiler
+    const goHex = runGoCompiler(irPath);
+    expect(goHex).not.toBeNull();
+    expect(goHex!.length).toBeGreaterThan(0);
+
+    // Run Rust compiler
+    const rustHex = runRustCompiler(irPath);
+    expect(rustHex).not.toBeNull();
+    expect(rustHex!.length).toBeGreaterThan(0);
+
+    // All three must match
+    expect(goHex!.toLowerCase()).toBe(tsHex);
+    expect(rustHex!.toLowerCase()).toBe(tsHex);
+    expect(goHex!.toLowerCase()).toBe(rustHex!.toLowerCase());
+  });
 });
