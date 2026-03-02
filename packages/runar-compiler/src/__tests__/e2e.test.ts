@@ -307,7 +307,7 @@ describe('End-to-end: compile()', () => {
   describe('stateful contract compilation', () => {
     it('compiles a counter contract with mutable state', () => {
       const source = `
-        class Counter extends SmartContract {
+        class Counter extends StatefulSmartContract {
           count: bigint;
 
           constructor(count: bigint) {
@@ -317,7 +317,6 @@ describe('End-to-end: compile()', () => {
 
           public increment() {
             this.count = this.count + 1n;
-            assert(true);
           }
         }
       `;

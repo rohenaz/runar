@@ -879,8 +879,8 @@ every public method:
 \label{sec:pass-optimize}
 %-----------------------------------------------------------------------------
 
-Between ANF lowering and stack lowering, an optional constant folding
-optimizer evaluates compile-time-known expressions:
+Between ANF lowering and stack lowering, a constant folding optimizer is
+available to evaluate compile-time-known expressions:
 
 \begin{definition}[Constant Folding]
 A binding $\texttt{let } t_i = V_i$ is \emph{foldable} if $V_i$ is a
@@ -897,6 +897,35 @@ are propagated through the binding sequence, enabling cascading optimizations.
 The optimizer preserves the binding indices---it replaces values in-place
 rather than removing bindings---ensuring that subsequent bindings' references
 remain valid.
+
+\paragraph{Conformance tradeoff: disabled by default.}
+Although the constant folding optimizer is fully implemented, it is
+\emph{disabled by default} in the standard compilation pipeline. The
+reason is architectural: the ANF IR serves as the conformance boundary
+between the three independent compiler implementations
+(Section~\ref{sec:eval-conformance}), and all three must produce
+byte-identical ANF IR for the same input to satisfy
+Theorem~\ref{thm:conformance}. Enabling constant folding would modify the
+ANF IR---replacing operation bindings with pre-computed constants---thereby
+altering the canonical representation that the conformance suite validates
+against. Since the three compilers share the same stack lowering and
+emission algorithms, any script size reduction achieved by folding at the
+ANF level would equally be achievable by each compiler independently, but
+the intermediate ANF output would no longer match, breaking the
+byte-identical cross-compiler guarantee at the conformance boundary.
+
+In practice, the optimizer can be enabled via an explicit compiler option
+for production builds in which script size optimization is desired and
+cross-compiler ANF conformance is not required. When enabled, it correctly
+folds all arithmetic ($+$, $-$, $*$, $/$, $\%$), comparison ($<$, $>$,
+$\leq$, $\geq$, $===$, $!==$), bitwise ($\&$, $|$, $\wedge$, $\ll$,
+$\gg$), and unary ($-$, $!$, $\sim$) operations, as well as pure built-in
+function calls (\texttt{abs}, \texttt{min}, \texttt{max}, \texttt{pow},
+\texttt{sqrt}, \texttt{gcd}, \texttt{sign}, \texttt{clamp},
+\texttt{divmod}, \texttt{log2}, among others). The default pipeline
+instead passes the unmodified ANF IR directly to stack lowering, preserving
+the canonical form that underpins the cross-compiler conformance
+architecture.
 
 %-----------------------------------------------------------------------------
 \subsection{Pass 5: Stack Lowering}

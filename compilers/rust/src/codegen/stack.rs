@@ -694,6 +694,11 @@ impl LoweringContext {
             return;
         }
 
+        if func_name == "__array_access" {
+            self.lower_array_access(binding_name, args, binding_index, last_uses);
+            return;
+        }
+
         if func_name == "reverseBytes" {
             self.lower_reverse_bytes(binding_name, args, binding_index, last_uses);
             return;
@@ -1496,6 +1501,77 @@ impl LoweringContext {
 
         // Rename top of stack to the binding name
         self.sm.pop();
+        self.sm.push(binding_name);
+        self.track_depth();
+    }
+
+    /// Lower `__array_access(data, index)` — ByteString byte-level indexing.
+    ///
+    /// Compiled to:
+    ///   `<data> <index> OP_SPLIT OP_NIP 1 OP_SPLIT OP_DROP OP_BIN2NUM`
+    ///
+    /// Stack trace:
+    ///   `[..., data, index]`
+    ///   `OP_SPLIT  → [..., left, right]`       (split at index)
+    ///   `OP_NIP    → [..., right]`             (discard left)
+    ///   `push 1    → [..., right, 1]`
+    ///   `OP_SPLIT  → [..., firstByte, rest]`   (split off first byte)
+    ///   `OP_DROP   → [..., firstByte]`         (discard rest)
+    ///   `OP_BIN2NUM → [..., numericValue]`     (convert byte to bigint)
+    fn lower_array_access(
+        &mut self,
+        binding_name: &str,
+        args: &[String],
+        binding_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) {
+        assert!(args.len() >= 2, "__array_access requires 2 arguments (object, index)");
+
+        let obj = &args[0];
+        let index = &args[1];
+
+        // Push the data (ByteString) onto the stack
+        let obj_is_last = self.is_last_use(obj, binding_index, last_uses);
+        self.bring_to_top(obj, obj_is_last);
+
+        // Push the index onto the stack
+        let index_is_last = self.is_last_use(index, binding_index, last_uses);
+        self.bring_to_top(index, index_is_last);
+
+        // OP_SPLIT at index: stack = [..., left, right]
+        self.sm.pop();  // index consumed
+        self.sm.pop();  // data consumed
+        self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
+        self.sm.push("");  // left part (discard)
+        self.sm.push("");  // right part (keep)
+
+        // OP_NIP: discard left, keep right: stack = [..., right]
+        self.emit_op(StackOp::Nip);
+        self.sm.pop();
+        let right_part = self.sm.pop();
+        self.sm.push(&right_part);
+
+        // Push 1 for the next split (extract 1 byte)
+        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.sm.push("");
+
+        // OP_SPLIT: split off first byte: stack = [..., firstByte, rest]
+        self.sm.pop();  // 1 consumed
+        self.sm.pop();  // right consumed
+        self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
+        self.sm.push("");  // first byte (keep)
+        self.sm.push("");  // rest (discard)
+
+        // OP_DROP: discard rest: stack = [..., firstByte]
+        self.emit_op(StackOp::Drop);
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push("");
+
+        // OP_BIN2NUM: convert single byte to numeric value
+        self.sm.pop();
+        self.emit_op(StackOp::Opcode("OP_BIN2NUM".to_string()));
+
         self.sm.push(binding_name);
         self.track_depth();
     }

@@ -38,4 +38,6 @@ export interface DeployOptions {
 export interface CallOptions {
   satoshis?: number; // for next output (stateful)
   changeAddress?: string;
+  /** New state values for the continuation output (stateful contracts). */
+  newState?: Record<string, unknown>;
 }

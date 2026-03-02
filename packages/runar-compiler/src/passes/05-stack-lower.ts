@@ -52,6 +52,7 @@ const BUILTIN_OPCODES: Record<string, string[]> = {
   int2str: ['OP_NUM2BIN'],
   sign: ['OP_DUP', 'OP_ABS', 'OP_SWAP', 'OP_DIV'],
   bool: ['OP_0NOTEQUAL'],
+  unpack: ['OP_BIN2NUM'],
 };
 
 // ---------------------------------------------------------------------------
@@ -367,13 +368,21 @@ class LoweringContext {
   lowerBindings(bindings: ANFBinding[], terminalAssert = false): void {
     const lastUses = computeLastUses(bindings);
 
-    // Find the index of the last assert binding (if terminalAssert is set)
+    // Find the terminal binding index (if terminalAssert is set).
+    // If the last binding is an 'if' whose branches end in asserts,
+    // that 'if' is the terminal point (not an earlier standalone assert).
     let lastAssertIdx = -1;
+    let terminalIfIdx = -1;
     if (terminalAssert) {
-      for (let i = bindings.length - 1; i >= 0; i--) {
-        if (bindings[i]!.value.kind === 'assert') {
-          lastAssertIdx = i;
-          break;
+      const lastBinding = bindings[bindings.length - 1];
+      if (lastBinding && lastBinding.value.kind === 'if') {
+        terminalIfIdx = bindings.length - 1;
+      } else {
+        for (let i = bindings.length - 1; i >= 0; i--) {
+          if (bindings[i]!.value.kind === 'assert') {
+            lastAssertIdx = i;
+            break;
+          }
         }
       }
     }
@@ -383,6 +392,9 @@ class LoweringContext {
       if (binding.value.kind === 'assert' && i === lastAssertIdx) {
         // Terminal assert: leave value on stack instead of OP_VERIFY
         this.lowerAssert(binding.value.value, i, lastUses, true);
+      } else if (binding.value.kind === 'if' && i === terminalIfIdx) {
+        // Terminal if: propagate terminalAssert into both branches
+        this.lowerIf(binding.name, binding.value.cond, binding.value.then, binding.value.else, i, lastUses, true);
       } else {
         this.lowerBinding(binding, i, lastUses);
       }
@@ -624,10 +636,41 @@ class LoweringContext {
       return;
     }
 
+    if (func === 'exit') {
+      // exit(condition) => condition OP_VERIFY — same as assert
+      if (args.length >= 1) {
+        const arg = args[0]!;
+        const isLast = this.isLastUse(arg, bindingIndex, lastUses);
+        this.bringToTop(arg, isLast);
+        this.stackMap.pop();
+        this.emitOp({ op: 'opcode', code: 'OP_VERIFY' });
+        this.stackMap.push(bindingName);
+      }
+      return;
+    }
+
+    // pack() and toByteString() are type-level casts — no-ops at the script level
+    if (func === 'pack' || func === 'toByteString') {
+      if (args.length >= 1) {
+        const arg = args[0]!;
+        const isLast = this.isLastUse(arg, bindingIndex, lastUses);
+        this.bringToTop(arg, isLast);
+        // Replace the arg's stack entry with the binding name
+        this.stackMap.pop();
+        this.stackMap.push(bindingName);
+      }
+      return;
+    }
+
     if (func === 'super') {
       // super() in constructor — no opcode emission needed, it's a
       // no-op at the script level. Constructor args are already on the stack.
       this.stackMap.push(bindingName);
+      return;
+    }
+
+    if (func === '__array_access') {
+      this.lowerArrayAccess(bindingName, args, bindingIndex, lastUses);
       return;
     }
 
@@ -808,6 +851,7 @@ class LoweringContext {
     elseBindings: ANFBinding[],
     bindingIndex: number,
     lastUses: Map<string, number>,
+    terminalAssert = false,
   ): void {
     // Get condition to top of stack
     const isLast = this.isLastUse(cond, bindingIndex, lastUses);
@@ -817,13 +861,13 @@ class LoweringContext {
     // Lower then-branch
     const thenCtx = new LoweringContext([], this._properties, this.privateMethods);
     thenCtx.stackMap = this.stackMap.clone();
-    thenCtx.lowerBindings(thenBindings);
+    thenCtx.lowerBindings(thenBindings, terminalAssert);
     const thenOps = thenCtx.result.ops;
 
     // Lower else-branch
     const elseCtx = new LoweringContext([], this._properties, this.privateMethods);
     elseCtx.stackMap = this.stackMap.clone();
-    elseCtx.lowerBindings(elseBindings);
+    elseCtx.lowerBindings(elseBindings, terminalAssert);
     const elseOps = elseCtx.result.ops;
 
     this.emitOp({
@@ -2267,6 +2311,79 @@ class LoweringContext {
     this.emitOp({ op: 'drop' });
     this.stackMap.pop();
     this.stackMap.pop();
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  /**
+   * Lower `__array_access(data, index)` — ByteString byte-level indexing.
+   *
+   * Compiled to:
+   *   <data> <index> OP_SPLIT OP_NIP 1 OP_SPLIT OP_DROP OP_BIN2NUM
+   *
+   * Stack trace:
+   *   [..., data, index]
+   *   OP_SPLIT  → [..., left, right]       (split at index)
+   *   OP_NIP    → [..., right]             (discard left)
+   *   push 1    → [..., right, 1]
+   *   OP_SPLIT  → [..., firstByte, rest]   (split off first byte)
+   *   OP_DROP   → [..., firstByte]         (discard rest)
+   *   OP_BIN2NUM → [..., numericValue]     (convert byte to bigint)
+   */
+  private lowerArrayAccess(
+    bindingName: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    if (args.length < 2) {
+      throw new Error('__array_access requires 2 arguments (object, index)');
+    }
+
+    const [obj, index] = args as [string, string];
+
+    // Push the data (ByteString) onto the stack
+    const objIsLast = this.isLastUse(obj, bindingIndex, lastUses);
+    this.bringToTop(obj, objIsLast);
+
+    // Push the index onto the stack
+    const indexIsLast = this.isLastUse(index, bindingIndex, lastUses);
+    this.bringToTop(index, indexIsLast);
+
+    // OP_SPLIT at index: stack = [..., left, right]
+    this.stackMap.pop();  // index consumed
+    this.stackMap.pop();  // data consumed
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
+    this.stackMap.push(null);  // left part (discard)
+    this.stackMap.push(null);  // right part (keep)
+
+    // OP_NIP: discard left, keep right: stack = [..., right]
+    this.emitOp({ op: 'nip' });
+    this.stackMap.pop();
+    const rightPart = this.stackMap.pop();
+    this.stackMap.push(rightPart);
+
+    // Push 1 for the next split (extract 1 byte)
+    this.emitOp({ op: 'push', value: 1n });
+    this.stackMap.push(null);
+
+    // OP_SPLIT: split off first byte: stack = [..., firstByte, rest]
+    this.stackMap.pop();  // 1 consumed
+    this.stackMap.pop();  // right consumed
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
+    this.stackMap.push(null);  // first byte (keep)
+    this.stackMap.push(null);  // rest (discard)
+
+    // OP_DROP: discard rest: stack = [..., firstByte]
+    this.emitOp({ op: 'drop' });
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+
+    // OP_BIN2NUM: convert single byte to numeric value
+    this.stackMap.pop();
+    this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
 
     this.stackMap.push(bindingName);
     this.trackDepth();

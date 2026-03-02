@@ -75,6 +75,19 @@ function validateProperties(ctx: ValidationContext): void {
     }
   }
 
+  // SmartContract requires all properties to be readonly
+  if (ctx.contract.parentClass === 'SmartContract') {
+    for (const prop of ctx.contract.properties) {
+      if (!prop.readonly) {
+        ctx.errors.push(makeDiagnostic(
+          `Property '${prop.name}' in SmartContract must be readonly. Use StatefulSmartContract for mutable state.`,
+          'error',
+          prop.sourceLocation,
+        ));
+      }
+    }
+  }
+
   // Warn if StatefulSmartContract has no mutable properties
   if (ctx.contract.parentClass === 'StatefulSmartContract') {
     const hasMutableProps = ctx.contract.properties.some(p => !p.readonly);

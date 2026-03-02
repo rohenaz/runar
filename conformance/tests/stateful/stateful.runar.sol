@@ -1,6 +1,6 @@
 pragma runar ^0.1.0;
 
-contract Stateful is SmartContract {
+contract Stateful is StatefulSmartContract {
     int count;
     int immutable maxCount;
 
@@ -9,16 +9,12 @@ contract Stateful is SmartContract {
         maxCount = _maxCount;
     }
 
-    function increment(int amount, SigHashPreimage txPreimage) public {
-        require(checkPreimage(txPreimage));
+    function increment(int amount) public {
         count = count + amount;
         require(count <= maxCount);
-        require(hash256(getStateScript()) == extractOutputHash(txPreimage));
     }
 
-    function reset(SigHashPreimage txPreimage) public {
-        require(checkPreimage(txPreimage));
+    function reset() public {
         count = 0;
-        require(hash256(getStateScript()) == extractOutputHash(txPreimage));
     }
 }

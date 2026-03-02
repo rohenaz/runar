@@ -184,10 +184,11 @@ describe('buildDeployTransaction', () => {
   });
 
   it('produces single output when change is zero', () => {
-    // Construct such that totalInput - satoshis - fee = 0
-    // fee = numInputs * 148 + 2 * 34 + 10 = 148 + 68 + 10 = 226
-    // So totalInput = satoshis + fee = 50000 + 226 = 50226
-    const utxos = [makeUtxo(50226)];
+    // Fee estimation uses actual script sizes:
+    //   TX_OVERHEAD(10) + 1 input * P2PKH(148) + contract output(8 + 1 + 1) + change output(34)
+    //   = 10 + 148 + 10 + 34 = 202
+    // So totalInput = satoshis + fee = 50000 + 202 = 50202
+    const utxos = [makeUtxo(50202)];
     const { txHex } = buildDeployTransaction(
       '51',
       utxos,

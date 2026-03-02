@@ -890,6 +890,21 @@ describe('Pass 3: Type-Check', () => {
       expect(result.errors).toEqual([]);
     });
 
+    it('allows split builtin on ByteString', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly data: ByteString;
+          constructor(data: ByteString) { super(data); this.data = data; }
+          public m() {
+            const left: ByteString = split(this.data, 10n);
+            assert(len(left) === 10n);
+          }
+        }
+      `;
+      const result = typecheckSource(source);
+      expect(result.errors).toEqual([]);
+    });
+
     it('allows calls to private contract methods', () => {
       const source = `
         class C extends SmartContract {

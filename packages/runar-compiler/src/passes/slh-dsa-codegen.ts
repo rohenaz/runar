@@ -1013,38 +1013,3 @@ export {
 };
 
 export type { SLHCodegenParams };
-
-// ===========================================================================
-// Integration with LoweringContext (05-stack-lower.ts)
-// ===========================================================================
-//
-// 1. In lowerCall(), replace the error-throwing stub:
-//
-//    if (func.startsWith('verifySLHDSA_SHA2_')) {
-//      const paramKey = func.replace('verifySLHDSA_', '');
-//      this.lowerVerifySLHDSA(bindingName, paramKey, args, bindingIndex, lastUses);
-//      return;
-//    }
-//
-// 2. Add method to LoweringContext:
-//
-//    private lowerVerifySLHDSA(
-//      bindingName: string,
-//      paramKey: string,
-//      args: string[],
-//      bindingIndex: number,
-//      lastUses: Map<string, number>,
-//    ): void {
-//      if (args.length < 3) {
-//        throw new Error('verifySLHDSA requires 3 arguments: msg, sig, pubkey');
-//      }
-//      for (const arg of args) {
-//        this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
-//      }
-//      for (let i = 0; i < 3; i++) this.stackMap.pop();
-//
-//      emitVerifySLHDSA((op) => this.emitOp(op), paramKey);
-//
-//      this.stackMap.push(bindingName);
-//      this.trackDepth();
-//    }

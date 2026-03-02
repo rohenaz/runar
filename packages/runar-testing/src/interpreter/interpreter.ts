@@ -605,6 +605,29 @@ export class RunarInterpreter {
         return { kind: 'void' };
       }
 
+      case 'exit': {
+        if (args.length < 1) throw new Error('exit requires at least one argument');
+        if (!this.toBool(args[0]!)) {
+          throw new AssertionError('exit(false)');
+        }
+        return { kind: 'void' };
+      }
+
+      case 'pack': {
+        // Convert bigint to its byte representation
+        return { kind: 'bytes', value: this.toBytes(args[0]!) };
+      }
+
+      case 'unpack': {
+        // Convert byte representation to bigint
+        return { kind: 'bigint', value: this.toBigInt(args[0]!) };
+      }
+
+      case 'toByteString': {
+        // Identity — already a ByteString
+        return args[0]!;
+      }
+
       case 'sha256': {
         const data = this.toBytes(args[0]!);
         const hash = createHash('sha256').update(data).digest();

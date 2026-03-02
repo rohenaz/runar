@@ -26,10 +26,7 @@ export function buildDeployTransaction(
   }
 
   const totalInput = utxos.reduce((sum, u) => sum + u.satoshis, 0);
-  // Estimate fee: ~148 bytes per input + ~34 bytes per output + 10 byte overhead
-  const estimatedSize = utxos.length * 148 + 2 * 34 + 10;
-  const feeRate = 1; // 1 sat/byte (BSV)
-  const fee = estimatedSize * feeRate;
+  const fee = estimateDeployFee(utxos.length, lockingScript.length / 2);
   const change = totalInput - satoshis - fee;
 
   if (change < 0) {
@@ -128,6 +125,68 @@ function reverseHex(hex: string): string {
     pairs.push(hex.slice(i, i + 2));
   }
   return pairs.reverse().join('');
+}
+
+// ---------------------------------------------------------------------------
+// Fee estimation
+// ---------------------------------------------------------------------------
+
+/** Estimated size of a P2PKH input (prevTxid + index + sig + pubkey + seq). */
+const P2PKH_INPUT_SIZE = 148;
+/** Estimated size of a P2PKH output (satoshis + varint + 25-byte script). */
+const P2PKH_OUTPUT_SIZE = 34;
+/** Transaction overhead: version(4) + input varint(1) + output varint(1) + locktime(4). */
+const TX_OVERHEAD = 10;
+
+function varIntByteSize(n: number): number {
+  if (n < 0xfd) return 1;
+  if (n <= 0xffff) return 3;
+  if (n <= 0xffffffff) return 5;
+  return 9;
+}
+
+/**
+ * Estimate the fee for a deploy transaction given the number of P2PKH
+ * inputs and the contract locking script byte length. Assumes 1 sat/byte
+ * fee rate and includes a P2PKH change output.
+ */
+export function estimateDeployFee(
+  numInputs: number,
+  lockingScriptByteLen: number,
+): number {
+  const inputsSize = numInputs * P2PKH_INPUT_SIZE;
+  const contractOutputSize =
+    8 + varIntByteSize(lockingScriptByteLen) + lockingScriptByteLen;
+  const changeOutputSize = P2PKH_OUTPUT_SIZE;
+  return TX_OVERHEAD + inputsSize + contractOutputSize + changeOutputSize;
+}
+
+/**
+ * Select the minimum set of UTXOs needed to fund a deployment, using a
+ * largest-first strategy. Returns the selected subset (possibly all UTXOs
+ * if the total is still insufficient — the caller should check).
+ */
+export function selectUtxos(
+  utxos: UTXO[],
+  targetSatoshis: number,
+  lockingScriptByteLen: number,
+): UTXO[] {
+  const sorted = [...utxos].sort((a, b) => b.satoshis - a.satoshis);
+  const selected: UTXO[] = [];
+  let total = 0;
+
+  for (const utxo of sorted) {
+    selected.push(utxo);
+    total += utxo.satoshis;
+
+    const fee = estimateDeployFee(selected.length, lockingScriptByteLen);
+    if (total >= targetSatoshis + fee) {
+      return selected;
+    }
+  }
+
+  // Return all UTXOs; buildDeployTransaction will throw if still insufficient
+  return selected;
 }
 
 /**

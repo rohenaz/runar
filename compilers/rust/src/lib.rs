@@ -11,6 +11,7 @@ pub mod ir;
 
 use artifact::{assemble_artifact, RunarArtifact};
 use codegen::emit::emit;
+use codegen::optimizer::optimize_stack_ops;
 use codegen::stack::lower_to_stack;
 use ir::loader::{load_ir, load_ir_from_str};
 
@@ -131,10 +132,12 @@ pub fn compile_source_str_to_ir(
 /// Compile a parsed ANF program to a Rúnar artifact.
 pub fn compile_from_program(program: &ir::ANFProgram) -> Result<RunarArtifact, String> {
     // Pass 5: Stack lowering
-    let stack_methods = lower_to_stack(program)?;
+    let mut stack_methods = lower_to_stack(program)?;
 
-    // Peephole optimization is disabled to match the TS reference output exactly.
-    // The TS reference compiler does not apply peephole optimizations.
+    // Peephole optimization — runs on Stack IR before emission.
+    for method in &mut stack_methods {
+        method.ops = optimize_stack_ops(&method.ops);
+    }
 
     // Pass 6: Emit
     let emit_result = emit(&stack_methods)?;

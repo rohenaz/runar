@@ -45,7 +45,7 @@ class P2PKH extends SmartContract {
 `;
 
 const VALID_COUNTER = `
-class Counter extends SmartContract {
+class Counter extends StatefulSmartContract {
   count: bigint;
 
   constructor(count: bigint) {
@@ -55,7 +55,6 @@ class Counter extends SmartContract {
 
   public increment() {
     this.count = this.count + 1n;
-    assert(true);
   }
 }
 `;
@@ -395,6 +394,46 @@ describe('Pass 2: Validate', () => {
         const result = validate(parseResult.contract);
         expect(hasError(result, "void")).toBe(true);
       }
+    });
+
+    it('reports error when SmartContract has a non-readonly property', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly pk: PubKey;
+          amount: bigint;
+
+          constructor(pk: PubKey, amount: bigint) {
+            super(pk, amount);
+            this.pk = pk;
+            this.amount = amount;
+          }
+
+          public m(sig: Sig) {
+            assert(checkSig(sig, this.pk));
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, "readonly")).toBe(true);
+    });
+
+    it('allows non-readonly properties in StatefulSmartContract', () => {
+      const source = `
+        class C extends StatefulSmartContract {
+          count: bigint;
+
+          constructor(count: bigint) {
+            super(count);
+            this.count = count;
+          }
+
+          public increment() {
+            this.count = this.count + 1n;
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, "readonly")).toBe(false);
     });
 
     it('reports error for unsupported custom type in property', () => {

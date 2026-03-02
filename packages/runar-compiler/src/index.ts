@@ -32,6 +32,7 @@ import { typecheck } from './passes/03-typecheck.js';
 import { lowerToANF } from './passes/04-anf-lower.js';
 import { lowerToStack } from './passes/05-stack-lower.js';
 import { emit } from './passes/06-emit.js';
+import { optimizeStackIR } from './optimizer/peephole.js';
 import { assembleArtifact } from './artifact/assembler.js';
 import type { CompilerDiagnostic } from './errors.js';
 import type { ContractNode, ANFProgram, RunarArtifact } from './ir/index.js';
@@ -184,9 +185,17 @@ export function compile(source: string, options?: CompileOptions): CompileResult
   // the default compile path.
   const optimizedAnf = anf;
 
-  // Pass 5-6: Stack lower + Emit
+  // Pass 5-6: Stack lower + Peephole optimize + Emit
   try {
     const stackProgram = lowerToStack(optimizedAnf);
+
+    // Apply peephole optimization to each method's ops (runs on Stack IR,
+    // after the ANF conformance boundary, so it doesn't affect cross-compiler
+    // conformance).
+    for (const method of stackProgram.methods) {
+      method.ops = optimizeStackIR(method.ops);
+    }
+
     const emitResult = emit(stackProgram);
     const artifact = assembleArtifact(
       parseResult.contract,

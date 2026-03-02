@@ -1,6 +1,6 @@
-import { SmartContract, assert, SigHashPreimage, checkPreimage, hash256, extractOutputHash } from 'runar-lang';
+import { StatefulSmartContract, assert } from 'runar-lang';
 
-class Stateful extends SmartContract {
+class Stateful extends StatefulSmartContract {
   count: bigint;
   readonly maxCount: bigint;
 
@@ -10,16 +10,12 @@ class Stateful extends SmartContract {
     this.maxCount = maxCount;
   }
 
-  public increment(amount: bigint, txPreimage: SigHashPreimage): void {
-    assert(checkPreimage(txPreimage));
+  public increment(amount: bigint): void {
     this.count = this.count + amount;
     assert(this.count <= this.maxCount);
-    assert(hash256(this.getStateScript()) === extractOutputHash(txPreimage));
   }
 
-  public reset(txPreimage: SigHashPreimage): void {
-    assert(checkPreimage(txPreimage));
+  public reset(): void {
     this.count = 0n;
-    assert(hash256(this.getStateScript()) === extractOutputHash(txPreimage));
   }
 }

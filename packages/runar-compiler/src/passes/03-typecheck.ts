@@ -101,6 +101,7 @@ const BUILTIN_FUNCTIONS: Map<string, FuncSig> = new Map([
   ['divmod',       { params: ['bigint', 'bigint'], returnType: 'bigint' }],
   ['log2',         { params: ['bigint'], returnType: 'bigint' }],
   ['bool',         { params: ['bigint'], returnType: 'boolean' }],
+  ['split',        { params: ['ByteString', 'bigint'], returnType: 'ByteString' }],
   ['reverseBytes', { params: ['ByteString'], returnType: 'ByteString' }],
   ['left',         { params: ['ByteString', 'bigint'], returnType: 'ByteString' }],
   ['right',        { params: ['ByteString', 'bigint'], returnType: 'ByteString' }],

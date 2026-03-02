@@ -25,7 +25,7 @@ export { LocalSigner, ExternalSigner } from './signers/index.js';
 export { RunarContract } from './contract.js';
 
 // Transaction building
-export { buildDeployTransaction } from './deployment.js';
+export { buildDeployTransaction, selectUtxos, estimateDeployFee } from './deployment.js';
 export { buildCallTransaction } from './calling.js';
 
 // State management

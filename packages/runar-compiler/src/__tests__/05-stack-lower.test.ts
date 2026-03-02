@@ -316,4 +316,237 @@ describe('Pass 5: Stack Lower', () => {
       expect(opcodes).toContain('OP_GREATERTHAN');
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Built-in functions that were type-checked but had no codegen (spec gaps)
+  // ---------------------------------------------------------------------------
+
+  describe('exit/pack/unpack/toByteString codegen', () => {
+    it('exit() compiles to OP_VERIFY', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(a: bigint) {
+            exit(a > 0n);
+            assert(true);
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'm');
+      const allOps = flattenOps(method.ops);
+      const opcodes = allOps.filter(o => o.op === 'opcode').map(o => (o as { code: string }).code);
+      expect(opcodes).toContain('OP_VERIFY');
+    });
+
+    it('unpack() compiles to OP_BIN2NUM', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: ByteString;
+          constructor(x: ByteString) { super(x); this.x = x; }
+          public m(data: ByteString) {
+            const n: bigint = unpack(data);
+            assert(n > 0n);
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'm');
+      const allOps = flattenOps(method.ops);
+      const opcodes = allOps.filter(o => o.op === 'opcode').map(o => (o as { code: string }).code);
+      expect(opcodes).toContain('OP_BIN2NUM');
+    });
+
+    it('pack() compiles without error (no-op type cast)', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(a: bigint) {
+            const b: ByteString = pack(a);
+            assert(len(b) > 0n);
+          }
+        }
+      `;
+      // Should not throw "Unknown builtin function"
+      expect(() => compileToStack(source)).not.toThrow();
+    });
+
+    it('toByteString() compiles without error (no-op identity)', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: ByteString;
+          constructor(x: ByteString) { super(x); this.x = x; }
+          public m(data: ByteString) {
+            const b: ByteString = toByteString(data);
+            assert(len(b) > 0n);
+          }
+        }
+      `;
+      expect(() => compileToStack(source)).not.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // checkMultiSig stack layout
+  // ---------------------------------------------------------------------------
+
+  describe('checkMultiSig stack layout', () => {
+    it('emits OP_0 dummy, counts, and OP_CHECKMULTISIG', () => {
+      const source = `
+        class MultiSig extends SmartContract {
+          readonly pk1: PubKey;
+          readonly pk2: PubKey;
+
+          constructor(pk1: PubKey, pk2: PubKey) {
+            super(pk1, pk2);
+            this.pk1 = pk1;
+            this.pk2 = pk2;
+          }
+
+          public unlock(sig1: Sig, sig2: Sig) {
+            assert(checkMultiSig([sig1, sig2], [this.pk1, this.pk2]));
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'unlock');
+      const allOps = flattenOps(method.ops);
+      const opcodes = allOps.filter(o => o.op === 'opcode').map(o => (o as { code: string }).code);
+      expect(opcodes).toContain('OP_CHECKMULTISIG');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Terminal assert in if/else branches (issue #2)
+  // ---------------------------------------------------------------------------
+
+  describe('terminal assert in if/else branches', () => {
+    it('omits OP_VERIFY for terminal asserts when if/else is the last binding', () => {
+      const source = `
+        class BranchAssert extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public check(a: bigint) {
+            if (a > 0n) {
+              assert(this.x > 0n);
+            } else {
+              assert(this.x === 0n);
+            }
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'check');
+
+      // Find the IfOp in the method ops
+      const ifOp = method.ops.find(o => o.op === 'if') as
+        | { op: 'if'; then: StackOp[]; else?: StackOp[] }
+        | undefined;
+      expect(ifOp).toBeDefined();
+
+      // Neither branch should contain OP_VERIFY — the terminal assert
+      // must leave its value on the stack for Bitcoin Script's truthiness check.
+      const thenOpcodes = ifOp!.then
+        .filter(o => o.op === 'opcode')
+        .map(o => (o as { code: string }).code);
+      expect(thenOpcodes).not.toContain('OP_VERIFY');
+
+      const elseOpcodes = (ifOp!.else ?? [])
+        .filter(o => o.op === 'opcode')
+        .map(o => (o as { code: string }).code);
+      expect(elseOpcodes).not.toContain('OP_VERIFY');
+    });
+
+    it('still emits OP_VERIFY for non-terminal asserts before a terminal if/else', () => {
+      const source = `
+        class PreAssert extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public check(a: bigint) {
+            assert(a > 0n);
+            if (a > 1n) {
+              assert(this.x > 0n);
+            } else {
+              assert(this.x === 0n);
+            }
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'check');
+
+      // The first assert (a > 0n) should still produce OP_VERIFY
+      // because it's not the terminal assert.
+      const topLevelOpcodes = method.ops
+        .filter(o => o.op === 'opcode')
+        .map(o => (o as { code: string }).code);
+      expect(topLevelOpcodes).toContain('OP_VERIFY');
+
+      // But the branch asserts should NOT have OP_VERIFY
+      const ifOp = method.ops.find(o => o.op === 'if') as
+        | { op: 'if'; then: StackOp[]; else?: StackOp[] }
+        | undefined;
+      expect(ifOp).toBeDefined();
+
+      const thenOpcodes = ifOp!.then
+        .filter(o => o.op === 'opcode')
+        .map(o => (o as { code: string }).code);
+      expect(thenOpcodes).not.toContain('OP_VERIFY');
+
+      const elseOpcodes = (ifOp!.else ?? [])
+        .filter(o => o.op === 'opcode')
+        .map(o => (o as { code: string }).code);
+      expect(elseOpcodes).not.toContain('OP_VERIFY');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // ByteString indexing (__array_access)
+  // ---------------------------------------------------------------------------
+
+  describe('ByteString indexing (__array_access)', () => {
+    it('produces OP_SPLIT + nip + OP_SPLIT + drop + OP_BIN2NUM for data[0n]', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(data: ByteString) {
+            const byte: bigint = data[0n];
+            assert(byte > 0n);
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'm');
+      const allOps = flattenOps(method.ops);
+      const opcodes = allOps.filter(o => o.op === 'opcode').map(o => (o as { code: string }).code);
+      const allOpTypes = allOps.map(o => o.op);
+      // ByteString indexing emits: OP_SPLIT nip push(1) OP_SPLIT drop OP_BIN2NUM
+      expect(opcodes).toContain('OP_SPLIT');
+      expect(allOpTypes).toContain('nip');
+      expect(allOpTypes).toContain('drop');
+      expect(opcodes).toContain('OP_BIN2NUM');
+    });
+
+    it('handles ByteString indexing with a variable index', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(data: ByteString, idx: bigint) {
+            const byte: bigint = data[idx];
+            assert(byte > 0n);
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'm');
+      const allOps = flattenOps(method.ops);
+      const opcodes = allOps.filter(o => o.op === 'opcode').map(o => (o as { code: string }).code);
+      expect(opcodes).toContain('OP_SPLIT');
+      expect(opcodes).toContain('OP_BIN2NUM');
+    });
+  });
 });

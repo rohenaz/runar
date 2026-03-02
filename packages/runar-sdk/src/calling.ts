@@ -33,12 +33,22 @@ export function buildCallTransaction(
   // Calculate outputs total
   const contractOutputSats = newLockingScript ? (newSatoshis ?? currentUtxo.satoshis) : 0;
 
-  // Estimate fee
-  const estimatedInputSize = allUtxos.length * 148;
-  const outputCount =
-    (newLockingScript ? 1 : 0) + (changeAddress || changeScript ? 1 : 0);
-  const estimatedOutputSize = outputCount * 34;
-  const estimatedSize = estimatedInputSize + estimatedOutputSize + 10;
+  // Estimate fee using actual script sizes
+  // Input 0 is the contract UTXO with a known unlocking script
+  const input0Size = 32 + 4 + varIntByteSize(unlockingScript.length / 2) +
+    unlockingScript.length / 2 + 4;
+  const additionalInputsSize = (allUtxos.length - 1) * 148; // P2PKH
+  const inputsSize = input0Size + additionalInputsSize;
+
+  let outputsSize = 0;
+  if (newLockingScript) {
+    outputsSize += 8 + varIntByteSize(newLockingScript.length / 2) +
+      newLockingScript.length / 2;
+  }
+  if (changeAddress || changeScript) {
+    outputsSize += 34; // P2PKH change
+  }
+  const estimatedSize = 10 + inputsSize + outputsSize;
   const fee = estimatedSize; // 1 sat/byte
 
   const change = totalInput - contractOutputSats - fee;
@@ -137,6 +147,13 @@ function reverseHex(hex: string): string {
     pairs.push(hex.slice(i, i + 2));
   }
   return pairs.reverse().join('');
+}
+
+function varIntByteSize(n: number): number {
+  if (n < 0xfd) return 1;
+  if (n <= 0xffff) return 3;
+  if (n <= 0xffffffff) return 5;
+  return 9;
 }
 
 function buildP2PKHScript(address: string): string {

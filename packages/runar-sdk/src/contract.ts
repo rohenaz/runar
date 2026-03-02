@@ -6,7 +6,7 @@ import type { RunarArtifact, ABIMethod } from 'runar-ir-schema';
 import type { Provider } from './providers/provider.js';
 import type { Signer } from './signers/signer.js';
 import type { Transaction, UTXO, DeployOptions, CallOptions } from './types.js';
-import { buildDeployTransaction } from './deployment.js';
+import { buildDeployTransaction, selectUtxos } from './deployment.js';
 import { buildCallTransaction } from './calling.js';
 import { serializeState, extractStateFromScript } from './state.js';
 
@@ -26,6 +26,7 @@ export class RunarContract {
   readonly artifact: RunarArtifact;
   private readonly constructorArgs: unknown[];
   private _state: Record<string, unknown> = {};
+  private _codeScript: string | null = null;
   private currentUtxo: UTXO | null = null;
 
   constructor(artifact: RunarArtifact, constructorArgs: unknown[]) {
@@ -38,6 +39,18 @@ export class RunarContract {
       throw new Error(
         `RunarContract: expected ${expected} constructor args for ${artifact.contractName}, got ${constructorArgs.length}`,
       );
+    }
+
+    // Initialize state from constructor args for stateful contracts
+    if (artifact.stateFields && artifact.stateFields.length > 0) {
+      for (const field of artifact.stateFields) {
+        const paramIndex = artifact.abi.constructor.params.findIndex(
+          (p) => p.name === field.name,
+        );
+        if (paramIndex >= 0) {
+          this._state[field.name] = constructorArgs[paramIndex];
+        }
+      }
     }
   }
 
@@ -62,11 +75,12 @@ export class RunarContract {
     const changeAddress = options.changeAddress ?? address;
     const lockingScript = this.getLockingScript();
 
-    // Fetch funding UTXOs
-    const utxos = await provider.getUtxos(address);
-    if (utxos.length === 0) {
+    // Fetch funding UTXOs and select the minimum set needed
+    const allUtxos = await provider.getUtxos(address);
+    if (allUtxos.length === 0) {
       throw new Error(`RunarContract.deploy: no UTXOs found for address ${address}`);
     }
+    const utxos = selectUtxos(allUtxos, options.satoshis, lockingScript.length / 2);
 
     // Build the deploy transaction
     const changeScript = buildP2PKHScriptFromAddress(changeAddress);
@@ -99,18 +113,6 @@ export class RunarContract {
       satoshis: options.satoshis,
       script: lockingScript,
     };
-
-    // Initialize state from constructor args if stateful
-    if (this.artifact.stateFields && this.artifact.stateFields.length > 0) {
-      for (const field of this.artifact.stateFields) {
-        const paramIndex = this.artifact.abi.constructor.params.findIndex(
-          (p) => p.name === field.name,
-        );
-        if (paramIndex >= 0) {
-          this._state[field.name] = this.constructorArgs[paramIndex];
-        }
-      }
-    }
 
     const tx = await provider.getTransaction(txid).catch(() => ({
       txid,
@@ -180,9 +182,10 @@ export class RunarContract {
 
     if (isStateful) {
       newSatoshis = options?.satoshis ?? this.currentUtxo.satoshis;
-      // For stateful contracts, we rebuild the locking script with
-      // potentially updated state. In practice, the contract's public
-      // method would update `this._state` and we'd reconstruct.
+      // Apply new state values before building the continuation output
+      if (options?.newState) {
+        this._state = { ...this._state, ...options.newState };
+      }
       newLockingScript = this.getLockingScript();
     }
 
@@ -249,6 +252,11 @@ export class RunarContract {
     return { ...this._state };
   }
 
+  /** Update state values directly (for stateful contracts). */
+  setState(newState: Record<string, unknown>): void {
+    this._state = { ...this._state, ...newState };
+  }
+
   // -------------------------------------------------------------------------
   // Script construction
   // -------------------------------------------------------------------------
@@ -260,6 +268,26 @@ export class RunarContract {
    * the serialized state fields.
    */
   getLockingScript(): string {
+    // Use stored code script from chain if available (reconnected contract)
+    let script = this._codeScript ?? this.buildCodeScript();
+
+    // Append state section for stateful contracts
+    if (this.artifact.stateFields && this.artifact.stateFields.length > 0) {
+      const stateHex = serializeState(this.artifact.stateFields, this._state);
+      if (stateHex.length > 0) {
+        script += '6a'; // OP_RETURN
+        script += stateHex;
+      }
+    }
+
+    return script;
+  }
+
+  /**
+   * Build the code portion of the locking script from the artifact and
+   * constructor args. This is the script without any state suffix.
+   */
+  private buildCodeScript(): string {
     let script = this.artifact.script;
 
     if (this.artifact.constructorSlots && this.artifact.constructorSlots.length > 0) {
@@ -277,15 +305,6 @@ export class RunarContract {
       // Backward compatibility: old artifacts without constructorSlots
       for (const arg of this.constructorArgs) {
         script += encodeArg(arg);
-      }
-    }
-
-    // Append state section for stateful contracts
-    if (this.artifact.stateFields && this.artifact.stateFields.length > 0) {
-      const stateHex = serializeState(this.artifact.stateFields, this._state);
-      if (stateHex.length > 0) {
-        script += '6a'; // OP_RETURN
-        script += stateHex;
       }
     }
 
@@ -352,10 +371,23 @@ export class RunarContract {
     const output = tx.outputs[outputIndex]!;
     const contract = new RunarContract(
       artifact,
-      // We don't know the original constructor args, but we can reconstruct
-      // state from the script. Pass empty array; state will be populated below.
+      // Dummy constructor args — we store the on-chain code script directly
+      // so these won't be used in getLockingScript().
       new Array(artifact.abi.constructor.params.length).fill(0n) as unknown[],
     );
+
+    // Store the code portion of the on-chain script so getLockingScript()
+    // produces correct output without needing the original constructor args.
+    if (artifact.stateFields && artifact.stateFields.length > 0) {
+      // Stateful: code is everything before the last OP_RETURN
+      const lastOpReturn = output.script.lastIndexOf('6a');
+      contract._codeScript = lastOpReturn !== -1
+        ? output.script.slice(0, lastOpReturn)
+        : output.script;
+    } else {
+      // Stateless: the full on-chain script IS the code
+      contract._codeScript = output.script;
+    }
 
     // Set the current UTXO
     contract.currentUtxo = {
@@ -489,20 +521,115 @@ function deterministicHash20(input: string): string {
 /**
  * Insert an unlocking script into a raw transaction at a specific input index.
  *
- * This is a simplified approach that works for the common case. A production
- * implementation would properly parse and reconstruct the transaction.
+ * Parses the raw transaction hex to locate the target input's scriptSig field,
+ * replaces it with the provided unlocking script, and returns the modified
+ * transaction hex.
  */
 function insertUnlockingScript(
   txHex: string,
-  _inputIndex: number,
-  _unlockScript: string,
+  inputIndex: number,
+  unlockScript: string,
 ): string {
-  // KNOWN LIMITATION: This function currently returns the transaction hex
-  // unmodified. Proper scriptSig injection requires parsing the raw
-  // transaction, locating the specified input, replacing its scriptSig
-  // field, and re-serializing. This means only input 0 (whose unlock
-  // script is placed during buildCallTransaction) will be correct.
-  // Additional inputs will lack their unlocking scripts until full
-  // transaction parsing is integrated via @bsv/sdk.
-  return txHex;
+  let pos = 0;
+
+  // Skip version (4 bytes = 8 hex chars)
+  pos += 8;
+
+  // Read input count
+  const { value: inputCount, hexLen: icLen } = readVarIntHex(txHex, pos);
+  pos += icLen;
+
+  if (inputIndex >= inputCount) {
+    throw new Error(
+      `insertUnlockingScript: input index ${inputIndex} out of range (${inputCount} inputs)`,
+    );
+  }
+
+  for (let i = 0; i < inputCount; i++) {
+    // Skip prevTxid (32 bytes = 64 hex chars)
+    pos += 64;
+    // Skip prevOutputIndex (4 bytes = 8 hex chars)
+    pos += 8;
+
+    // Read scriptSig length
+    const { value: scriptLen, hexLen: slLen } = readVarIntHex(txHex, pos);
+
+    if (i === inputIndex) {
+      // Build the replacement: new varint length + new script data
+      const newScriptByteLen = unlockScript.length / 2;
+      const newVarInt = writeVarIntHex(newScriptByteLen);
+
+      const before = txHex.slice(0, pos);
+      const after = txHex.slice(pos + slLen + scriptLen * 2);
+      return before + newVarInt + unlockScript + after;
+    }
+
+    // Skip this input's scriptSig + sequence (4 bytes = 8 hex chars)
+    pos += slLen + scriptLen * 2 + 8;
+  }
+
+  // Should be unreachable due to the range check above
+  throw new Error(
+    `insertUnlockingScript: input index ${inputIndex} out of range`,
+  );
+}
+
+/**
+ * Read a Bitcoin varint from a hex string at the given position.
+ * Returns the decoded value and the number of hex characters consumed.
+ */
+function readVarIntHex(
+  hex: string,
+  pos: number,
+): { value: number; hexLen: number } {
+  const first = parseInt(hex.slice(pos, pos + 2), 16);
+  if (first < 0xfd) {
+    return { value: first, hexLen: 2 };
+  }
+  if (first === 0xfd) {
+    const lo = parseInt(hex.slice(pos + 2, pos + 4), 16);
+    const hi = parseInt(hex.slice(pos + 4, pos + 6), 16);
+    return { value: lo | (hi << 8), hexLen: 6 };
+  }
+  if (first === 0xfe) {
+    const b0 = parseInt(hex.slice(pos + 2, pos + 4), 16);
+    const b1 = parseInt(hex.slice(pos + 4, pos + 6), 16);
+    const b2 = parseInt(hex.slice(pos + 6, pos + 8), 16);
+    const b3 = parseInt(hex.slice(pos + 8, pos + 10), 16);
+    return {
+      value: (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0,
+      hexLen: 10,
+    };
+  }
+  // 0xff — 8-byte varint; handle the low 4 bytes (sufficient for scripts)
+  const b0 = parseInt(hex.slice(pos + 2, pos + 4), 16);
+  const b1 = parseInt(hex.slice(pos + 4, pos + 6), 16);
+  const b2 = parseInt(hex.slice(pos + 6, pos + 8), 16);
+  const b3 = parseInt(hex.slice(pos + 8, pos + 10), 16);
+  return {
+    value: (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0,
+    hexLen: 18,
+  };
+}
+
+/**
+ * Encode a number as a Bitcoin varint in hex.
+ */
+function writeVarIntHex(n: number): string {
+  if (n < 0xfd) {
+    return n.toString(16).padStart(2, '0');
+  }
+  if (n <= 0xffff) {
+    const lo = (n & 0xff).toString(16).padStart(2, '0');
+    const hi = ((n >> 8) & 0xff).toString(16).padStart(2, '0');
+    return 'fd' + lo + hi;
+  }
+  if (n <= 0xffffffff) {
+    const b0 = (n & 0xff).toString(16).padStart(2, '0');
+    const b1 = ((n >> 8) & 0xff).toString(16).padStart(2, '0');
+    const b2 = ((n >> 16) & 0xff).toString(16).padStart(2, '0');
+    const b3 = ((n >> 24) & 0xff).toString(16).padStart(2, '0');
+    return 'fe' + b0 + b1 + b2 + b3;
+  }
+  throw new Error('writeVarIntHex: value too large');
 }

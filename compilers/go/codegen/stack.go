@@ -1370,6 +1370,74 @@ func (ctx *loweringContext) lowerReverseBytes(bindingName string, args []string,
 	ctx.trackDepth()
 }
 
+// lowerArrayAccess handles __array_access(data, index) — ByteString byte-level indexing.
+//
+// Compiled to:
+//
+//	<data> <index> OP_SPLIT OP_NIP 1 OP_SPLIT OP_DROP OP_BIN2NUM
+//
+// Stack trace:
+//
+//	[..., data, index]
+//	OP_SPLIT  → [..., left, right]       (split at index)
+//	OP_NIP    → [..., right]             (discard left)
+//	push 1    → [..., right, 1]
+//	OP_SPLIT  → [..., firstByte, rest]   (split off first byte)
+//	OP_DROP   → [..., firstByte]         (discard rest)
+//	OP_BIN2NUM → [..., numericValue]     (convert byte to bigint)
+func (ctx *loweringContext) lowerArrayAccess(bindingName string, args []string, bindingIndex int, lastUses map[string]int) {
+	if len(args) < 2 {
+		panic("__array_access requires 2 arguments (object, index)")
+	}
+
+	obj, index := args[0], args[1]
+
+	// Push the data (ByteString) onto the stack
+	objIsLast := ctx.isLastUse(obj, bindingIndex, lastUses)
+	ctx.bringToTop(obj, objIsLast)
+
+	// Push the index onto the stack
+	indexIsLast := ctx.isLastUse(index, bindingIndex, lastUses)
+	ctx.bringToTop(index, indexIsLast)
+
+	// OP_SPLIT at index: stack = [..., left, right]
+	ctx.sm.pop()  // index consumed
+	ctx.sm.pop()  // data consumed
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
+	ctx.sm.push("") // left part (discard)
+	ctx.sm.push("") // right part (keep)
+
+	// OP_NIP: discard left, keep right: stack = [..., right]
+	ctx.emitOp(StackOp{Op: "nip"})
+	ctx.sm.pop()
+	rightPart := ctx.sm.pop()
+	ctx.sm.push(rightPart)
+
+	// Push 1 for the next split (extract 1 byte)
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(1)})
+	ctx.sm.push("")
+
+	// OP_SPLIT: split off first byte: stack = [..., firstByte, rest]
+	ctx.sm.pop()  // 1 consumed
+	ctx.sm.pop()  // right consumed
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
+	ctx.sm.push("") // first byte (keep)
+	ctx.sm.push("") // rest (discard)
+
+	// OP_DROP: discard rest: stack = [..., firstByte]
+	ctx.emitOp(StackOp{Op: "drop"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+
+	// OP_BIN2NUM: convert single byte to numeric value
+	ctx.sm.pop()
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_BIN2NUM"})
+
+	ctx.sm.push(bindingName)
+	ctx.trackDepth()
+}
+
 func (ctx *loweringContext) lowerSubstr(bindingName string, args []string, bindingIndex int, lastUses map[string]int) {
 	if len(args) < 3 {
 		panic("substr requires 3 arguments")

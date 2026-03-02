@@ -94,25 +94,11 @@ describe('Example contracts: end-to-end compilation', () => {
           return;
         }
 
-        // Stack lowering and emit may fail for contracts using advanced
-        // features (stateful contracts, preimage checking, etc.) that are
-        // not yet fully implemented in the backend. We catch and skip those.
-        let stackProgram;
-        try {
-          stackProgram = lowerToStack(compileResult.anf);
-        } catch {
-          // Backend doesn't support this contract yet -- not a test failure
-          return;
-        }
+        const stackProgram = lowerToStack(compileResult.anf);
         expect(stackProgram).toBeDefined();
         expect(stackProgram.contractName).toBe(compileResult.anf.contractName);
 
-        let emitResult;
-        try {
-          emitResult = emit(stackProgram);
-        } catch {
-          return;
-        }
+        const emitResult = emit(stackProgram);
         expect(emitResult).toBeDefined();
 
         // Assemble artifact
@@ -169,19 +155,8 @@ describe('Example contracts: end-to-end compilation', () => {
           return;
         }
 
-        let stackProgram;
-        try {
-          stackProgram = lowerToStack(compileResult.anf);
-        } catch {
-          return;
-        }
-
-        let emitResult;
-        try {
-          emitResult = emit(stackProgram);
-        } catch {
-          return;
-        }
+        const stackProgram = lowerToStack(compileResult.anf);
+        const emitResult = emit(stackProgram);
 
         // The script should not be empty (a valid contract should produce code)
         expect(emitResult.scriptHex.length).toBeGreaterThan(0);

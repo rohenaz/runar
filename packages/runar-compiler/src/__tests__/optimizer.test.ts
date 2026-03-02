@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { foldConstants, eliminateDeadBindings } from '../optimizer/constant-fold.js';
-import type { ANFProgram, ANFBinding, ANFMethod, ANFValue } from '../ir/index.js';
+import { optimizeStackIR } from '../optimizer/peephole.js';
+import type { ANFProgram, ANFBinding, ANFMethod, ANFValue, StackOp } from '../ir/index.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -581,5 +582,244 @@ describe('Optimizer: Dead Binding Elimination', () => {
     ]);
     const cleaned = eliminateDeadBindings(program);
     expect(cleaned.methods[0]!.body).toHaveLength(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Peephole Optimizer (Stack IR)
+// ---------------------------------------------------------------------------
+
+describe('Optimizer: Peephole (Stack IR)', () => {
+  describe('DUP/DROP elimination', () => {
+    it('removes dup followed by drop (StackOp form)', () => {
+      const ops: StackOp[] = [
+        { op: 'dup' },
+        { op: 'drop' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([]);
+    });
+
+    it('removes OP_DUP followed by OP_DROP (opcode form)', () => {
+      const ops: StackOp[] = [
+        { op: 'opcode', code: 'OP_DUP' },
+        { op: 'opcode', code: 'OP_DROP' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('double negation elimination', () => {
+    it('removes OP_NOT OP_NOT', () => {
+      const ops: StackOp[] = [
+        { op: 'push', value: 1n },
+        { op: 'opcode', code: 'OP_NOT' },
+        { op: 'opcode', code: 'OP_NOT' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'push', value: 1n }]);
+    });
+
+    it('removes OP_NEGATE OP_NEGATE', () => {
+      const ops: StackOp[] = [
+        { op: 'push', value: 42n },
+        { op: 'opcode', code: 'OP_NEGATE' },
+        { op: 'opcode', code: 'OP_NEGATE' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'push', value: 42n }]);
+    });
+  });
+
+  describe('swap elimination', () => {
+    it('removes SWAP SWAP', () => {
+      const ops: StackOp[] = [
+        { op: 'push', value: 1n },
+        { op: 'swap' },
+        { op: 'swap' },
+        { op: 'push', value: 2n },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([
+        { op: 'push', value: 1n },
+        { op: 'push', value: 2n },
+      ]);
+    });
+  });
+
+  describe('verify fusion', () => {
+    it('fuses OP_EQUAL + OP_VERIFY into OP_EQUALVERIFY', () => {
+      const ops: StackOp[] = [
+        { op: 'opcode', code: 'OP_EQUAL' },
+        { op: 'opcode', code: 'OP_VERIFY' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'opcode', code: 'OP_EQUALVERIFY' }]);
+    });
+
+    it('fuses OP_CHECKSIG + OP_VERIFY into OP_CHECKSIGVERIFY', () => {
+      const ops: StackOp[] = [
+        { op: 'opcode', code: 'OP_CHECKSIG' },
+        { op: 'opcode', code: 'OP_VERIFY' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'opcode', code: 'OP_CHECKSIGVERIFY' }]);
+    });
+
+    it('fuses OP_NUMEQUAL + OP_VERIFY into OP_NUMEQUALVERIFY', () => {
+      const ops: StackOp[] = [
+        { op: 'opcode', code: 'OP_NUMEQUAL' },
+        { op: 'opcode', code: 'OP_VERIFY' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'opcode', code: 'OP_NUMEQUALVERIFY' }]);
+    });
+
+    it('fuses OP_CHECKMULTISIG + OP_VERIFY into OP_CHECKMULTISIGVERIFY', () => {
+      const ops: StackOp[] = [
+        { op: 'opcode', code: 'OP_CHECKMULTISIG' },
+        { op: 'opcode', code: 'OP_VERIFY' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'opcode', code: 'OP_CHECKMULTISIGVERIFY' }]);
+    });
+  });
+
+  describe('arithmetic identity elimination', () => {
+    it('removes PUSH 0 + OP_ADD (identity: x + 0 = x)', () => {
+      const ops: StackOp[] = [
+        { op: 'push', value: 42n },
+        { op: 'push', value: 0n },
+        { op: 'opcode', code: 'OP_ADD' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'push', value: 42n }]);
+    });
+
+    it('removes PUSH 0 + OP_SUB (identity: x - 0 = x)', () => {
+      const ops: StackOp[] = [
+        { op: 'push', value: 42n },
+        { op: 'push', value: 0n },
+        { op: 'opcode', code: 'OP_SUB' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'push', value: 42n }]);
+    });
+
+    it('replaces PUSH 1 + OP_ADD with OP_1ADD', () => {
+      const ops: StackOp[] = [
+        { op: 'push', value: 1n },
+        { op: 'opcode', code: 'OP_ADD' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'opcode', code: 'OP_1ADD' }]);
+    });
+
+    it('replaces PUSH 1 + OP_SUB with OP_1SUB', () => {
+      const ops: StackOp[] = [
+        { op: 'push', value: 1n },
+        { op: 'opcode', code: 'OP_SUB' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'opcode', code: 'OP_1SUB' }]);
+    });
+  });
+
+  describe('dead value elimination', () => {
+    it('removes PUSH x followed by DROP', () => {
+      const ops: StackOp[] = [
+        { op: 'push', value: 99n },
+        { op: 'drop' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('stack fusion', () => {
+    it('fuses OVER OVER into OP_2DUP', () => {
+      const ops: StackOp[] = [
+        { op: 'over' },
+        { op: 'over' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'opcode', code: 'OP_2DUP' }]);
+    });
+
+    it('fuses DROP DROP into OP_2DROP', () => {
+      const ops: StackOp[] = [
+        { op: 'drop' },
+        { op: 'drop' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'opcode', code: 'OP_2DROP' }]);
+    });
+  });
+
+  describe('recursive if-block optimization', () => {
+    it('optimizes ops inside if-then blocks', () => {
+      const ops: StackOp[] = [
+        {
+          op: 'if',
+          then: [
+            { op: 'opcode', code: 'OP_NOT' },
+            { op: 'opcode', code: 'OP_NOT' },
+          ],
+        },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'if', then: [] }]);
+    });
+
+    it('optimizes ops inside if-else blocks', () => {
+      const ops: StackOp[] = [
+        {
+          op: 'if',
+          then: [{ op: 'push', value: 1n }],
+          else: [
+            { op: 'swap' },
+            { op: 'swap' },
+          ],
+        },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([
+        {
+          op: 'if',
+          then: [{ op: 'push', value: 1n }],
+          else: [],
+        },
+      ]);
+    });
+  });
+
+  describe('iterative fixed-point', () => {
+    it('cascading elimination across multiple passes', () => {
+      // PUSH 99, DROP removes to nothing
+      // Then DUP, DROP that were adjacent to a removed pair may cascade
+      const ops: StackOp[] = [
+        { op: 'dup' },
+        { op: 'push', value: 99n },
+        { op: 'drop' },
+        { op: 'drop' },
+      ];
+      const result = optimizeStackIR(ops);
+      // First pass: PUSH 99 + DROP -> removed, leaving DUP, DROP
+      // Second pass: DUP + DROP -> removed
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('non-matchable ops pass through', () => {
+    it('leaves unrelated ops unchanged', () => {
+      const ops: StackOp[] = [
+        { op: 'push', value: 10n },
+        { op: 'push', value: 20n },
+        { op: 'opcode', code: 'OP_ADD' },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual(ops);
+    });
   });
 });

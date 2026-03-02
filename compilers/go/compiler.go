@@ -100,10 +100,10 @@ func CompileFromProgram(program *ir.ANFProgram) (*Artifact, error) {
 		return nil, fmt.Errorf("stack lowering: %w", err)
 	}
 
-	// Peephole optimization — disabled to match TS reference stack-lower output.
-	// for i := range stackMethods {
-	// 	stackMethods[i].Ops = codegen.OptimizeStackOps(stackMethods[i].Ops)
-	// }
+	// Peephole optimization — runs on Stack IR before emission.
+	for i := range stackMethods {
+		stackMethods[i].Ops = codegen.OptimizeStackOps(stackMethods[i].Ops)
+	}
 
 	// Pass 6: Emit
 	emitResult, err := codegen.Emit(stackMethods)
