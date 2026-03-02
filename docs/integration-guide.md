@@ -1,349 +1,365 @@
 # Integration Guide
 
-This guide covers the full Rúnar development pipeline: writing contracts, testing them, compiling to artifacts, and loading those artifacts for deployment and interaction from TypeScript, Go, or Rust.
+This guide walks through the full lifecycle of Rúnar smart contracts: writing, testing locally, compiling, deploying on-chain, and interacting with deployed contracts. It focuses on stateful contracts since they're the most interesting and the least obvious.
 
 ---
 
-## Pipeline Overview
+## Local Development (No Blockchain Needed)
 
-```
- Source Code                     Artifact (JSON)                   On-Chain
- (.runar.ts / .runar.sol /        ┌──────────────────┐              ┌──────────────┐
-  .runar.move / .runar.go /  ──►  │ version          │  ──►  deploy │ Locking UTXO │
-  .runar.rs)                     │ abi              │              │ (Bitcoin SV)  │
-                                │ script (hex)     │  ◄──  call  └──────────────┘
-       │                        │ asm              │
-       │  test                  │ stateFields      │
-       ▼                        └──────────────────┘
- vitest / go test /                  ▲
- cargo test                          │
-                               runar compile
-                               compile() (TS)
-                               CompileFromSource() (Go)
-                               compile_from_source() (Rust)
-```
+Most development happens locally with `TestContract`, which compiles a contract and runs methods through the reference interpreter. No blockchain connection, no real keys, no fees.
 
-The artifact JSON is the intermediary form that bridges compilation and deployment. It contains everything needed to construct locking scripts, build unlocking scripts, and interact with a deployed contract.
+### Stateless Contract
 
----
-
-## Developing Contracts
-
-Rúnar contracts are classes that extend `SmartContract` (stateless) or `StatefulSmartContract` (stateful). You can write them in any of five syntax formats -- all compile to the same AST and produce identical Bitcoin Script.
-
-| Extension | Syntax Style | Parser |
-|-----------|-------------|--------|
-| `.runar.ts` | TypeScript (stable) | ts-morph |
-| `.runar.sol` | Solidity-like | Hand-written recursive descent |
-| `.runar.move` | Move-style | Hand-written recursive descent |
-| `.runar.go` | Go | `go/parser` stdlib |
-| `.runar.rs` | Rust macro DSL | Custom token parser |
-
-A minimal stateless contract in TypeScript:
+A stateless contract (like P2PKH) has only `readonly` properties. Spending is a single transaction that consumes the UTXO.
 
 ```typescript
-import { SmartContract, assert, PubKey, Sig, Addr, hash160, checkSig } from 'runar-lang';
-
-class P2PKH extends SmartContract {
-  readonly pubKeyHash: Addr;
-
-  constructor(pubKeyHash: Addr) {
-    super(pubKeyHash);
-    this.pubKeyHash = pubKeyHash;
-  }
-
-  public unlock(sig: Sig, pubKey: PubKey) {
-    assert(hash160(pubKey) === this.pubKeyHash);
-    assert(checkSig(sig, pubKey));
-  }
-}
-```
-
-See the [Getting Started](./getting-started.md) guide for a detailed walkthrough and the [Language Reference](./language-reference.md) for the complete set of types, operators, and built-in functions.
-
----
-
-## Testing Contracts
-
-Rúnar supports testing at multiple levels. The summary below covers the most common patterns; see the [Testing Guide](./testing-guide.md) for advanced techniques including property-based fuzzing, differential testing, and cross-compiler conformance.
-
-### TypeScript (vitest)
-
-`TestContract.fromSource()` compiles a contract and runs methods through the reference interpreter with mocked crypto (`checkSig` always returns true, hash functions compute real values).
-
-```typescript
-import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { TestContract } from 'runar-testing';
 
-describe('Counter', () => {
-  const source = readFileSync('Counter.runar.ts', 'utf8');
-  const counter = TestContract.fromSource(source, { count: 0n });
+// Load the contract source
+const source = readFileSync('P2PKH.runar.ts', 'utf8');
 
-  it('increments', () => {
-    counter.call('increment');
-    expect(counter.state.count).toBe(1n);
-  });
+// Create with constructor args (property values baked into the locking script)
+const contract = TestContract.fromSource(source, {
+  pubKeyHash: 'ab'.repeat(20),  // hex-encoded 20-byte address
 });
+
+// Call the unlock method — checkSig is mocked to return true
+const result = contract.call('unlock', {
+  sig: '30' + 'ff'.repeat(35),
+  pubKey: '02' + 'ab'.repeat(32),
+});
+
+console.log(result.success);  // true or false
+console.log(result.error);    // error message if false
 ```
 
-For multi-format sources, pass the filename so the parser can dispatch by extension:
+### Stateful Contract (Counter)
+
+A stateful contract has mutable properties. The state persists across transactions — each `call()` mutates the contract's state, and you can inspect it after each call.
 
 ```typescript
-const solCounter = TestContract.fromSource(solSource, { count: 0n }, 'Counter.runar.sol');
+const source = readFileSync('Counter.runar.ts', 'utf8');
+
+// Deploy with initial state: count = 0
+const counter = TestContract.fromSource(source, { count: 0n });
+console.log(counter.state.count);  // 0n
+
+// Call increment — state updates in place
+counter.call('increment');
+console.log(counter.state.count);  // 1n
+
+counter.call('increment');
+counter.call('increment');
+console.log(counter.state.count);  // 3n
+
+// Call decrement
+counter.call('decrement');
+console.log(counter.state.count);  // 2n
+
+// Decrement at zero fails
+const zeroCounter = TestContract.fromSource(source, { count: 0n });
+const result = zeroCounter.call('decrement');
+console.log(result.success);  // false — assert(this.count > 0n) failed
 ```
 
-### Go (go test)
+This is the primary development loop: write contract, run `TestContract`, inspect state, iterate.
 
-Go contracts run as native Go code using the `runar` mock package. Add a `CompileCheck` test to verify the contract is valid Rúnar.
+### Multi-Output Contract (Fungible Token)
 
-```go
-func TestCounter_Increment(t *testing.T) {
-    c := &Counter{Count: 0}
-    c.Increment()
-    if c.Count != 1 {
-        t.Errorf("expected 1, got %d", c.Count)
-    }
-}
-
-func TestCounter_Compile(t *testing.T) {
-    if err := runar.CompileCheck("Counter.runar.go"); err != nil {
-        t.Fatalf("Rúnar compile check failed: %v", err)
-    }
-}
-```
-
-Run with `go test ./...` from the contract directory.
-
-### Rust (cargo test)
-
-Rust contracts run as native Rust code using the `runar::prelude` mock types. Use `#[should_panic]` for expected failures.
-
-```rust
-#[path = "Counter.runar.rs"]
-mod contract;
-use contract::*;
-use runar::prelude::*;
-
-#[test]
-fn test_increment() {
-    let mut c = Counter { count: 0 };
-    c.increment();
-    assert_eq!(c.count, 1);
-}
-
-#[test]
-fn test_compile() {
-    runar::compile_check(
-        include_str!("Counter.runar.rs"),
-        "Counter.runar.rs",
-    ).unwrap();
-}
-```
-
-Run with `cargo test` from the examples/rust directory.
-
-### Script VM Testing
-
-For full script execution testing (compiled Bitcoin Script, not interpreter), use `TestSmartContract.fromArtifact()`:
+Contracts that call `this.addOutput()` create multiple transaction outputs. This is how tokens split and merge.
 
 ```typescript
-import { TestSmartContract, expectScriptSuccess } from 'runar-testing';
-import artifact from './artifacts/P2PKH.json';
+const source = readFileSync('FungibleTokenExample.runar.ts', 'utf8');
 
-const contract = TestSmartContract.fromArtifact(artifact, [pubKeyHash]);
-const result = contract.call('unlock', [sig, pubKey]);
-expectScriptSuccess(result);
+const token = TestContract.fromSource(source, {
+  owner: '02' + 'aa'.repeat(32),   // Alice
+  balance: 100n,
+  tokenId: 'deadbeef',
+});
+
+// Transfer 30 tokens from Alice to Bob — creates 2 outputs
+const result = token.call('transfer', {
+  sig: '30' + 'ff'.repeat(35),
+  to: '02' + 'bb'.repeat(32),       // Bob
+  amount: 30n,
+  outputSatoshis: 1000n,
+});
+
+console.log(result.success);          // true
+console.log(result.outputs.length);   // 2
+
+// Output 0: Bob gets 30 tokens
+console.log(result.outputs[0].owner);    // Bob's pubkey
+console.log(result.outputs[0].balance);  // 30n
+console.log(result.outputs[0].satoshis); // 1000n
+
+// Output 1: Alice keeps 70 tokens (change)
+console.log(result.outputs[1].owner);    // Alice's pubkey
+console.log(result.outputs[1].balance);  // 70n
 ```
 
-See the [Testing Guide](./testing-guide.md) for the full API.
+Each output becomes a separate UTXO on-chain, each carrying its own copy of the contract code with updated state values.
+
+### How `addOutput` Works
+
+In the contract source:
+
+```typescript
+class FungibleToken extends StatefulSmartContract {
+  owner: PubKey;           // mutable state field (index 0)
+  balance: bigint;         // mutable state field (index 1)
+  readonly tokenId: ByteString;
+
+  public transfer(sig: Sig, to: PubKey, amount: bigint, outputSatoshis: bigint) {
+    assert(checkSig(sig, this.owner));
+    assert(amount > 0n && amount <= this.balance);
+
+    // addOutput(satoshis, <state fields in declaration order>)
+    this.addOutput(outputSatoshis, to, amount);                      // recipient
+    this.addOutput(outputSatoshis, this.owner, this.balance - amount); // change
+  }
+}
+```
+
+The arguments after `satoshis` correspond to the mutable properties in declaration order (`owner`, `balance`). The compiler verifies this at typecheck time.
 
 ---
 
 ## Compiling to Artifacts
 
-The artifact is a JSON file containing the compiled locking script, the contract ABI, and metadata. This is the form you should load when deploying or interacting with a contract.
-
 ### CLI
 
 ```bash
-runar compile Counter.runar.ts                   # Outputs artifacts/Counter.json
+runar compile Counter.runar.ts                   # => artifacts/Counter.json
 runar compile Counter.runar.ts --output ./build  # Custom output directory
 runar compile Counter.runar.ts --ir              # Include ANF IR in artifact
-runar compile Counter.runar.ts --asm             # Print assembly to stdout
 ```
 
-### Programmatic (TypeScript)
+### Programmatic
 
 ```typescript
 import { compile } from 'runar-compiler';
-import type { CompileResult, RunarArtifact } from 'runar-compiler';
 
 const source = readFileSync('Counter.runar.ts', 'utf8');
-const result: CompileResult = compile(source, { fileName: 'Counter.runar.ts' });
+const result = compile(source, { fileName: 'Counter.runar.ts' });
 
 if (!result.success) {
-  const errors = result.diagnostics
-    .filter(d => d.severity === 'error')
-    .map(d => d.message);
-  throw new Error(`Compilation failed: ${errors.join(', ')}`);
+  throw new Error(result.diagnostics.filter(d => d.severity === 'error').map(d => d.message).join('\n'));
 }
 
-const artifact: RunarArtifact = result.artifact!;
-// Write to disk, load in SDK, etc.
+const artifact = result.artifact!;
+console.log(artifact.contractName);   // "Counter"
+console.log(artifact.script);         // hex-encoded Bitcoin Script
+console.log(artifact.stateFields);    // [{ name: "count", type: "bigint", index: 0 }]
 ```
 
-### Programmatic (Go)
-
-The Go compiler exposes the same pipeline as a library:
-
-```go
-import main // or your import path for the Go compiler package
-
-// From source file
-artifact, err := CompileFromSource("Counter.runar.go")
-
-// From ANF IR JSON (generated by any compiler)
-artifact, err := CompileFromIR("Counter-anf.json")
-
-// From raw IR bytes
-artifact, err := CompileFromIRBytes(irJSON)
-
-// Serialize to JSON
-jsonBytes, err := ArtifactToJSON(artifact)
-```
-
-### Programmatic (Rust)
-
-The Rust compiler provides equivalent functions:
-
-```rust
-use runar_compiler_rust::{compile_from_source, compile_from_ir, compile_from_source_str};
-use std::path::Path;
-
-// From source file
-let artifact = compile_from_source(Path::new("Counter.runar.rs"))?;
-
-// From source string
-let artifact = compile_from_source_str(&source, Some("Counter.runar.rs"))?;
-
-// From ANF IR JSON file
-let artifact = compile_from_ir(Path::new("Counter-anf.json"))?;
-
-// From ANF IR string
-let artifact = compile_from_ir_str(&ir_json)?;
-
-// Serialize with serde
-let json = serde_json::to_string_pretty(&artifact).unwrap();
-```
-
-### Artifact Schema
-
-All three compilers produce artifacts with the same JSON schema:
+### Artifact Structure
 
 ```json
 {
   "version": "runar-v0.1.0",
-  "compilerVersion": "0.1.0",
   "contractName": "Counter",
   "abi": {
-    "constructor": {
-      "params": [
-        { "name": "count", "type": "bigint" }
-      ]
-    },
+    "constructor": { "params": [{ "name": "count", "type": "bigint" }] },
     "methods": [
-      { "name": "increment", "params": [...], "isPublic": true },
-      { "name": "decrement", "params": [...], "isPublic": true }
+      { "name": "increment", "params": [], "isPublic": true },
+      { "name": "decrement", "params": [], "isPublic": true }
     ]
   },
   "script": "5179...",
   "asm": "OP_1 OP_PICK ...",
   "stateFields": [
     { "name": "count", "type": "bigint", "index": 0 }
-  ],
-  "buildTimestamp": "2026-03-02T12:00:00Z"
+  ]
 }
 ```
 
-Key fields:
-
-| Field | Description |
-|-------|-------------|
-| `script` | Hex-encoded Bitcoin Script locking script |
-| `asm` | Human-readable opcode assembly |
-| `abi` | Constructor parameters and public method signatures |
-| `stateFields` | Mutable state fields (present only for `StatefulSmartContract`) |
-| `ir` | Optional ANF/Stack IR snapshots (when compiled with `--ir`) |
+The `stateFields` array is present only for `StatefulSmartContract`. It tells the SDK which fields are mutable and their serialization order.
 
 ---
 
-## Loading Artifacts in TypeScript
+## On-Chain Lifecycle: Stateful Counter
 
-The `runar-sdk` package provides `RunarContract` for deploying and interacting with compiled contracts.
+This is the complete lifecycle of a stateful contract from deployment through multiple state transitions.
 
-### Setup
+### Step 1: Compile
 
-```bash
-pnpm add runar-sdk runar-compiler runar-lang
+```typescript
+import { compile } from 'runar-compiler';
+import { RunarContract, LocalSigner, WhatsOnChainProvider } from 'runar-sdk';
+
+const source = readFileSync('Counter.runar.ts', 'utf8');
+const { artifact } = compile(source, { fileName: 'Counter.runar.ts' });
 ```
 
-### Deploy and Call
+### Step 2: Deploy (count = 0)
+
+```typescript
+const provider = new WhatsOnChainProvider('mainnet');
+const signer = new LocalSigner(privateKey);
+
+// Instantiate with initial state
+const counter = new RunarContract(artifact, [0n]);
+
+// Deploy: creates a UTXO with the locking script + state
+const { txid } = await counter.deploy(provider, signer, { satoshis: 10_000 });
+console.log('Deployed:', txid);
+// The UTXO now contains: <compiled code> OP_RETURN <count=0>
+```
+
+### Step 3: Call increment (count → 1)
+
+```typescript
+const { txid: tx2 } = await counter.call('increment', [], provider, signer);
+console.log('Incremented:', tx2);
+console.log('State:', counter.state);  // { count: 1n }
+// The old UTXO is spent. A new UTXO is created with: <code> OP_RETURN <count=1>
+```
+
+### Step 4: Call increment again (count → 2)
+
+```typescript
+const { txid: tx3 } = await counter.call('increment', [], provider, signer);
+console.log('State:', counter.state);  // { count: 2n }
+```
+
+### Step 5: Reconnect to an existing contract
+
+```typescript
+// On a different machine, reconnect to the deployed contract
+const existing = await RunarContract.fromTxId(artifact, tx3, 0, provider);
+console.log('Reconnected state:', existing.state);  // { count: 2n }
+```
+
+### What Happens On-Chain
+
+Each state transition is a Bitcoin transaction:
+
+```
+TX1 (deploy):
+  Input:  funding UTXO
+  Output: Counter locking script with count=0, 10000 sats
+
+TX2 (increment):
+  Input:  TX1 output 0 (unlocking script proves method call)
+  Output: Counter locking script with count=1, 10000 sats
+
+TX3 (increment):
+  Input:  TX2 output 0
+  Output: Counter locking script with count=2, 10000 sats
+```
+
+The contract code is identical in every output. Only the state suffix changes. The OP_PUSH_TX pattern (automatic preimage verification) ensures that the spending transaction actually contains the correct updated state.
+
+---
+
+## On-Chain Lifecycle: Token Split
+
+Multi-output contracts create multiple UTXOs per transaction, enabling token splitting and merging.
+
+### Deploy with 100 tokens
+
+```typescript
+const tokenArtifact = compile(tokenSource, { fileName: 'FungibleToken.runar.ts' }).artifact!;
+const token = new RunarContract(tokenArtifact, [alicePubKey, 100n, tokenIdHex]);
+const { txid } = await token.deploy(provider, signer, { satoshis: 10_000 });
+```
+
+### Transfer 30 tokens to Bob (split)
+
+```typescript
+const { txid: splitTx } = await token.call(
+  'transfer',
+  [aliceSig, bobPubKey, 30n, 5000n],
+  provider,
+  signer,
+);
+```
+
+This creates a single transaction with **two outputs**:
+
+```
+TX (transfer):
+  Input:  deploy UTXO (Alice owns 100 tokens)
+  Output 0: FungibleToken { owner: Bob,   balance: 30 }, 5000 sats
+  Output 1: FungibleToken { owner: Alice, balance: 70 }, 5000 sats
+```
+
+Each output is an independent UTXO that can be spent separately. Bob can now transfer his 30 tokens, and Alice can transfer her 70.
+
+---
+
+## State Management
+
+### Serialization
+
+The SDK serializes state values into the locking script suffix:
+
+```typescript
+import { serializeState, deserializeState, extractStateFromScript } from 'runar-sdk';
+
+// Serialize state to hex (for embedding in custom transactions)
+const stateHex = serializeState(artifact.stateFields!, { count: 42n });
+
+// Deserialize from a data section
+const state = deserializeState(artifact.stateFields!, stateHex);
+console.log(state.count);  // 42n
+
+// Extract state directly from a full locking script
+const state = extractStateFromScript(artifact, scriptHex);
+```
+
+### State Encoding
+
+State fields are encoded as Bitcoin Script push data in the order specified by `stateFields[].index`:
+
+| Type | Encoding |
+|------|----------|
+| `bigint` | 8-byte OP_NUM2BIN (little-endian, sign-magnitude) |
+| `boolean` | 1-byte OP_NUM2BIN |
+| `ByteString` | Raw push data |
+| `PubKey` | 33-byte push data (compressed) |
+
+---
+
+## Script VM Testing (Advanced)
+
+For testing that the compiled Bitcoin Script actually executes correctly (not just the interpreter), use `ScriptExecutionContract`:
+
+```typescript
+import { ScriptExecutionContract } from 'runar-testing';
+
+const compiled = ScriptExecutionContract.fromSource(source, { count: 0n });
+const result = compiled.execute('increment', []);
+console.log(result.success);  // true
+```
+
+This compiles the contract with baked constructor args, then executes the locking + unlocking scripts through the BSV SDK's production script interpreter. Use this for validation that the compiled Bitcoin Script matches the interpreter.
+
+---
+
+## Production Integration: TypeScript (@bsv/sdk)
+
+For production deployments with full control over transaction construction, use `@bsv/sdk` directly with the compiled locking script.
+
+### Deploy a Contract
 
 ```typescript
 import { readFileSync } from 'node:fs';
-import { compile } from 'runar-compiler';
-import { RunarContract, LocalSigner } from 'runar-sdk';
-import type { RunarArtifact } from 'runar-ir-schema';
-
-// 1. Compile (or load a pre-compiled artifact JSON)
-const source = readFileSync('P2PKH.runar.ts', 'utf8');
-const result = compile(source, { fileName: 'P2PKH.runar.ts' });
-const artifact: RunarArtifact = result.artifact!;
-
-// Or load from a saved artifact file:
-// const artifact = JSON.parse(readFileSync('artifacts/P2PKH.json', 'utf8'));
-
-// 2. Instantiate with constructor arguments
-const contract = new RunarContract(artifact, [pubKeyHash]);
-
-// 3. Get the locking script (hex)
-const lockingScript = contract.getLockingScript();
-
-// 4. Deploy to blockchain
-const { txid } = await contract.deploy(provider, signer, { satoshis: 10_000 });
-
-// 5. Call a method (spend the UTXO)
-const result = await contract.call('unlock', [sig, pubKey], provider, signer);
-
-// 6. Reconnect to an existing deployed contract
-const existing = await RunarContract.fromTxId(artifact, txid, 0, provider);
-console.log(existing.state); // Extract state from the locking script
-```
-
-### State Management (Stateful Contracts)
-
-```typescript
-import { serializeState, deserializeState } from 'runar-sdk';
-
-// Serialize state to hex (for embedding in locking scripts)
-const stateHex = serializeState(artifact.stateFields!, { count: 42n });
-
-// Deserialize state from a locking script
-const state = deserializeState(artifact.stateFields!, stateHex);
-```
-
-### Production Integration with @bsv/sdk
-
-For production deployments, use `@bsv/sdk` directly with the artifact's locking script:
-
-```typescript
 import { PrivateKey, Transaction, P2PKH, ARC, LockingScript } from '@bsv/sdk';
+import { RunarContract } from 'runar-sdk';
 
-// Load the compiled locking script into @bsv/sdk
+// Load compiled artifact
+const artifact = JSON.parse(readFileSync('artifacts/Counter.json', 'utf8'));
+const contract = new RunarContract(artifact, [0n]); // count = 0
+
+// The locking script is the contract bytecode + embedded constructor args
+// For stateful contracts, it also includes the OP_RETURN-delimited state suffix
 const lockingScript = LockingScript.fromHex(contract.getLockingScript());
 
-// Build a deployment transaction
+// Build deployment transaction
+const privKey = PrivateKey.fromWIF('...');
 const deployTx = new Transaction();
 deployTx.addInput({
   sourceTransaction: fundingTx,
@@ -351,186 +367,315 @@ deployTx.addInput({
   unlockingScriptTemplate: new P2PKH().unlock(privKey),
 });
 deployTx.addOutput({ lockingScript, satoshis: 10_000 });
-deployTx.addOutput({ lockingScript: new P2PKH().lock(privKey.toAddress()), change: true });
+deployTx.addOutput({
+  lockingScript: new P2PKH().lock(privKey.toAddress()),
+  change: true,
+});
 await deployTx.fee();
 await deployTx.sign();
 
 // Broadcast via ARC
 const broadcaster = new ARC('https://arc.taal.com');
-const result = await deployTx.broadcast(broadcaster);
+const { txid } = await deployTx.broadcast(broadcaster);
+```
 
-// Spend the contract
+### Call a Stateless Method (Spend)
+
+For stateless contracts (P2PKH, Escrow), spending consumes the UTXO with no continuation:
+
+```typescript
+import { UnlockingScript } from '@bsv/sdk';
+
+// Build the unlocking script: method arguments + method selector
+const unlockHex = contract.buildUnlockingScript('unlock', [sigHex, pubKeyHex]);
+
 const spendTx = new Transaction();
 spendTx.addInput({
   sourceTransaction: deployTx,
   sourceOutputIndex: 0,
-  unlockingScript: UnlockingScript.fromHex(
-    contract.buildUnlockingScript('unlock', [sigHex, pubKeyHex])
-  ),
+  unlockingScript: UnlockingScript.fromHex(unlockHex),
 });
+// Add outputs (payment, change, etc.)
+spendTx.addOutput({ ... });
+await spendTx.fee();
+await spendTx.sign();
+await spendTx.broadcast(broadcaster);
+```
+
+### Call a Stateful Method (State Transition)
+
+Stateful contracts (Counter, FungibleToken) spend the current UTXO and create a new one with updated state. The OP_PUSH_TX pattern ensures the spending transaction contains the correct updated output.
+
+```typescript
+import { Hash, TransactionSignature } from '@bsv/sdk';
+
+// 1. Build the NEW locking script with updated state
+//    (same contract code, but state suffix changes)
+const newLockingScript = LockingScript.fromHex(
+  contract.getLockingScript() // reflects updated state after call()
+);
+
+// 2. Build transaction: old contract input → new contract output
+const callTx = new Transaction();
+callTx.addInput({
+  sourceTransaction: deployTx,
+  sourceOutputIndex: 0,
+  sequenceNumber: 0xffffffff,
+});
+// Output 0: new contract UTXO with updated state
+callTx.addOutput({ lockingScript: newLockingScript, satoshis: 10_000 });
+// Output 1: change
+callTx.addOutput({
+  lockingScript: new P2PKH().lock(privKey.toAddress()),
+  change: true,
+});
+await callTx.fee();
+
+// 3. Compute BIP-143 sighash preimage for OP_PUSH_TX
+const scope = TransactionSignature.SIGHASH_ALL | TransactionSignature.SIGHASH_FORKID;
+const preimageBytes = TransactionSignature.formatBytes({
+  sourceTXID: deployTx.id('hex'),
+  sourceOutputIndex: 0,
+  sourceSatoshis: 10_000,
+  transactionVersion: callTx.version,
+  otherInputs: [],
+  outputs: callTx.outputs,
+  inputIndex: 0,
+  subscript: oldLockingScript,
+  inputSequence: 0xffffffff,
+  lockTime: callTx.lockTime,
+  scope,
+});
+
+// 4. Sign the preimage (OP_PUSH_TX uses a well-known key)
+const singleHash = Hash.sha256(Array.from(preimageBytes));
+const sig = privKey.sign(singleHash);
+const txSig = new TransactionSignature(sig.r, sig.s, scope);
+const sigDer = txSig.toChecksigFormat();
+
+// 5. Build unlocking script: <sig> <preimage> [method args] [method index]
+const unlockHex = contract.buildUnlockingScript('increment', [
+  bytesToHex(new Uint8Array(sigDer)),
+  bytesToHex(new Uint8Array(preimageBytes)),
+]);
+callTx.inputs[0].unlockingScript = UnlockingScript.fromHex(unlockHex);
+
+await callTx.broadcast(broadcaster);
+```
+
+### Multi-Method Dispatch
+
+For contracts with multiple public methods, the unlocking script includes a method selector index:
+
+```typescript
+// Escrow has 4 methods: releaseBySeller(0), releaseByArbiter(1), refundToBuyer(2), refundByArbiter(3)
+const unlock = contract.buildUnlockingScript('releaseByArbiter', [sigHex]);
+// Internally appends OP_1 (method index 1) after the arguments
+```
+
+### Read State from an Existing UTXO
+
+```typescript
+import { extractStateFromScript } from 'runar-sdk';
+
+// Fetch the UTXO's locking script from the blockchain
+const utxo = await provider.getTransaction(txid);
+const scriptHex = utxo.outputs[0].script;
+
+// Extract the state fields
+const state = extractStateFromScript(artifact, scriptHex);
+console.log(state.count);  // 2n
 ```
 
 ---
 
-## Loading Artifacts in Go
+## Production Integration: Go (go-sdk)
 
-The Go compiler can both produce and consume artifacts. To load a pre-compiled artifact JSON file:
+The Go BSV SDK (`github.com/bsv-blockchain/go-sdk`) provides the same capabilities for transaction construction.
+
+### Deploy a Contract
 
 ```go
 package main
 
 import (
-    "encoding/json"
-    "os"
+    "encoding/hex"
+    "log"
+
+    "github.com/bsv-blockchain/go-sdk/primitives/ec"
+    "github.com/bsv-blockchain/go-sdk/script"
+    "github.com/bsv-blockchain/go-sdk/transaction"
+    "github.com/bsv-blockchain/go-sdk/transaction/sighash"
 )
 
-// Artifact mirrors the Rúnar artifact schema (same struct as in compiler.go)
-type Artifact struct {
-    Version         string       `json:"version"`
-    CompilerVersion string       `json:"compilerVersion"`
-    ContractName    string       `json:"contractName"`
-    ABI             ABI          `json:"abi"`
-    Script          string       `json:"script"`
-    ASM             string       `json:"asm"`
-    StateFields     []StateField `json:"stateFields,omitempty"`
-    BuildTimestamp  string       `json:"buildTimestamp"`
-}
+func main() {
+    // Load the compiled locking script hex from the artifact
+    lockingScriptHex := artifact.Script // from JSON artifact
 
-func LoadArtifact(path string) (*Artifact, error) {
-    data, err := os.ReadFile(path)
-    if err != nil {
-        return nil, err
-    }
-    var artifact Artifact
-    if err := json.Unmarshal(data, &artifact); err != nil {
-        return nil, err
-    }
-    return &artifact, nil
+    // Generate or load a keypair
+    privKey, _ := ec.NewPrivateKey()
+    pubKey := privKey.PubKey()
+    address, _ := script.NewAddressFromPublicKey(pubKey, true)
+
+    // Build deployment transaction
+    deployTx := transaction.NewTransaction()
+
+    // Add funding input (P2PKH UTXO you control)
+    _ = deployTx.AddInputFrom(
+        fundingTxID,   // hex txid of the funding UTXO
+        0,             // output index
+        fundingScript, // P2PKH locking script of the funding UTXO
+        100_000,       // satoshis in the funding UTXO
+        nil,           // unlocking script (will be signed below)
+    )
+
+    // Output 0: contract UTXO
+    lockScript, _ := script.NewFromHex(lockingScriptHex)
+    deployTx.AddOutput(&transaction.TransactionOutput{
+        Satoshis:      10_000,
+        LockingScript: lockScript,
+    })
+
+    // Output 1: change back to sender
+    changeScript, _ := script.NewP2PKHFromAddress(address)
+    deployTx.AddOutput(&transaction.TransactionOutput{
+        Satoshis:      89_000, // 100k - 10k - ~1k fee
+        LockingScript: changeScript,
+    })
+
+    // Sign the funding input
+    sigHash, _ := deployTx.CalcInputSignatureHash(0, sighash.AllForkID)
+    sig, _ := privKey.Sign(sigHash)
+    sigBytes := append(sig.Serialize(), byte(sighash.AllForkID))
+
+    unlockScript := &script.Script{}
+    _ = unlockScript.AppendPushData(sigBytes)
+    _ = unlockScript.AppendPushData(pubKey.Compressed())
+    deployTx.Inputs[0].UnlockingScript = unlockScript
+
+    // Broadcast (use your preferred provider)
+    rawTx := hex.EncodeToString(deployTx.Bytes())
+    log.Printf("Deploy txid: %s", deployTx.TxID())
 }
 ```
 
-To compile and produce an artifact directly from Go:
+### Call a Stateful Method
 
 ```go
-// Full pipeline: source file → artifact
-artifact, err := CompileFromSource("Counter.runar.go")
-if err != nil {
-    log.Fatal(err)
-}
+// Build the spending transaction
+spendTx := transaction.NewTransaction()
 
-// Or from ANF IR JSON (portable across compilers)
-artifact, err := CompileFromIR("Counter-anf.json")
+// Input: the contract UTXO
+spendTx.AddInputWithOutput(
+    &transaction.TransactionInput{
+        SourceTXID:       deployTxID,
+        SourceTxOutIndex: 0,
+        SequenceNumber:   0xffffffff,
+    },
+    &transaction.TransactionOutput{
+        Satoshis:      10_000,
+        LockingScript: lockScript, // the current locking script
+    },
+)
 
-// Access the compiled script
-fmt.Println("Script hex:", artifact.Script)
-fmt.Println("Contract:", artifact.ContractName)
-for _, m := range artifact.ABI.Methods {
-    if m.IsPublic {
-        fmt.Printf("  %s(%v)\n", m.Name, m.Params)
-    }
-}
+// Output 0: new contract UTXO with updated state
+newLockScript, _ := script.NewFromHex(newLockingScriptHex) // updated state
+spendTx.AddOutput(&transaction.TransactionOutput{
+    Satoshis:      10_000,
+    LockingScript: newLockScript,
+})
 
-// Serialize back to JSON
-jsonBytes, _ := ArtifactToJSON(artifact)
-os.WriteFile("Counter.json", jsonBytes, 0644)
+// Output 1: change
+spendTx.AddOutput(&transaction.TransactionOutput{
+    Satoshis:      changeAmount,
+    LockingScript: changeScript,
+})
+
+// OP_PUSH_TX: compute preimage and sign
+preimage, _ := spendTx.CalcInputPreimage(0, sighash.AllForkID)
+preimageHash := sha256d(preimage) // double SHA-256
+
+sig, _ := privKey.Sign(preimageHash)
+sigBytes := append(sig.Serialize(), byte(sighash.AllForkID))
+
+// Build unlocking script: <sig> <preimage> [method args] [method index]
+unlockScript := &script.Script{}
+_ = unlockScript.AppendPushData(sigBytes)
+_ = unlockScript.AppendPushData(preimage)
+// For method index (if multi-method): unlockScript.AppendPushDataByte(0x00)
+spendTx.Inputs[0].UnlockingScript = unlockScript
+
+rawTx := hex.EncodeToString(spendTx.Bytes())
+log.Printf("Call txid: %s", spendTx.TxID())
 ```
 
-The `artifact.Script` hex string is the locking script ready to be embedded in a Bitcoin SV transaction using your Go BSV library of choice.
+### Script Execution (Local Verification)
+
+Verify that a spending transaction is valid before broadcasting:
+
+```go
+import "github.com/bsv-blockchain/go-sdk/script/interpreter"
+
+eng := interpreter.NewEngine()
+err := eng.Execute(
+    interpreter.WithScripts(lockingScript, unlockingScript),
+    interpreter.WithAfterGenesis(),  // enable BSV Genesis opcodes
+    interpreter.WithForkID(),        // enable BIP-143 sighash
+)
+if err != nil {
+    log.Fatalf("Script execution failed: %v", err)
+}
+```
 
 ---
 
-## Loading Artifacts in Rust
+## Provider & Signer Interfaces
 
-The Rust compiler uses serde for JSON serialization. To load a pre-compiled artifact:
+The SDK abstracts blockchain access and key management:
 
-```rust
-use serde::{Deserialize, Serialize};
-use std::fs;
+### Provider
 
-// RunarArtifact mirrors the shared schema (same struct as in artifact.rs)
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RunarArtifact {
-    version: String,
-    compiler_version: String,
-    contract_name: String,
-    abi: ABI,
-    script: String,
-    asm: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state_fields: Option<Vec<StateField>>,
-    build_timestamp: String,
-}
-
-fn load_artifact(path: &str) -> Result<RunarArtifact, Box<dyn std::error::Error>> {
-    let data = fs::read_to_string(path)?;
-    let artifact: RunarArtifact = serde_json::from_str(&data)?;
-    Ok(artifact)
+```typescript
+interface Provider {
+  getTransaction(txid: string): Promise<Transaction>;
+  broadcast(rawTx: string): Promise<string>;  // returns txid
+  getUtxos(address: string): Promise<UTXO[]>;
+  getContractUtxo(scriptHash: string): Promise<UTXO | null>;
+  getNetwork(): 'mainnet' | 'testnet';
 }
 ```
 
-To compile and produce an artifact directly from Rust:
+Built-in implementations: `WhatsOnChainProvider` (production), `MockProvider` (testing).
 
-```rust
-use runar_compiler_rust::{compile_from_source, compile_from_source_str};
-use std::path::Path;
+### Signer
 
-// Full pipeline: source file → artifact
-let artifact = compile_from_source(Path::new("Counter.runar.rs"))
-    .expect("compilation failed");
-
-// Or from a source string
-let source = std::fs::read_to_string("Counter.runar.rs").unwrap();
-let artifact = compile_from_source_str(&source, Some("Counter.runar.rs"))
-    .expect("compilation failed");
-
-// Access the compiled script
-println!("Script hex: {}", artifact.script);
-println!("Contract: {}", artifact.contract_name);
-
-// Serialize back to JSON
-let json = serde_json::to_string_pretty(&artifact).unwrap();
-std::fs::write("Counter.json", json).unwrap();
+```typescript
+interface Signer {
+  getPublicKey(): Promise<string>;
+  getAddress(): Promise<string>;
+  sign(txHex: string, inputIndex: number, subscript: string, satoshis: number): Promise<string>;
+}
 ```
 
-The `artifact.script` hex string is the locking script for embedding in a Bitcoin SV transaction using your Rust BSV library of choice.
+Built-in implementations: `LocalSigner` (in-memory key, testing/CLI), `ExternalSigner` (hardware wallet callback).
 
 ---
 
 ## Cross-Compiler Workflow
 
-All three compilers produce byte-identical Bitcoin Script for the same contract source. This means you can:
+All three compilers (TypeScript, Go, Rust) produce byte-identical Bitcoin Script for the same contract. You can:
 
-1. **Write** a contract in any supported format (`.runar.ts`, `.runar.sol`, `.runar.go`, etc.)
-2. **Test** using the language-native test runner (vitest, go test, cargo test)
-3. **Compile** with any of the three compilers
-4. **Load** the artifact from any language
+1. **Write** in any format (`.runar.ts`, `.runar.go`, `.runar.rs`, `.runar.sol`, `.runar.move`)
+2. **Test** with the native test runner (`vitest`, `go test`, `cargo test`)
+3. **Compile** with any compiler
+4. **Deploy** the same artifact from any language
 
-The ANF IR (A-Normal Form Intermediate Representation) serves as the portable interchange format. You can generate ANF IR from one compiler and feed it to another:
+The ANF IR is the portable interchange format:
 
 ```bash
-# Generate ANF IR with the TypeScript compiler
-runar compile Counter.runar.ts --ir
-
-# Feed the ANF IR to the Go compiler backend
-runar-go --ir Counter-anf.json --output Counter.json
-
-# Or to the Rust compiler backend
-runar-rust --ir Counter-anf.json --output Counter.json
+runar compile Counter.runar.ts --ir          # generates Counter-anf.json
+runar-go --ir Counter-anf.json -o Counter.json
+runar-rust --ir Counter-anf.json -o Counter.json
 ```
 
-This produces identical `script` hex in all three cases. The cross-compiler conformance test suite (`conformance/`) validates this guarantee by comparing SHA-256 hashes of the output across all compilers.
-
----
-
-## Recommended Workflow
-
-1. **Development**: Write contracts in your preferred format with full IDE support. TypeScript (`.runar.ts`) has the most mature tooling.
-
-2. **Testing**: Run language-native tests for fast iteration on business logic. Add `CompileCheck` / `compile_check` tests to catch Rúnar language errors the host compiler would miss.
-
-3. **Compilation**: Use the CLI (`runar compile`) or the programmatic API to produce artifact JSON files. Commit artifacts to version control or store them as build outputs.
-
-4. **Deployment**: Load the artifact in your application using `RunarContract` (TypeScript), `json.Unmarshal` (Go), or `serde_json::from_str` (Rust). Use the `script` field as the locking script for transaction construction.
-
-5. **Interaction**: Use the ABI from the artifact to build unlocking scripts for spending. For stateful contracts, use `stateFields` to serialize/deserialize on-chain state.
+All three produce identical `script` hex. The conformance test suite validates this.
