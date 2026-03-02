@@ -57,6 +57,11 @@ export interface StateField {
   index: number;
 }
 
+export interface ConstructorSlot {
+  paramIndex: number;
+  byteOffset: number;
+}
+
 export interface RunarArtifact {
   /** Schema version, e.g. "runar-v0.1.0" */
   version: string;
@@ -88,6 +93,9 @@ export interface RunarArtifact {
   /** State field descriptors (present only for stateful contracts) */
   stateFields?: StateField[];
 
+  /** Byte offsets of constructor parameter placeholders in the script */
+  constructorSlots?: ConstructorSlot[];
+
   /** ISO-8601 build timestamp */
   buildTimestamp: string;
 }
@@ -105,6 +113,8 @@ export interface AssembleOptions {
   sourceMappings?: SourceMapping[];
   /** Override the compiler version string. */
   compilerVersion?: string;
+  /** Constructor parameter placeholder byte offsets from the emitter. */
+  constructorSlots?: ConstructorSlot[];
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +269,11 @@ export function assembleArtifact(
   // State fields (only if the contract has mutable state)
   if (stateFields.length > 0) {
     artifact.stateFields = stateFields;
+  }
+
+  // Constructor slots (only if there are placeholder byte offsets)
+  if (options?.constructorSlots && options.constructorSlots.length > 0) {
+    artifact.constructorSlots = options.constructorSlots;
   }
 
   return artifact;

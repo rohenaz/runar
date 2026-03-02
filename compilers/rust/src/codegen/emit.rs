@@ -4,8 +4,25 @@
 //! Script opcodes, producing both a hex-encoded script and a human-readable
 //! ASM representation.
 
+use serde::{Deserialize, Serialize};
+
 use super::opcodes::opcode_byte;
 use super::stack::{PushValue, StackMethod, StackOp};
+
+// ---------------------------------------------------------------------------
+// ConstructorSlot
+// ---------------------------------------------------------------------------
+
+/// Records the byte offset of a constructor parameter placeholder in the
+/// emitted script. The SDK uses these offsets to splice in real values at
+/// deployment time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstructorSlot {
+    #[serde(rename = "paramIndex")]
+    pub param_index: usize,
+    #[serde(rename = "byteOffset")]
+    pub byte_offset: usize,
+}
 
 // ---------------------------------------------------------------------------
 // EmitResult
@@ -16,6 +33,7 @@ use super::stack::{PushValue, StackMethod, StackOp};
 pub struct EmitResult {
     pub script_hex: String,
     pub script_asm: String,
+    pub constructor_slots: Vec<ConstructorSlot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -25,6 +43,8 @@ pub struct EmitResult {
 struct EmitContext {
     hex_parts: Vec<String>,
     asm_parts: Vec<String>,
+    byte_length: usize,
+    constructor_slots: Vec<ConstructorSlot>,
 }
 
 impl EmitContext {
@@ -32,21 +52,38 @@ impl EmitContext {
         EmitContext {
             hex_parts: Vec::new(),
             asm_parts: Vec::new(),
+            byte_length: 0,
+            constructor_slots: Vec::new(),
         }
+    }
+
+    fn append_hex(&mut self, hex: &str) {
+        self.byte_length += hex.len() / 2;
+        self.hex_parts.push(hex.to_string());
     }
 
     fn emit_opcode(&mut self, name: &str) -> Result<(), String> {
         let byte = opcode_byte(name)
             .ok_or_else(|| format!("unknown opcode: {}", name))?;
-        self.hex_parts.push(format!("{:02x}", byte));
+        self.append_hex(&format!("{:02x}", byte));
         self.asm_parts.push(name.to_string());
         Ok(())
     }
 
     fn emit_push(&mut self, value: &PushValue) {
         let (h, a) = encode_push_value(value);
-        self.hex_parts.push(h);
+        self.append_hex(&h);
         self.asm_parts.push(a);
+    }
+
+    fn emit_placeholder(&mut self, param_index: usize, _param_name: &str) {
+        let byte_offset = self.byte_length;
+        self.append_hex("00"); // OP_0 placeholder byte
+        self.asm_parts.push("OP_0".to_string());
+        self.constructor_slots.push(ConstructorSlot {
+            param_index,
+            byte_offset,
+        });
     }
 
     fn get_hex(&self) -> String {
@@ -197,6 +234,13 @@ fn emit_stack_op(op: &StackOp, ctx: &mut EmitContext) -> Result<(), String> {
             then_ops,
             else_ops,
         } => emit_if(then_ops, else_ops, ctx),
+        StackOp::Placeholder {
+            param_index,
+            param_name,
+        } => {
+            ctx.emit_placeholder(*param_index, param_name);
+            Ok(())
+        }
     }
 }
 
@@ -318,6 +362,7 @@ pub fn emit(methods: &[StackMethod]) -> Result<EmitResult, String> {
         return Ok(EmitResult {
             script_hex: String::new(),
             script_asm: String::new(),
+            constructor_slots: Vec::new(),
         });
     }
 
@@ -333,6 +378,7 @@ pub fn emit(methods: &[StackMethod]) -> Result<EmitResult, String> {
     Ok(EmitResult {
         script_hex: ctx.get_hex(),
         script_asm: ctx.get_asm(),
+        constructor_slots: ctx.constructor_slots,
     })
 }
 
@@ -379,5 +425,6 @@ pub fn emit_method(method: &StackMethod) -> Result<EmitResult, String> {
     Ok(EmitResult {
         script_hex: ctx.get_hex(),
         script_asm: ctx.get_asm(),
+        constructor_slots: ctx.constructor_slots,
     })
 }

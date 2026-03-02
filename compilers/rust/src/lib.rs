@@ -139,6 +139,11 @@ pub fn compile_from_program(program: &ir::ANFProgram) -> Result<RunarArtifact, S
     // Pass 6: Emit
     let emit_result = emit(&stack_methods)?;
 
-    let artifact = assemble_artifact(program, &emit_result.script_hex, &emit_result.script_asm);
+    let artifact = assemble_artifact(
+        program,
+        &emit_result.script_hex,
+        &emit_result.script_asm,
+        emit_result.constructor_slots,
+    );
     Ok(artifact)
 }

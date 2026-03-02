@@ -262,11 +262,22 @@ export class RunarContract {
   getLockingScript(): string {
     let script = this.artifact.script;
 
-    // Append constructor args as push data at the end of the script
-    // The compiled script expects constructor params on the stack at setup
-    // time, so they're embedded as data pushes.
-    for (const arg of this.constructorArgs) {
-      script += encodeArg(arg);
+    if (this.artifact.constructorSlots && this.artifact.constructorSlots.length > 0) {
+      // Sort by byteOffset descending so splicing doesn't shift later offsets
+      const slots = [...this.artifact.constructorSlots].sort(
+        (a, b) => b.byteOffset - a.byteOffset,
+      );
+      for (const slot of slots) {
+        const encoded = encodeArg(this.constructorArgs[slot.paramIndex]);
+        const hexOffset = slot.byteOffset * 2;
+        // Replace the 1-byte OP_0 placeholder (2 hex chars) with the encoded arg
+        script = script.slice(0, hexOffset) + encoded + script.slice(hexOffset + 2);
+      }
+    } else {
+      // Backward compatibility: old artifacts without constructorSlots
+      for (const arg of this.constructorArgs) {
+        script += encodeArg(arg);
+      }
     }
 
     // Append state section for stateful contracts

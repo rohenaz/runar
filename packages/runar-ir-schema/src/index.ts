@@ -82,6 +82,7 @@ export type {
   OverOp,
   RotOp,
   TuckOp,
+  PlaceholderOp,
   StackOp,
 } from './stack-ir.js';
 
@@ -94,6 +95,7 @@ export type {
   SourceMapping,
   SourceMap,
   StateField,
+  ConstructorSlot,
   RunarArtifact,
 } from './artifact.js';
 

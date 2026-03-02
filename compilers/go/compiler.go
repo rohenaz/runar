@@ -47,16 +47,20 @@ type StateField struct {
 	Index int    `json:"index"`
 }
 
+// ConstructorSlot records a constructor parameter placeholder in the compiled script.
+type ConstructorSlot = codegen.ConstructorSlot
+
 // Artifact is the final compiled output of a Rúnar compiler.
 type Artifact struct {
-	Version         string       `json:"version"`
-	CompilerVersion string       `json:"compilerVersion"`
-	ContractName    string       `json:"contractName"`
-	ABI             ABI          `json:"abi"`
-	Script          string       `json:"script"`
-	ASM             string       `json:"asm"`
-	StateFields     []StateField `json:"stateFields,omitempty"`
-	BuildTimestamp  string       `json:"buildTimestamp"`
+	Version          string            `json:"version"`
+	CompilerVersion  string            `json:"compilerVersion"`
+	ContractName     string            `json:"contractName"`
+	ABI              ABI               `json:"abi"`
+	Script           string            `json:"script"`
+	ASM              string            `json:"asm"`
+	StateFields      []StateField      `json:"stateFields,omitempty"`
+	ConstructorSlots []ConstructorSlot `json:"constructorSlots,omitempty"`
+	BuildTimestamp   string            `json:"buildTimestamp"`
 }
 
 const (
@@ -107,12 +111,12 @@ func CompileFromProgram(program *ir.ANFProgram) (*Artifact, error) {
 		return nil, fmt.Errorf("emit: %w", err)
 	}
 
-	artifact := assembleArtifact(program, emitResult.ScriptHex, emitResult.ScriptAsm)
+	artifact := assembleArtifact(program, emitResult.ScriptHex, emitResult.ScriptAsm, emitResult.ConstructorSlots)
 	return artifact, nil
 }
 
 // assembleArtifact builds the final output artifact from the compilation products.
-func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string) *Artifact {
+func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, constructorSlots []ConstructorSlot) *Artifact {
 	// Build ABI
 	constructorParams := make([]ABIParam, len(program.Properties))
 	for i, prop := range program.Properties {
@@ -154,10 +158,11 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string) *Arti
 			Constructor: ABIConstructor{Params: constructorParams},
 			Methods:     methods,
 		},
-		Script:         scriptHex,
-		ASM:            scriptAsm,
-		StateFields:    stateFields,
-		BuildTimestamp: time.Now().UTC().Format(time.RFC3339),
+		Script:           scriptHex,
+		ASM:              scriptAsm,
+		StateFields:      stateFields,
+		ConstructorSlots: constructorSlots,
+		BuildTimestamp:    time.Now().UTC().Format(time.RFC3339),
 	}
 }
 

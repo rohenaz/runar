@@ -24,12 +24,14 @@ const maxStackDepth = 800
 
 // StackOp represents a single stack-machine operation.
 type StackOp struct {
-	Op    string    // "push", "dup", "swap", "roll", "pick", "drop", "opcode", "if", "nip", "over", "rot", "tuck"
-	Value PushValue // for push ops
-	Depth int       // for roll/pick (informational)
-	Code  string    // for opcode ops (e.g. "OP_ADD")
-	Then  []StackOp // for if ops
-	Else  []StackOp // for if ops
+	Op         string    // "push", "dup", "swap", "roll", "pick", "drop", "opcode", "if", "nip", "over", "rot", "tuck", "placeholder"
+	Value      PushValue // for push ops
+	Depth      int       // for roll/pick (informational)
+	Code       string    // for opcode ops (e.g. "OP_ADD")
+	Then       []StackOp // for if ops
+	Else       []StackOp // for if ops
+	ParamIndex int       // for placeholder ops — index into constructor params
+	ParamName  string    // for placeholder ops — name of constructor param
 }
 
 // PushValue holds the typed value for a push operation.
@@ -474,7 +476,16 @@ func (ctx *loweringContext) lowerLoadProp(bindingName, propName string) {
 		ctx.bringToTop(propName, false)
 		ctx.sm.pop()
 	} else {
-		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(0)})
+		// Property value will be provided at deployment time; emit a placeholder.
+		// The emitter records byte offsets so the SDK can splice in real values.
+		paramIndex := 0
+		for i, p := range ctx.properties {
+			if p.Name == propName {
+				paramIndex = i
+				break
+			}
+		}
+		ctx.emitOp(StackOp{Op: "placeholder", ParamIndex: paramIndex, ParamName: propName})
 	}
 	ctx.sm.push(bindingName)
 }

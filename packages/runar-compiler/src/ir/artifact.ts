@@ -58,6 +58,15 @@ export interface StateField {
 }
 
 // ---------------------------------------------------------------------------
+// Constructor slots
+// ---------------------------------------------------------------------------
+
+export interface ConstructorSlot {
+  paramIndex: number;
+  byteOffset: number;
+}
+
+// ---------------------------------------------------------------------------
 // Top-level artifact
 // ---------------------------------------------------------------------------
 
@@ -91,6 +100,9 @@ export interface RunarArtifact {
 
   /** State field descriptors (present only for stateful contracts) */
   stateFields?: StateField[];
+
+  /** Byte offsets of constructor parameter placeholders in the script */
+  constructorSlots?: ConstructorSlot[];
 
   /** ISO-8601 build timestamp */
   buildTimestamp: string;

@@ -134,6 +134,11 @@ for (const [name, byte] of Object.entries(OPCODES)) {
 // Emit result
 // ---------------------------------------------------------------------------
 
+export interface ConstructorSlot {
+  paramIndex: number;
+  byteOffset: number;
+}
+
 export interface EmitResult {
   /** Hex-encoded Bitcoin Script */
   scriptHex: string;
@@ -141,6 +146,8 @@ export interface EmitResult {
   scriptAsm: string;
   /** Source mappings (opcode index → source location) */
   sourceMap: SourceMapping[];
+  /** Byte offsets of constructor parameter placeholders */
+  constructorSlots: ConstructorSlot[];
 }
 
 // ---------------------------------------------------------------------------
@@ -313,10 +320,13 @@ class EmitContext {
   private hexParts: string[] = [];
   private asmParts: string[] = [];
   private opcodeIndex = 0;
+  private byteLength = 0;
   readonly sourceMap: SourceMapping[] = [];
+  readonly constructorSlots: ConstructorSlot[] = [];
 
   appendHex(hex: string): void {
     this.hexParts.push(hex);
+    this.byteLength += hex.length / 2;
   }
 
   appendAsm(asm: string): void {
@@ -342,6 +352,14 @@ class EmitContext {
     this.appendHex(hex);
     this.appendAsm(asm);
     this.nextOpcodeIndex();
+  }
+
+  emitPlaceholder(paramIndex: number, _paramName: string): void {
+    const byteOffset = this.byteLength;
+    this.appendHex('00'); // OP_0 placeholder byte
+    this.appendAsm('OP_0');
+    this.nextOpcodeIndex();
+    this.constructorSlots.push({ paramIndex, byteOffset });
   }
 
   getHex(): string {
@@ -408,6 +426,10 @@ function emitStackOp(op: StackOp, ctx: EmitContext): void {
 
     case 'if':
       emitIf(op.then, op.else, ctx);
+      break;
+
+    case 'placeholder':
+      ctx.emitPlaceholder(op.paramIndex, op.paramName);
       break;
   }
 }
@@ -514,6 +536,7 @@ export function emit(program: StackProgram): EmitResult {
       scriptHex: '',
       scriptAsm: '',
       sourceMap: [],
+      constructorSlots: [],
     };
   }
 
@@ -539,6 +562,7 @@ export function emit(program: StackProgram): EmitResult {
     scriptHex: ctx.getHex(),
     scriptAsm: ctx.getAsm(),
     sourceMap: ctx.sourceMap,
+    constructorSlots: ctx.constructorSlots,
   };
 }
 
@@ -598,5 +622,6 @@ export function emitMethod(method: StackMethod): EmitResult {
     scriptHex: ctx.getHex(),
     scriptAsm: ctx.getAsm(),
     sourceMap: ctx.sourceMap,
+    constructorSlots: ctx.constructorSlots,
   };
 }

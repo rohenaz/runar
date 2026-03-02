@@ -44,6 +44,10 @@ pub enum StackOp {
         then_ops: Vec<StackOp>,
         else_ops: Vec<StackOp>,
     },
+    Placeholder {
+        param_index: usize,
+        param_name: String,
+    },
 }
 
 /// Typed value for push operations.
@@ -510,13 +514,32 @@ impl LoweringContext {
                 self.bring_to_top(prop_name, false);
                 self.sm.pop();
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(0)));
+                // Property value will be provided at deployment time; emit a placeholder.
+                // The emitter records byte offsets so the SDK can splice in real values.
+                let param_index = self
+                    .properties
+                    .iter()
+                    .position(|p2| p2.name == prop_name)
+                    .unwrap_or(0);
+                self.emit_op(StackOp::Placeholder {
+                    param_index,
+                    param_name: prop_name.to_string(),
+                });
             }
         } else if self.sm.has(prop_name) {
             self.bring_to_top(prop_name, false);
             self.sm.pop();
         } else {
-            self.emit_op(StackOp::Push(PushValue::Int(0)));
+            // Property not found and not on stack — emit placeholder with index 0.
+            let param_index = self
+                .properties
+                .iter()
+                .position(|p2| p2.name == prop_name)
+                .unwrap_or(0);
+            self.emit_op(StackOp::Placeholder {
+                param_index,
+                param_name: prop_name.to_string(),
+            });
         }
         self.sm.push(binding_name);
     }

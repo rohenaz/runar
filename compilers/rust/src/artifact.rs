@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::codegen::emit::ConstructorSlot;
 use crate::ir::ANFProgram;
 
 // ---------------------------------------------------------------------------
@@ -64,6 +65,8 @@ pub struct RunarArtifact {
     pub asm: String,
     #[serde(rename = "stateFields", skip_serializing_if = "Vec::is_empty")]
     pub state_fields: Vec<StateField>,
+    #[serde(rename = "constructorSlots", skip_serializing_if = "Vec::is_empty", default)]
+    pub constructor_slots: Vec<ConstructorSlot>,
     #[serde(rename = "buildTimestamp")]
     pub build_timestamp: String,
 }
@@ -80,6 +83,7 @@ pub fn assemble_artifact(
     program: &ANFProgram,
     script_hex: &str,
     script_asm: &str,
+    constructor_slots: Vec<ConstructorSlot>,
 ) -> RunarArtifact {
     // Build constructor params from properties
     let constructor_params: Vec<ABIParam> = program
@@ -139,6 +143,7 @@ pub fn assemble_artifact(
         script: script_hex.to_string(),
         asm: script_asm.to_string(),
         state_fields,
+        constructor_slots,
         build_timestamp: now,
     }
 }

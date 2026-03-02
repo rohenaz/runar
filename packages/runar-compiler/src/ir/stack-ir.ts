@@ -78,6 +78,12 @@ export interface TuckOp {
   op: 'tuck';
 }
 
+export interface PlaceholderOp {
+  op: 'placeholder';
+  paramIndex: number;
+  paramName: string;
+}
+
 export type StackOp =
   | PushOp
   | DupOp
@@ -90,4 +96,5 @@ export type StackOp =
   | NipOp
   | OverOp
   | RotOp
-  | TuckOp;
+  | TuckOp
+  | PlaceholderOp;

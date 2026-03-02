@@ -194,6 +194,7 @@ export function compile(source: string, options?: CompileOptions): CompileResult
       stackProgram,
       emitResult.scriptHex,
       emitResult.scriptAsm,
+      { constructorSlots: emitResult.constructorSlots },
     );
 
     return {

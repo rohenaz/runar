@@ -111,13 +111,26 @@ var opcodes = map[string]byte{
 }
 
 // ---------------------------------------------------------------------------
+// ConstructorSlot
+// ---------------------------------------------------------------------------
+
+// ConstructorSlot records the byte offset of a constructor parameter placeholder
+// in the emitted script. The SDK uses these offsets to splice in real values at
+// deployment time.
+type ConstructorSlot struct {
+	ParamIndex int `json:"paramIndex"`
+	ByteOffset int `json:"byteOffset"`
+}
+
+// ---------------------------------------------------------------------------
 // EmitResult
 // ---------------------------------------------------------------------------
 
 // EmitResult holds the outputs of the emission pass.
 type EmitResult struct {
-	ScriptHex string
-	ScriptAsm string
+	ScriptHex        string
+	ScriptAsm        string
+	ConstructorSlots []ConstructorSlot
 }
 
 // ---------------------------------------------------------------------------
@@ -125,8 +138,10 @@ type EmitResult struct {
 // ---------------------------------------------------------------------------
 
 type emitContext struct {
-	hexParts []string
-	asmParts []string
+	hexParts         []string
+	asmParts         []string
+	byteLength       int
+	constructorSlots []ConstructorSlot
 }
 
 func newEmitContext() *emitContext {
@@ -135,6 +150,7 @@ func newEmitContext() *emitContext {
 
 func (ctx *emitContext) appendHex(h string) {
 	ctx.hexParts = append(ctx.hexParts, h)
+	ctx.byteLength += len(h) / 2
 }
 
 func (ctx *emitContext) appendAsm(a string) {
@@ -155,6 +171,16 @@ func (ctx *emitContext) emitPush(value PushValue) {
 	h, a := encodePushValue(value)
 	ctx.appendHex(h)
 	ctx.appendAsm(a)
+}
+
+func (ctx *emitContext) emitPlaceholder(paramIndex int) {
+	byteOffset := ctx.byteLength
+	ctx.appendHex("00") // OP_0 placeholder byte
+	ctx.appendAsm("OP_0")
+	ctx.constructorSlots = append(ctx.constructorSlots, ConstructorSlot{
+		ParamIndex: paramIndex,
+		ByteOffset: byteOffset,
+	})
 }
 
 func (ctx *emitContext) getHex() string {
@@ -328,6 +354,8 @@ func emitStackOp(op *StackOp, ctx *emitContext) error {
 		return ctx.emitOpcode(op.Code)
 	case "if":
 		return emitIf(op.Then, op.Else, ctx)
+	case "placeholder":
+		ctx.emitPlaceholder(op.ParamIndex)
 	default:
 		return fmt.Errorf("unknown stack op: %s", op.Op)
 	}
@@ -440,7 +468,7 @@ func Emit(methods []StackMethod) (*EmitResult, error) {
 	}
 
 	if len(publicMethods) == 0 {
-		return &EmitResult{ScriptHex: "", ScriptAsm: ""}, nil
+		return &EmitResult{ScriptHex: "", ScriptAsm: "", ConstructorSlots: nil}, nil
 	}
 
 	// Apply peephole optimizations to each method's ops
@@ -463,8 +491,9 @@ func Emit(methods []StackMethod) (*EmitResult, error) {
 	}
 
 	return &EmitResult{
-		ScriptHex: ctx.getHex(),
-		ScriptAsm: ctx.getAsm(),
+		ScriptHex:        ctx.getHex(),
+		ScriptAsm:        ctx.getAsm(),
+		ConstructorSlots: ctx.constructorSlots,
 	}, nil
 }
 
@@ -525,7 +554,8 @@ func EmitMethod(method *StackMethod) (*EmitResult, error) {
 		}
 	}
 	return &EmitResult{
-		ScriptHex: ctx.getHex(),
-		ScriptAsm: ctx.getAsm(),
+		ScriptHex:        ctx.getHex(),
+		ScriptAsm:        ctx.getAsm(),
+		ConstructorSlots: ctx.constructorSlots,
 	}, nil
 }

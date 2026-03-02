@@ -486,8 +486,13 @@ class LoweringContext {
       this.stackMap.pop();
     } else {
       // Property value will be provided at deployment time; emit a placeholder.
-      // The assembler fills this in from constructor args.
-      this.emitOp({ op: 'push', value: 0n });
+      // The emitter records byte offsets so the SDK can splice in real values.
+      const paramIndex = this._properties.findIndex(p => p.name === propName);
+      this.emitOp({
+        op: 'placeholder',
+        paramIndex: paramIndex >= 0 ? paramIndex : 0,
+        paramName: propName,
+      });
     }
     this.stackMap.push(bindingName);
   }
