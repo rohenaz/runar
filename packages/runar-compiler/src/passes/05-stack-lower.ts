@@ -94,6 +94,7 @@ const UNARYOP_OPCODES: Record<string, string[]> = {
   '!': ['OP_NOT'],
   '-': ['OP_NEGATE'],
   '~': ['OP_INVERT'],
+  'unpack': ['OP_BIN2NUM'],
 };
 
 // ---------------------------------------------------------------------------
@@ -1130,12 +1131,13 @@ class LoweringContext {
   private lowerExtractParentOutput(
     bindingName: string,
     rawTx: string,
-    _outputIndex: string,
+    outputIndex: string,
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
-    // For V1, we always extract output index 0 (the continuation output).
+    // Extract the output script at the given outputIndex from a raw Bitcoin tx.
     // The implementation uses OP_SPLIT chains to parse the raw tx on the stack.
+    // Supports output indices 0-3 via an unrolled output-skipping loop.
 
     // Bring rawTx to top
     const isLastRawTx = this.isLastUse(rawTx, bindingIndex, lastUses);
@@ -1156,7 +1158,7 @@ class LoweringContext {
     this.stackMap.pop();
     this.stackMap.push(null); // remainder
 
-    // --- Step 2: Read inputCount (1 byte varint, V1 assumption) ---
+    // --- Step 2: Read inputCount (1 byte varint) ---
     this.emitOp({ op: 'push', value: 1n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
@@ -1171,75 +1173,39 @@ class LoweringContext {
     this.emitOp({ op: 'opcode', code: 'OP_SWAP' });
     // Stack: [inputCount, remainder]
 
-    // --- Step 3: Skip each input ---
-    // For each input we need to skip: prevTxId(32) + prevVout(4) + varint(scriptLen) + scriptSig + sequence(4)
-    // = 36 bytes fixed prefix, then varint + scriptSig + 4 bytes sequence
-    // We use a loop: for each input, skip 36 bytes, read 1-byte varint scriptLen,
-    // skip scriptLen + 4 bytes
-    //
-    // To loop in Script we'll use an unrolled approach via OP_TOALTSTACK/OP_FROMALTSTACK.
-    // But Bitcoin Script doesn't have dynamic loops. Instead, we use a repeated
-    // pattern with the count on the stack.
-    //
-    // For V1, we'll implement this as inline opcodes that skip N inputs.
-    // Since we can't do dynamic loops in Bitcoin Script, and the plan says
-    // V1 handles 1-byte varints, we can use a technique where we:
-    // 1. Compute the total skip length dynamically
-    // 2. Actually, we need to parse each input because scriptSig is variable length
-    //
-    // The standard approach is to unroll this into a fixed loop. For genesis txs
-    // the parent typically has 1 input. For subsequent txs, also typically 1-2.
-    // Let's use the approach from the plan: parse inputs one at a time.
-    //
-    // For a robust implementation, we'll skip inputs by computing offset:
-    // Move inputCount to alt stack, then for each input (while inputCount > 0),
-    // split 36 bytes, read 1-byte varint for scriptSig length, split that + 4.
-    // Bitcoin Script doesn't support dynamic loops, so we'll use a different
-    // technique: treat the entire inputs section as parseable by doing:
-    //   OP_TOALTSTACK (save inputCount)
-    //   ... process one input ...
-    //   OP_FROMALTSTACK OP_1SUB OP_DUP OP_TOALTSTACK
-    //   OP_IF ... process another input ... OP_ENDIF
-    //
-    // To keep V1 simple and practical, we'll support transactions with up to 4
-    // inputs via unrolled logic (covers >99% of real cases). A single pass
-    // handles all counts by checking if remaining count > 0.
-
+    // --- Step 3: Skip each input (unrolled, up to 4 inputs) ---
     // Move inputCount to alt stack
     this.emitOp({ op: 'opcode', code: 'OP_SWAP' });
-    // Stack: [remainder, inputCount]
     this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
     this.stackMap.pop(); // inputCount to alt
     // Stack: [remainder]
 
-    // Unrolled input-skipping: up to 4 inputs
     for (let i = 0; i < 4; i++) {
       this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' });
-      this.stackMap.push(null); // inputCount
+      this.stackMap.push(null);
       this.emitOp({ op: 'opcode', code: 'OP_DUP' });
       this.stackMap.push(null);
       this.emitOp({ op: 'opcode', code: 'OP_0NOTEQUAL' });
-      // OP_IF: skip one input
       this.emitOp({ op: 'opcode', code: 'OP_IF' });
 
       // Decrement counter
       this.emitOp({ op: 'opcode', code: 'OP_1SUB' });
       this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
-      this.stackMap.pop(); // counter to alt
-      this.stackMap.pop(); // dup
+      this.stackMap.pop();
+      this.stackMap.pop();
 
       // Skip 36 bytes (prevTxId + prevVout)
       this.emitOp({ op: 'push', value: 36n });
       this.stackMap.push(null);
       this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
-      this.stackMap.pop(); // 36n
-      this.stackMap.pop(); // remainder
-      this.stackMap.push(null); // prefix
-      this.stackMap.push(null); // rest
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.stackMap.push(null);
+      this.stackMap.push(null);
       this.emitOp({ op: 'opcode', code: 'OP_NIP' });
       this.stackMap.pop();
       this.stackMap.pop();
-      this.stackMap.push(null); // rest
+      this.stackMap.push(null);
 
       // Read 1-byte varint for scriptSig length
       this.emitOp({ op: 'push', value: 1n });
@@ -1247,50 +1213,41 @@ class LoweringContext {
       this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
       this.stackMap.pop();
       this.stackMap.pop();
-      this.stackMap.push(null); // scriptLenByte
-      this.stackMap.push(null); // rest
+      this.stackMap.push(null);
+      this.stackMap.push(null);
       this.emitOp({ op: 'opcode', code: 'OP_SWAP' });
       this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
-      // Stack: [rest, scriptLen]
 
       // Skip scriptLen + 4 (sequence) bytes
       this.emitOp({ op: 'push', value: 4n });
       this.stackMap.push(null);
       this.emitOp({ op: 'opcode', code: 'OP_ADD' });
       this.stackMap.pop();
-      // Stack: [rest, totalSkip]
       this.emitOp({ op: 'opcode', code: 'OP_SWAP' });
       this.emitOp({ op: 'opcode', code: 'OP_SWAP' });
-      // Stack: [totalSkip, rest] -> want [rest, totalSkip]
-      // Actually OP_SWAP already does that. Let me reconsider:
-      // After BIN2NUM: stack is [rest, scriptLen]
-      // After OP_ADD: stack is [rest, scriptLen+4]
-      // We need OP_SPLIT on [rest] with [scriptLen+4]
-      // So we need to swap them
       this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
-      this.stackMap.pop(); // totalSkip
-      this.stackMap.pop(); // rest
-      this.stackMap.push(null); // skipped
-      this.stackMap.push(null); // newRemainder
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.stackMap.push(null);
+      this.stackMap.push(null);
       this.emitOp({ op: 'opcode', code: 'OP_NIP' });
       this.stackMap.pop();
       this.stackMap.pop();
-      this.stackMap.push(null); // newRemainder
+      this.stackMap.push(null);
 
-      // OP_ELSE: counter was 0, just drop the dup and keep remainder
       this.emitOp({ op: 'opcode', code: 'OP_ELSE' });
       this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
       this.emitOp({ op: 'opcode', code: 'OP_ENDIF' });
     }
 
-    // Clean up: get counter from alt stack and drop it
+    // Clean up input counter from alt stack
     this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_DROP' });
     this.stackMap.pop();
     // Stack: [remainder after inputs]
 
-    // --- Step 4: Read outputCount (1 byte varint) ---
+    // --- Step 4: Read outputCount (1 byte varint) and discard ---
     this.emitOp({ op: 'push', value: 1n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
@@ -1301,9 +1258,82 @@ class LoweringContext {
     this.emitOp({ op: 'opcode', code: 'OP_NIP' });
     this.stackMap.pop();
     this.stackMap.pop();
-    this.stackMap.push(null); // remainder (we don't need outputCount for idx 0)
+    this.stackMap.push(null); // remainder
 
-    // --- Step 5 & 6: Extract output 0's script ---
+    // --- Step 5: Bring outputIndex to top, push to alt stack as counter ---
+    const isLastOutputIndex = this.isLastUse(outputIndex, bindingIndex, lastUses);
+    this.bringToTop(outputIndex, isLastOutputIndex);
+    // Stack: [remainder, outputIndex]
+    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
+    this.stackMap.pop(); // outputIndex to alt
+    // Stack: [remainder]
+
+    // --- Step 6: Unrolled output-skipping loop (up to 4 iterations) ---
+    // Each output: 8 bytes (satoshis) + 1-byte varint (scriptLen) + script bytes
+    for (let i = 0; i < 4; i++) {
+      this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' });
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_DUP' });
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_0NOTEQUAL' });
+      this.emitOp({ op: 'opcode', code: 'OP_IF' });
+
+      // Decrement counter
+      this.emitOp({ op: 'opcode', code: 'OP_1SUB' });
+      this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
+      this.stackMap.pop();
+      this.stackMap.pop();
+
+      // Skip 8 bytes (satoshis)
+      this.emitOp({ op: 'push', value: 8n });
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.stackMap.push(null);
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_NIP' });
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.stackMap.push(null);
+
+      // Read 1-byte varint for script length
+      this.emitOp({ op: 'push', value: 1n });
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.stackMap.push(null);
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_SWAP' });
+      this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
+
+      // Skip scriptLen bytes
+      this.emitOp({ op: 'opcode', code: 'OP_SWAP' });
+      this.emitOp({ op: 'opcode', code: 'OP_SWAP' });
+      this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.stackMap.push(null);
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_NIP' });
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.stackMap.push(null);
+
+      this.emitOp({ op: 'opcode', code: 'OP_ELSE' });
+      this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
+      this.emitOp({ op: 'opcode', code: 'OP_ENDIF' });
+    }
+
+    // Clean up output counter from alt stack
+    this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_DROP' });
+    this.stackMap.pop();
+    // Stack: [remainder positioned at target output]
+
+    // --- Step 7: Extract the target output's script ---
     // Skip satoshis (8 bytes)
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);

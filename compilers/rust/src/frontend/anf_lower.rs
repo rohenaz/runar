@@ -169,12 +169,30 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             let ptx_ref = non_genesis_ctx.emit(ANFValue::LoadParam {
                 name: "parentTx".to_string(),
             });
-            let zero_idx = non_genesis_ctx.emit(ANFValue::LoadConst {
-                value: serde_json::Value::Number(serde_json::Number::from(0i64)),
+            // Derive output index dynamically from the current transaction's outpoint.
+            // The outpoint is 36 bytes: 32-byte txid + 4-byte vout (little-endian).
+            // We extract the last 4 bytes (vout) and convert to a number via OP_BIN2NUM.
+            let preimage_for_idx = non_genesis_ctx.emit(ANFValue::LoadParam {
+                name: "txPreimage".to_string(),
+            });
+            let outpoint_for_idx = non_genesis_ctx.emit(ANFValue::Call {
+                func: "extractOutpoint".to_string(),
+                args: vec![preimage_for_idx],
+            });
+            let four = non_genesis_ctx.emit(ANFValue::LoadConst {
+                value: serde_json::Value::Number(serde_json::Number::from(4i64)),
+            });
+            let output_idx_bytes = non_genesis_ctx.emit(ANFValue::Call {
+                func: "right".to_string(),
+                args: vec![outpoint_for_idx, four],
+            });
+            let output_idx = non_genesis_ctx.emit(ANFValue::UnaryOp {
+                op: "unpack".to_string(),
+                operand: output_idx_bytes,
             });
             let parent_script = non_genesis_ctx.emit(ANFValue::ExtractParentOutput {
                 raw_tx: ptx_ref,
-                output_index: zero_idx,
+                output_index: output_idx,
             });
 
             // Extract internal fields from the END of parent script
@@ -274,10 +292,9 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 else_branch: non_genesis_ctx.bindings,
             });
 
-            // 4. Lower the developer's method body
-            lower_statements(&method.body, &mut method_ctx);
-
-            // 5. Inject internal field updates (before state continuation)
+            // 4. Inject internal field updates BEFORE the developer body, so that
+            //    addOutput calls in the developer's code pick up the updated values
+            //    via auto-appended load_prop references.
             //    _grandparentOutpoint = _parentOutpoint
             let old_parent = method_ctx.emit(ANFValue::LoadProp {
                 name: "_parentOutpoint".to_string(),
@@ -298,6 +315,9 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 name: "_parentOutpoint".to_string(),
                 value: current_outpoint2,
             });
+
+            // 5. Lower the developer's method body
+            lower_statements(&method.body, &mut method_ctx);
 
             // 6. State continuation (same as StatefulSmartContract)
             let add_output_refs = method_ctx.add_output_refs.clone();
@@ -1002,7 +1022,18 @@ fn lower_call_expr(
         if property == "addOutput" {
             let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
             let satoshis = arg_refs.first().cloned().unwrap_or_default();
-            let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
+            let mut state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
+            // For InductiveSmartContract, auto-append internal field values.
+            // The internal fields have already been updated (update_prop) before the
+            // developer's body, so load_prop returns the correct new-generation values.
+            if ctx.contract.parent_class == "InductiveSmartContract" {
+                let genesis_ref = ctx.emit(ANFValue::LoadProp { name: "_genesisOutpoint".to_string() });
+                let parent_ref = ctx.emit(ANFValue::LoadProp { name: "_parentOutpoint".to_string() });
+                let grandparent_ref = ctx.emit(ANFValue::LoadProp { name: "_grandparentOutpoint".to_string() });
+                state_values.push(genesis_ref);
+                state_values.push(parent_ref);
+                state_values.push(grandparent_ref);
+            }
             let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values });
             ctx.add_output_refs.push(r.clone());
             return r;
@@ -1014,7 +1045,16 @@ fn lower_call_expr(
             if name == "this" && property == "addOutput" {
                 let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
                 let satoshis = arg_refs.first().cloned().unwrap_or_default();
-                let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
+                let mut state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
+                // For InductiveSmartContract, auto-append internal field values.
+                if ctx.contract.parent_class == "InductiveSmartContract" {
+                    let genesis_ref = ctx.emit(ANFValue::LoadProp { name: "_genesisOutpoint".to_string() });
+                    let parent_ref = ctx.emit(ANFValue::LoadProp { name: "_parentOutpoint".to_string() });
+                    let grandparent_ref = ctx.emit(ANFValue::LoadProp { name: "_grandparentOutpoint".to_string() });
+                    state_values.push(genesis_ref);
+                    state_values.push(parent_ref);
+                    state_values.push(grandparent_ref);
+                }
                 let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values });
                 ctx.add_output_refs.push(r.clone());
                 return r;

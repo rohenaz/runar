@@ -391,6 +391,4 @@ The simplicity of the invariant — "every transaction in the chain shares the s
 ## Limitations (V1)
 
 - **1-byte varint only**: The transaction parser handles inputs/outputs counts up to 252. Transactions with 253+ inputs or outputs are not supported. This covers 99%+ of real transactions.
-- **Single output index**: V1 always reads output index 0 from the parent transaction. Multi-output parent parsing is planned for V2.
-- **No bolt mechanism**: The BOLT alternation mechanism (odd/even transaction pairs with auxiliary proof outputs) is planned for V2.
 - **Fixed 36-byte outpoints**: The internal field sizes are hardcoded. This is a fundamental Bitcoin constant (32-byte txid + 4-byte vout) and is unlikely to change.

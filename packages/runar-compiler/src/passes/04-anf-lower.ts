@@ -123,8 +123,15 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       const nonGenesisCtx = methodCtx.subContext();
       // Extract parent output script via extract_parent_output
       const ptxRef = nonGenesisCtx.emit({ kind: 'load_param', name: 'parentTx' });
-      const zeroIdx = nonGenesisCtx.emit({ kind: 'load_const', value: 0n });
-      const parentScript = nonGenesisCtx.emit({ kind: 'extract_parent_output', rawTx: ptxRef, outputIndex: zeroIdx });
+      // Derive output index dynamically from the current transaction's outpoint.
+      // The outpoint is 36 bytes: 32-byte txid + 4-byte vout (little-endian).
+      // We extract the last 4 bytes (vout) and convert to a number via OP_BIN2NUM.
+      const preimageForIdx = nonGenesisCtx.emit({ kind: 'load_param', name: 'txPreimage' });
+      const outpointForIdx = nonGenesisCtx.emit({ kind: 'call', func: 'extractOutpoint', args: [preimageForIdx] });
+      const four = nonGenesisCtx.emit({ kind: 'load_const', value: 4n });
+      const outputIdxBytes = nonGenesisCtx.emit({ kind: 'call', func: 'right', args: [outpointForIdx, four] });
+      const outputIdx = nonGenesisCtx.emit({ kind: 'unary_op', op: 'unpack', operand: outputIdxBytes });
+      const parentScript = nonGenesisCtx.emit({ kind: 'extract_parent_output', rawTx: ptxRef, outputIndex: outputIdx });
 
       // Extract internal fields from the END of parent script
       // Internal fields are the last 108 bytes of push data (3 fields * 36 bytes)

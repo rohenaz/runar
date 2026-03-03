@@ -203,10 +203,32 @@ impl RunarContract {
             .as_ref()
             .map_or(false, |f| !f.is_empty());
 
+        // Check for multi-output mode
+        let is_multi_output = options
+            .and_then(|o| o.outputs.as_ref())
+            .map_or(false, |outputs| !outputs.is_empty());
+
         let mut new_locking_script: Option<String> = None;
         let mut new_satoshis: Option<i64> = None;
+        let mut multi_outputs: Vec<CallOutput> = Vec::new();
 
-        if is_stateful {
+        if is_multi_output {
+            // Multi-output mode: build a locking script for each output spec
+            let output_specs = options.unwrap().outputs.as_ref().unwrap();
+            for spec in output_specs {
+                // Save current state, apply output-specific state, build script, restore
+                let saved_state = self.state.clone();
+                for (k, v) in &spec.state {
+                    self.state.insert(k.clone(), v.clone());
+                }
+                let ls = self.get_locking_script();
+                multi_outputs.push(CallOutput {
+                    locking_script: ls,
+                    satoshis: spec.satoshis,
+                });
+                self.state = saved_state;
+            }
+        } else if is_stateful {
             new_satoshis = Some(
                 options
                     .and_then(|o| o.satoshis)
@@ -226,6 +248,12 @@ impl RunarContract {
         // Fetch additional funding UTXOs if needed
         let additional_utxos = provider.get_utxos(&address).unwrap_or_default();
 
+        let multi_outputs_ref = if multi_outputs.is_empty() {
+            None
+        } else {
+            Some(multi_outputs.as_slice())
+        };
+
         let (tx_hex, input_count) = build_call_transaction(
             &current_utxo,
             &unlocking_script,
@@ -238,6 +266,7 @@ impl RunarContract {
             } else {
                 Some(&additional_utxos)
             },
+            multi_outputs_ref,
         );
 
         // Sign additional inputs (input 0 already has the unlocking script)
@@ -254,8 +283,29 @@ impl RunarContract {
         // Broadcast
         let txid = provider.broadcast(&signed_tx)?;
 
-        // Update tracked UTXO for stateful contracts
-        if is_stateful {
+        // Update tracked UTXO
+        if is_multi_output {
+            let output_specs = options.unwrap().outputs.as_ref().unwrap();
+            // Determine which output to track as continuation
+            let cont_idx = options
+                .and_then(|o| o.continuation_output_index)
+                .unwrap_or(multi_outputs.len() - 1);
+            if cont_idx < multi_outputs.len() {
+                let tracked = &multi_outputs[cont_idx];
+                // Apply the tracked output's state
+                if cont_idx < output_specs.len() {
+                    for (k, v) in &output_specs[cont_idx].state {
+                        self.state.insert(k.clone(), v.clone());
+                    }
+                }
+                self.current_utxo = Some(Utxo {
+                    txid: txid.clone(),
+                    output_index: cont_idx as u32,
+                    satoshis: tracked.satoshis,
+                    script: tracked.locking_script.clone(),
+                });
+            }
+        } else if is_stateful {
             if let Some(ref nls) = new_locking_script {
                 self.current_utxo = Some(Utxo {
                     txid: txid.clone(),

@@ -7,7 +7,7 @@ import type { Provider } from './providers/provider.js';
 import type { Signer } from './signers/signer.js';
 import type { Transaction, UTXO, DeployOptions, CallOptions } from './types.js';
 import { buildDeployTransaction, selectUtxos } from './deployment.js';
-import { buildCallTransaction } from './calling.js';
+import { buildCallTransaction, type CallOutput } from './calling.js';
 import { serializeState, extractStateFromScript, findLastOpReturn } from './state.js';
 
 /**
@@ -205,14 +205,36 @@ export class RunarContract {
 
     let newLockingScript: string | undefined;
     let newSatoshis: number | undefined;
+    let multiOutputs: CallOutput[] | undefined;
 
     if (isStateful) {
-      newSatoshis = options?.satoshis ?? this.currentUtxo.satoshis;
-      // Apply new state values before building the continuation output
-      if (options?.newState) {
-        this._state = { ...this._state, ...options.newState };
+      if (options?.outputs && options.outputs.length > 0) {
+        // Multi-output mode: build a locking script for each output
+        const savedState = { ...this._state };
+        multiOutputs = [];
+        for (const outputSpec of options.outputs) {
+          this._state = { ...savedState, ...outputSpec.state };
+          multiOutputs.push({
+            lockingScript: this.getLockingScript(),
+            satoshis: outputSpec.satoshis,
+          });
+        }
+        // Restore state to the continuation output's state (last by default)
+        const contIdx = options.continuationOutputIndex ?? (options.outputs.length - 1);
+        const contOutput = options.outputs[contIdx];
+        if (contOutput) {
+          this._state = { ...savedState, ...contOutput.state };
+        } else {
+          this._state = savedState;
+        }
+      } else {
+        // Single-output mode (existing behavior)
+        newSatoshis = options?.satoshis ?? this.currentUtxo.satoshis;
+        if (options?.newState) {
+          this._state = { ...this._state, ...options.newState };
+        }
+        newLockingScript = this.getLockingScript();
       }
-      newLockingScript = this.getLockingScript();
     }
 
     const changeScript = buildP2PKHScriptFromAddress(changeAddress);
@@ -228,6 +250,7 @@ export class RunarContract {
       changeAddress,
       changeScript,
       additionalUtxos.length > 0 ? additionalUtxos : undefined,
+      multiOutputs,
     );
 
     // Sign additional inputs (input 0 already has the unlocking script)
@@ -246,13 +269,31 @@ export class RunarContract {
     const txid = await provider.broadcast(signedTx);
 
     // Update tracked UTXO for stateful contracts
-    if (isStateful && newLockingScript) {
-      this.currentUtxo = {
-        txid,
-        outputIndex: 0,
-        satoshis: newSatoshis ?? this.currentUtxo.satoshis,
-        script: newLockingScript,
-      };
+    if (isStateful) {
+      if (multiOutputs && multiOutputs.length > 0) {
+        // Multi-output: track the continuation output
+        const contIdx = options?.continuationOutputIndex ?? (multiOutputs.length - 1);
+        const contOutput = multiOutputs[contIdx];
+        if (contOutput) {
+          this.currentUtxo = {
+            txid,
+            outputIndex: contIdx,
+            satoshis: contOutput.satoshis,
+            script: contOutput.lockingScript,
+          };
+        } else {
+          this.currentUtxo = null;
+        }
+      } else if (newLockingScript) {
+        this.currentUtxo = {
+          txid,
+          outputIndex: 0,
+          satoshis: newSatoshis ?? this.currentUtxo.satoshis,
+          script: newLockingScript,
+        };
+      } else {
+        this.currentUtxo = null;
+      }
     } else {
       this.currentUtxo = null;
     }

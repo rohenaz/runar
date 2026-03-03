@@ -124,6 +124,7 @@ fn unaryop_opcodes(op: &str) -> Option<Vec<&'static str>> {
         "!" => Some(vec!["OP_NOT"]),
         "-" => Some(vec!["OP_NEGATE"]),
         "~" => Some(vec!["OP_INVERT"]),
+        "unpack" => Some(vec!["OP_BIN2NUM"]),
         _ => None,
     }
 }
@@ -1179,10 +1180,13 @@ impl LoweringContext {
         &mut self,
         binding_name: &str,
         raw_tx: &str,
-        _output_index: &str,
+        output_index: &str,
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
+        // Extract the output script at the given output_index from a raw Bitcoin tx.
+        // Supports output indices 0-3 via an unrolled output-skipping loop.
+
         // Bring rawTx to top
         let is_last_raw_tx = self.is_last_use(raw_tx, binding_index, last_uses);
         self.bring_to_top(raw_tx, is_last_raw_tx);
@@ -1191,13 +1195,11 @@ impl LoweringContext {
         self.emit_op(StackOp::Push(PushValue::Int(4)));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
-        // Stack: [version | remainder]
-        self.sm.pop(); // remove 4n
-        self.sm.pop(); // remove rawTx
+        self.sm.pop();
+        self.sm.pop();
         self.sm.push(""); // version (left)
         self.sm.push(""); // remainder (right)
         self.emit_op(StackOp::Opcode("OP_NIP".to_string()));
-        // Stack: [remainder] (version dropped)
         self.sm.pop();
         self.sm.pop();
         self.sm.push(""); // remainder
@@ -1206,52 +1208,44 @@ impl LoweringContext {
         self.emit_op(StackOp::Push(PushValue::Int(1)));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
-        self.sm.pop(); // remove 1n
-        self.sm.pop(); // remove remainder
+        self.sm.pop();
+        self.sm.pop();
         self.sm.push(""); // inputCountByte (left)
         self.sm.push(""); // remainder (right)
-        // Convert inputCount byte to number
         self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
         self.emit_op(StackOp::Opcode("OP_BIN2NUM".to_string()));
-        // Stack: [remainder, inputCount]
         self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
-        // Stack: [inputCount, remainder]
 
         // --- Step 3: Skip each input (unrolled, up to 4) ---
-        // Move inputCount to alt stack
         self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
-        // Stack: [remainder, inputCount]
         self.emit_op(StackOp::Opcode("OP_TOALTSTACK".to_string()));
-        self.sm.pop(); // inputCount to alt
-        // Stack: [remainder]
+        self.sm.pop();
 
         for _i in 0..4 {
             self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".to_string()));
-            self.sm.push(""); // inputCount
+            self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_DUP".to_string()));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_0NOTEQUAL".to_string()));
-            // OP_IF: skip one input
             self.emit_op(StackOp::Opcode("OP_IF".to_string()));
 
-            // Decrement counter
             self.emit_op(StackOp::Opcode("OP_1SUB".to_string()));
             self.emit_op(StackOp::Opcode("OP_TOALTSTACK".to_string()));
-            self.sm.pop(); // counter to alt
-            self.sm.pop(); // dup
+            self.sm.pop();
+            self.sm.pop();
 
             // Skip 36 bytes (prevTxId + prevVout)
             self.emit_op(StackOp::Push(PushValue::Int(36)));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
-            self.sm.pop(); // 36n
-            self.sm.pop(); // remainder
-            self.sm.push(""); // prefix
-            self.sm.push(""); // rest
+            self.sm.pop();
+            self.sm.pop();
+            self.sm.push("");
+            self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_NIP".to_string()));
             self.sm.pop();
             self.sm.pop();
-            self.sm.push(""); // rest
+            self.sm.push("");
 
             // Read 1-byte varint for scriptSig length
             self.emit_op(StackOp::Push(PushValue::Int(1)));
@@ -1259,44 +1253,40 @@ impl LoweringContext {
             self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
             self.sm.pop();
             self.sm.pop();
-            self.sm.push(""); // scriptLenByte
-            self.sm.push(""); // rest
+            self.sm.push("");
+            self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
             self.emit_op(StackOp::Opcode("OP_BIN2NUM".to_string()));
-            // Stack: [rest, scriptLen]
 
             // Skip scriptLen + 4 (sequence) bytes
             self.emit_op(StackOp::Push(PushValue::Int(4)));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_ADD".to_string()));
             self.sm.pop();
-            // Stack: [rest, totalSkip]
             self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
             self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
             self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
-            self.sm.pop(); // totalSkip
-            self.sm.pop(); // rest
-            self.sm.push(""); // skipped
-            self.sm.push(""); // newRemainder
+            self.sm.pop();
+            self.sm.pop();
+            self.sm.push("");
+            self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_NIP".to_string()));
             self.sm.pop();
             self.sm.pop();
-            self.sm.push(""); // newRemainder
+            self.sm.push("");
 
-            // OP_ELSE: counter was 0, just drop the dup and keep remainder
             self.emit_op(StackOp::Opcode("OP_ELSE".to_string()));
             self.emit_op(StackOp::Opcode("OP_TOALTSTACK".to_string()));
             self.emit_op(StackOp::Opcode("OP_ENDIF".to_string()));
         }
 
-        // Clean up: get counter from alt stack and drop it
+        // Clean up input counter from alt stack
         self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".to_string()));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_DROP".to_string()));
         self.sm.pop();
-        // Stack: [remainder after inputs]
 
-        // --- Step 4: Read outputCount (1 byte varint, ignored for idx 0) ---
+        // --- Step 4: Read outputCount (1 byte varint) and discard ---
         self.emit_op(StackOp::Push(PushValue::Int(1)));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
@@ -1307,9 +1297,78 @@ impl LoweringContext {
         self.emit_op(StackOp::Opcode("OP_NIP".to_string()));
         self.sm.pop();
         self.sm.pop();
-        self.sm.push(""); // remainder (we don't need outputCount for idx 0)
+        self.sm.push(""); // remainder
 
-        // --- Step 5 & 6: Extract output 0's script ---
+        // --- Step 5: Bring outputIndex to top, push to alt stack as counter ---
+        let is_last_output_index = self.is_last_use(output_index, binding_index, last_uses);
+        self.bring_to_top(output_index, is_last_output_index);
+        self.emit_op(StackOp::Opcode("OP_TOALTSTACK".to_string()));
+        self.sm.pop();
+
+        // --- Step 6: Unrolled output-skipping loop (up to 4 iterations) ---
+        // Each output: 8 bytes (satoshis) + 1-byte varint (scriptLen) + script bytes
+        for _i in 0..4 {
+            self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".to_string()));
+            self.sm.push("");
+            self.emit_op(StackOp::Opcode("OP_DUP".to_string()));
+            self.sm.push("");
+            self.emit_op(StackOp::Opcode("OP_0NOTEQUAL".to_string()));
+            self.emit_op(StackOp::Opcode("OP_IF".to_string()));
+
+            self.emit_op(StackOp::Opcode("OP_1SUB".to_string()));
+            self.emit_op(StackOp::Opcode("OP_TOALTSTACK".to_string()));
+            self.sm.pop();
+            self.sm.pop();
+
+            // Skip 8 bytes (satoshis)
+            self.emit_op(StackOp::Push(PushValue::Int(8)));
+            self.sm.push("");
+            self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
+            self.sm.pop();
+            self.sm.pop();
+            self.sm.push("");
+            self.sm.push("");
+            self.emit_op(StackOp::Opcode("OP_NIP".to_string()));
+            self.sm.pop();
+            self.sm.pop();
+            self.sm.push("");
+
+            // Read 1-byte varint for script length
+            self.emit_op(StackOp::Push(PushValue::Int(1)));
+            self.sm.push("");
+            self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
+            self.sm.pop();
+            self.sm.pop();
+            self.sm.push("");
+            self.sm.push("");
+            self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
+            self.emit_op(StackOp::Opcode("OP_BIN2NUM".to_string()));
+
+            // Skip scriptLen bytes
+            self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
+            self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
+            self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
+            self.sm.pop();
+            self.sm.pop();
+            self.sm.push("");
+            self.sm.push("");
+            self.emit_op(StackOp::Opcode("OP_NIP".to_string()));
+            self.sm.pop();
+            self.sm.pop();
+            self.sm.push("");
+
+            self.emit_op(StackOp::Opcode("OP_ELSE".to_string()));
+            self.emit_op(StackOp::Opcode("OP_TOALTSTACK".to_string()));
+            self.emit_op(StackOp::Opcode("OP_ENDIF".to_string()));
+        }
+
+        // Clean up output counter from alt stack
+        self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".to_string()));
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_DROP".to_string()));
+        self.sm.pop();
+
+        // --- Step 7: Extract the target output's script ---
         // Skip satoshis (8 bytes)
         self.emit_op(StackOp::Push(PushValue::Int(8)));
         self.sm.push("");
@@ -1333,7 +1392,6 @@ impl LoweringContext {
         self.sm.push(""); // rest
         self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));
         self.emit_op(StackOp::Opcode("OP_BIN2NUM".to_string()));
-        // Stack: [rest, scriptLen]
 
         // Extract the script bytes
         self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));

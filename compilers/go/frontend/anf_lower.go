@@ -176,8 +176,15 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			nonGenesisCtx := methodCtx.subContext()
 			// Extract parent output script via extract_parent_output
 			ptxRef := nonGenesisCtx.emit(ir.ANFValue{Kind: "load_param", Name: "parentTx"})
-			zeroIdx := nonGenesisCtx.emit(makeLoadConstInt(0))
-			parentScript := nonGenesisCtx.emit(ir.ANFValue{Kind: "extract_parent_output", RawTx: ptxRef, OutputIndex: zeroIdx})
+			// Derive output index dynamically from the current transaction's outpoint.
+			// The outpoint is 36 bytes: 32-byte txid + 4-byte vout (little-endian).
+			// We extract the last 4 bytes (vout) and convert to a number via OP_BIN2NUM.
+			preimageForIdx := nonGenesisCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+			outpointForIdx := nonGenesisCtx.emit(makeCall("extractOutpoint", []string{preimageForIdx}))
+			fourC := nonGenesisCtx.emit(makeLoadConstInt(4))
+			outputIdxBytes := nonGenesisCtx.emit(makeCall("right", []string{outpointForIdx, fourC}))
+			outputIdx := nonGenesisCtx.emit(ir.ANFValue{Kind: "unary_op", Op: "unpack", Operand: outputIdxBytes})
+			parentScript := nonGenesisCtx.emit(ir.ANFValue{Kind: "extract_parent_output", RawTx: ptxRef, OutputIndex: outputIdx})
 
 			// Extract internal fields from the END of parent script
 			// Internal fields are the last 111 bytes (3 * 37 bytes: 1 push opcode + 36 data bytes each)
@@ -224,10 +231,9 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 				Else: nonGenesisCtx.bindings,
 			})
 
-			// 4. Lower the developer's method body
-			methodCtx.lowerStatements(method.Body)
-
-			// 5. Inject internal field updates (before state continuation)
+			// 4. Inject internal field updates BEFORE the developer body, so that
+			//    addOutput calls in the developer's code pick up the updated values
+			//    via auto-appended load_prop references.
 			//    _grandparentOutpoint = _parentOutpoint
 			oldParent := methodCtx.emit(ir.ANFValue{Kind: "load_prop", Name: "_parentOutpoint"})
 			methodCtx.emit(makeUpdateProp("_grandparentOutpoint", oldParent))
@@ -235,6 +241,9 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			preimageRef3 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 			currentOutpoint2 := methodCtx.emit(makeCall("extractOutpoint", []string{preimageRef3}))
 			methodCtx.emit(makeUpdateProp("_parentOutpoint", currentOutpoint2))
+
+			// 5. Lower the developer's method body
+			methodCtx.lowerStatements(method.Body)
 
 			// 6. State continuation (same as StatefulSmartContract)
 			addOutputRefs := methodCtx.getAddOutputRefs()
@@ -803,6 +812,15 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 		argRefs := ctx.lowerArgs(e.Args)
 		satoshis := argRefs[0]
 		stateValues := argRefs[1:]
+		// For InductiveSmartContract, auto-append internal field values.
+		// The internal fields have already been updated (update_prop) before the
+		// developer's body, so load_prop returns the correct new-generation values.
+		if ctx.contract.ParentClass == "InductiveSmartContract" {
+			genesisRef := ctx.emit(ir.ANFValue{Kind: "load_prop", Name: "_genesisOutpoint"})
+			parentRef := ctx.emit(ir.ANFValue{Kind: "load_prop", Name: "_parentOutpoint"})
+			grandparentRef := ctx.emit(ir.ANFValue{Kind: "load_prop", Name: "_grandparentOutpoint"})
+			stateValues = append(stateValues, genesisRef, parentRef, grandparentRef)
+		}
 		ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues})
 		ctx.addOutputRef(ref)
 		return ref
@@ -812,6 +830,13 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 			argRefs := ctx.lowerArgs(e.Args)
 			satoshis := argRefs[0]
 			stateValues := argRefs[1:]
+			// For InductiveSmartContract, auto-append internal field values.
+			if ctx.contract.ParentClass == "InductiveSmartContract" {
+				genesisRef := ctx.emit(ir.ANFValue{Kind: "load_prop", Name: "_genesisOutpoint"})
+				parentRef := ctx.emit(ir.ANFValue{Kind: "load_prop", Name: "_parentOutpoint"})
+				grandparentRef := ctx.emit(ir.ANFValue{Kind: "load_prop", Name: "_grandparentOutpoint"})
+				stateValues = append(stateValues, genesisRef, parentRef, grandparentRef)
+			}
 			ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues})
 			ctx.addOutputRef(ref)
 			return ref
