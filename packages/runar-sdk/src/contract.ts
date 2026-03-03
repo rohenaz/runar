@@ -180,7 +180,23 @@ export class RunarContract {
 
     const address = await signer.getAddress();
     const changeAddress = options?.changeAddress ?? address;
-    const unlockingScript = this.buildUnlockingScript(methodName, args);
+    // For InductiveSmartContract methods, detect if the ABI includes a
+    // `parentTx` implicit parameter. If so, fetch the raw parent transaction
+    // (the tx that created the current UTXO) and prepend it to the unlocking
+    // script before the regular arguments and method selector.
+    let parentTxPrefix = '';
+    const hasParentTxParam = method.params.some((p) => p.name === 'parentTx');
+    if (hasParentTxParam) {
+      const parentTx = await provider.getTransaction(this.currentUtxo.txid);
+      if (!parentTx.raw) {
+        throw new Error(
+          'RunarContract.call: provider returned transaction without raw hex, needed for parentTx (InductiveSmartContract)',
+        );
+      }
+      parentTxPrefix = encodePushData(parentTx.raw);
+    }
+
+    const unlockingScript = parentTxPrefix + this.buildUnlockingScript(methodName, args);
 
     // Determine if this is a stateful call
     const isStateful =

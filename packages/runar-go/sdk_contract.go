@@ -179,7 +179,30 @@ func (c *RunarContract) Call(
 		changeAddress = address
 	}
 
-	unlockingScript := c.BuildUnlockingScript(methodName, args)
+	// For InductiveSmartContract methods, detect if the ABI includes a
+	// "parentTx" implicit parameter. If so, fetch the raw parent transaction
+	// (the tx that created the current UTXO) and prepend it to the unlocking
+	// script before the regular arguments and method selector.
+	parentTxPrefix := ""
+	hasParentTxParam := false
+	for _, p := range method.Params {
+		if p.Name == "parentTx" {
+			hasParentTxParam = true
+			break
+		}
+	}
+	if hasParentTxParam {
+		parentTx, err := provider.GetTransaction(c.currentUtxo.Txid)
+		if err != nil {
+			return "", nil, fmt.Errorf("RunarContract.Call: fetching parent tx for InductiveSmartContract: %w", err)
+		}
+		if parentTx.Raw == "" {
+			return "", nil, fmt.Errorf("RunarContract.Call: provider returned transaction without raw hex, needed for parentTx (InductiveSmartContract)")
+		}
+		parentTxPrefix = EncodePushData(parentTx.Raw)
+	}
+
+	unlockingScript := parentTxPrefix + c.BuildUnlockingScript(methodName, args)
 
 	// Determine if this is a stateful call
 	isStateful := len(c.Artifact.StateFields) > 0

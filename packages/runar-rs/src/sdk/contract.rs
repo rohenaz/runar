@@ -180,7 +180,21 @@ impl RunarContract {
         let change_address = options
             .and_then(|o| o.change_address.as_deref())
             .unwrap_or(&address);
-        let unlocking_script = self.build_unlocking_script(method_name, args)?;
+        // For InductiveSmartContract methods, detect if the ABI includes a
+        // "parentTx" implicit parameter. If so, fetch the raw parent transaction
+        // (the tx that created the current UTXO) and prepend it to the unlocking
+        // script before the regular arguments and method selector.
+        let mut parent_tx_prefix = String::new();
+        let has_parent_tx_param = method.params.iter().any(|p| p.name == "parentTx");
+        if has_parent_tx_param {
+            let parent_tx = provider.get_transaction(&current_utxo.txid)?;
+            let raw = parent_tx.raw.ok_or_else(|| {
+                "RunarContract.call: provider returned transaction without raw hex, needed for parentTx (InductiveSmartContract)".to_string()
+            })?;
+            parent_tx_prefix = encode_push_data(&raw);
+        }
+
+        let unlocking_script = format!("{}{}", parent_tx_prefix, self.build_unlocking_script(method_name, args)?);
 
         // Determine if this is a stateful call
         let is_stateful = self
