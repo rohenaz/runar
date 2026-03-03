@@ -357,6 +357,37 @@ await token.call('transfer', [sig, newOwner, amount, satoshis]);
 
 ---
 
+## Formal Verification
+
+The induction argument underlying `InductiveSmartContract` is simple enough to be machine-checked. The core theorem can be stated informally as:
+
+> **Theorem (Chain Integrity).** For any UTXO chain `Tx₀, Tx₁, …, Txₙ` where every transaction satisfies the inductive verification predicate, there exists no index `k` such that `Txₖ` has a different genesis outpoint than `Tx₀`.
+
+The proof follows directly from the two-branch structure of the verification logic:
+
+1. **Base case (genesis).** When `_genesisOutpoint` is the zero sentinel, the contract sets it to the current outpoint. This is the only point at which `_genesisOutpoint` is written. The sentinel value `0x00…00₃₆` is not a valid outpoint, so no real transaction can trigger the genesis branch after this point.
+
+2. **Inductive step (non-genesis).** The contract extracts the parent's `_genesisOutpoint` from its output script and asserts it equals the current transaction's `_genesisOutpoint`. If the parent was valid (by the inductive hypothesis), its genesis outpoint traces back to the true genesis. The equality assertion forces the current transaction to share that lineage.
+
+3. **Chain linking.** The grandparent consistency check (`parentParentOutpoint === _grandparentOutpoint`) prevents an attacker from splicing a valid suffix onto a forged prefix. Even if an attacker produces a parent with the correct genesis outpoint, the grandparent back-reference must also match — and that reference was set by the *genuine* chain, which the attacker cannot retroactively modify (Bitcoin transactions are immutable once confirmed).
+
+This argument has three assumptions that would need to be axiomatized in a formal proof:
+
+- **Hash collision resistance.** `hash256` (double SHA-256) is collision-resistant: no adversary can produce two distinct transactions with the same hash. This is the standard cryptographic assumption underlying all of Bitcoin.
+- **Preimage binding.** `checkPreimage` correctly binds the sighash preimage to the spending transaction. This is guaranteed by the BIP-143 sighash algorithm and OP_PUSH_TX.
+- **Script immutability.** The locking script (covenant) is identical across all UTXOs in the chain. This is enforced by the state continuation mechanism inherited from `StatefulSmartContract`, which hashes the output scripts and compares against `extractOutputHash`.
+
+Given these axioms, the proof is a straightforward structural induction on chain length. A Coq or Lean formalization would likely be under 200 lines, consisting of:
+
+- A record type for the UTXO state (genesis, parent, grandparent outpoints)
+- A predicate for the verification check (the if/else logic)
+- A transition function for the field updates
+- The induction theorem with a `nat_ind` proof term
+
+The simplicity of the invariant — "every transaction in the chain shares the same genesis outpoint, and the back-reference chain is consistent" — is by design. More complex verification schemes might offer additional guarantees, but they would sacrifice the ability to reason about correctness with confidence.
+
+---
+
 ## Limitations (V1)
 
 - **1-byte varint only**: The transaction parser handles inputs/outputs counts up to 252. Transactions with 253+ inputs or outputs are not supported. This covers 99%+ of real transactions.
