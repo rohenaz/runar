@@ -350,9 +350,9 @@ function parseTypeNode(
       const sizeText = typeArgs[1]!.getText().trim();
       const size = parseInt(sizeText, 10);
 
-      if (isNaN(size) || size < 0) {
+      if (isNaN(size) || size <= 0) {
         errors.push(makeDiagnostic(
-          `FixedArray size must be a non-negative integer literal, got '${sizeText}'`,
+          `FixedArray size must be a positive integer literal, got '${sizeText}'`,
           'error',
           locFromNode(typeArgs[1]!, file),
         ));
@@ -564,7 +564,7 @@ function parseExpressionStatement(
       };
       return {
         kind: 'assignment',
-        target: parseExpression(binExpr.getLeft(), file, errors),
+        target,
         value,
         sourceLocation: locFromNode(node, file),
       };

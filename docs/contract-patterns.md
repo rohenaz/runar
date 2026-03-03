@@ -304,11 +304,11 @@ A stateful auction where bidders can submit increasing bids, and the auctioneer 
 
 ```typescript
 import {
-  SmartContract, assert, PubKey, Sig, SigHashPreimage,
+  StatefulSmartContract, assert, PubKey, Sig, SigHashPreimage,
   checkSig, checkPreimage, hash256, extractOutputHash, extractLocktime
 } from 'runar-lang';
 
-class Auction extends SmartContract {
+class Auction extends StatefulSmartContract {
   readonly auctioneer: PubKey;
   highestBidder: PubKey;      // stateful
   highestBid: bigint;          // stateful

@@ -13,7 +13,9 @@ This document specifies the Administrative Normal Form (ANF) Intermediate Repres
 2. **Explicit**: All intermediate computations are named. There are no nested expressions.
 3. **Serializable**: The IR has a well-defined JSON serialization using RFC 8785 (JSON Canonicalization Scheme / JCS).
 4. **Flat**: Method bodies are flat lists of bindings -- no nested blocks except for `if` and `loop` nodes.
-5. **Typed**: Every binding carries its resolved type.
+5. **Typed** (planned): Per-binding type annotations are specified below but not yet emitted by the current compilers. The current IR omits the `type` field on bindings and uses `kind` as the value node discriminator instead of `tag`.
+
+> **Implementation note:** The current compiler output differs from this specification in two ways: (1) bindings do not carry a `type` field, and (2) the top-level `version` field is not emitted. The value node discriminator field is named `kind` in the actual output rather than `tag` as specified below. These discrepancies will be resolved as the specification and compilers converge.
 
 ---
 

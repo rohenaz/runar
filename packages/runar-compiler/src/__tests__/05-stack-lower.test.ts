@@ -758,4 +758,216 @@ describe('Pass 5: Stack Lower', () => {
       expect(opcodes).toContain('OP_ADD');
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Fix #1: extractOutputHash offset should be 40 not 44 (BIP-143)
+  // ---------------------------------------------------------------------------
+
+  describe('extractOutputHash BIP-143 offset (Fix #1)', () => {
+    it('uses offset 40 (not 44) for extractOutputHash', () => {
+      const source = `
+        class Counter extends StatefulSmartContract {
+          count: bigint;
+          constructor(count: bigint) { super(count); this.count = count; }
+          public increment(txPreimage: SigHashPreimage) {
+            const outputHash: Sha256 = extractOutputHash(txPreimage);
+            assert(true);
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'increment');
+      const allOps = flattenOps(method.ops);
+      // Find all push ops and check for 40n (correct) not 44n (wrong)
+      const pushValues = allOps.filter(o => o.op === 'push').map(o => (o as { value: unknown }).value);
+      expect(pushValues).toContain(40n);
+      expect(pushValues).not.toContain(44n);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix #7: collectRefs tracks @ref: variables
+  // ---------------------------------------------------------------------------
+
+  describe('collectRefs @ref: tracking (Fix #7)', () => {
+    it('does not crash when a variable is aliased via @ref: in ANF', () => {
+      // This tests that the stack lowerer properly handles @ref: aliases
+      // in use analysis (collectRefs). If @ref: was not tracked, the
+      // referenced variable might be consumed too early.
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(a: bigint) {
+            let b: bigint = a;
+            const c: bigint = b + 1n;
+            assert(c > 0n);
+          }
+        }
+      `;
+      // Should compile without errors (no stack underflow from missing ref tracking)
+      expect(() => compileToStack(source)).not.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix #6: len() must emit OP_NIP after OP_SIZE
+  // ---------------------------------------------------------------------------
+
+  describe('len() stack cleanup (Fix #6)', () => {
+    it('emits OP_NIP after OP_SIZE to remove the phantom original value', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(data: ByteString) {
+            const sz: bigint = len(data);
+            assert(sz > 0n);
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'm');
+      const allOps = flattenOps(method.ops);
+      const opcodes = allOps.filter(o => o.op === 'opcode').map(o => (o as { code: string }).code);
+      const allOpTypes = allOps.map(o => o.op);
+
+      expect(opcodes).toContain('OP_SIZE');
+      // OP_NIP must follow OP_SIZE to remove the original value
+      expect(allOpTypes).toContain('nip');
+
+      // Verify nip comes after OP_SIZE
+      const sizeIdx = allOps.findIndex(o => o.op === 'opcode' && (o as { code: string }).code === 'OP_SIZE');
+      const nipIdx = allOps.findIndex((o, i) => i > sizeIdx && o.op === 'nip');
+      expect(nipIdx).toBeGreaterThan(sizeIdx);
+    });
+
+    it('len() followed by more operations does not corrupt the stack', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(data: ByteString) {
+            const sz1: bigint = len(data);
+            const sz2: bigint = len(data);
+            assert(sz1 === sz2);
+          }
+        }
+      `;
+      // If len() leaked a phantom element, this would throw a stack error
+      expect(() => compileToStack(source)).not.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix #5: log2() uses bit-scanning (not byte-size approximation)
+  // ---------------------------------------------------------------------------
+
+  describe('log2() bit-scanning (Fix #5)', () => {
+    it('emits OP_RSHIFT and OP_GREATERTHAN for proper bit scanning', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(a: bigint) {
+            const bits: bigint = log2(a);
+            assert(bits > 0n);
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'm');
+      const allOps = flattenOps(method.ops);
+      const opcodes = allOps.filter(o => o.op === 'opcode').map(o => (o as { code: string }).code);
+
+      // The bit-scanning loop should use OP_RSHIFT and OP_GREATERTHAN
+      expect(opcodes).toContain('OP_RSHIFT');
+      expect(opcodes).toContain('OP_GREATERTHAN');
+      expect(opcodes).toContain('OP_1ADD');
+
+      // The old byte-size approximation used OP_SIZE and OP_MUL — those should NOT be present
+      // for the log2 computation itself
+      expect(opcodes).not.toContain('OP_MUL');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix #25: sqrt(0) division by zero guard
+  // ---------------------------------------------------------------------------
+
+  describe('sqrt(0) guard (Fix #25)', () => {
+    it('wraps Newton iteration in OP_DUP OP_IF guard', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(a: bigint) {
+            const r: bigint = sqrt(a);
+            assert(r >= 0n);
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'm');
+      const allOps = flattenOps(method.ops);
+
+      // The guard should emit OP_DUP followed by an if StackOp
+      const opcodes = allOps.filter(o => o.op === 'opcode').map(o => (o as { code: string }).code);
+      expect(opcodes).toContain('OP_DUP');
+
+      // An if block must be present (the guard)
+      const allOpTypes = allOps.map(o => o.op);
+      expect(allOpTypes).toContain('if');
+
+      // The Newton iteration (OP_DIV) should be INSIDE the if-branch only
+      const topLevelOpcodes = method.ops
+        .filter(o => o.op === 'opcode')
+        .map(o => (o as { code: string }).code);
+      expect(topLevelOpcodes).not.toContain('OP_DIV');
+    });
+
+    it('sqrt compiles without errors', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m(a: bigint) {
+            const r: bigint = sqrt(a);
+            assert(r >= 0n);
+          }
+        }
+      `;
+      expect(() => compileToStack(source)).not.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // reverseBytes uses OP_SPLIT/OP_CAT loop, not OP_REVERSE
+  // ---------------------------------------------------------------------------
+
+  describe('reverseBytes codegen', () => {
+    it('reverseBytes uses OP_SPLIT/OP_CAT loop, not OP_REVERSE', () => {
+      const source = `
+        class ReverseTest extends SmartContract {
+          readonly data: ByteString;
+          constructor(data: ByteString) { super(data); this.data = data; }
+          public check(expected: ByteString) {
+            const reversed: ByteString = reverseBytes(this.data);
+            assert(reversed === expected);
+          }
+        }
+      `;
+      const program = compileToStack(source);
+      const method = findStackMethod(program, 'check');
+      const allOps = flattenOps(method.ops);
+
+      const allOpsJson = JSON.stringify(allOps, (_k, v) =>
+        typeof v === 'bigint' ? v.toString() : v,
+      );
+      expect(allOpsJson).not.toContain('OP_REVERSE');
+      expect(allOpsJson).toContain('OP_SPLIT');
+      expect(allOpsJson).toContain('OP_CAT');
+      expect(allOpsJson).toContain('OP_SIZE');
+    });
+  });
 });

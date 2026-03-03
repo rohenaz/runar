@@ -104,7 +104,7 @@ export class TestContract {
    */
   static fromFile(filePath: string, initialState: Record<string, unknown> = {}): TestContract {
     const source = readFileSync(filePath, 'utf8');
-    return TestContract.fromSource(source, initialState);
+    return TestContract.fromSource(source, initialState, filePath);
   }
 
   /**

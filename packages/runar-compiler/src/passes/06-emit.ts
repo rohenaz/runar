@@ -113,7 +113,6 @@ export const OPCODES: Record<string, number> = {
   'OP_CHECKMULTISIG': 0xae,
   'OP_CHECKMULTISIGVERIFY': 0xaf,
   'OP_INVERT': 0x83,
-  'OP_REVERSE': 0xd1,
 };
 
 // ---------------------------------------------------------------------------

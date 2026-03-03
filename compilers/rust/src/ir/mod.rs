@@ -149,7 +149,7 @@ pub enum ANFValue {
 #[derive(Debug, Clone)]
 pub enum ConstValue {
     Bool(bool),
-    Int(i64),
+    Int(i128),
     Str(String),
 }
 
@@ -167,7 +167,16 @@ impl ANFValue {
 pub fn parse_const_value(v: &serde_json::Value) -> Option<ConstValue> {
     match v {
         serde_json::Value::Bool(b) => Some(ConstValue::Bool(*b)),
-        serde_json::Value::Number(n) => n.as_i64().map(ConstValue::Int),
+        serde_json::Value::Number(n) => {
+            // Try i64 first (covers most values), then fall back to f64 for larger numbers
+            if let Some(i) = n.as_i64() {
+                Some(ConstValue::Int(i as i128))
+            } else if let Some(f) = n.as_f64() {
+                Some(ConstValue::Int(f as i128))
+            } else {
+                None
+            }
+        }
         serde_json::Value::String(s) => Some(ConstValue::Str(s.clone())),
         _ => None,
     }

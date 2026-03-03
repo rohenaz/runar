@@ -1,21 +1,7 @@
 {
   "contractName": "BooleanLogic",
-  "properties": [
-    {
-      "name": "threshold",
-      "type": "bigint",
-      "readonly": true
-    }
-  ],
   "methods": [
     {
-      "name": "constructor",
-      "params": [
-        {
-          "name": "threshold",
-          "type": "bigint"
-        }
-      ],
       "body": [
         {
           "name": "t0",
@@ -27,11 +13,11 @@
         {
           "name": "t1",
           "value": {
-            "kind": "call",
-            "func": "super",
             "args": [
               "t0"
-            ]
+            ],
+            "func": "super",
+            "kind": "call"
           }
         },
         {
@@ -50,24 +36,16 @@
           }
         }
       ],
-      "isPublic": false
-    },
-    {
-      "name": "verify",
+      "isPublic": false,
+      "name": "constructor",
       "params": [
         {
-          "name": "a",
+          "name": "threshold",
           "type": "bigint"
-        },
-        {
-          "name": "b",
-          "type": "bigint"
-        },
-        {
-          "name": "flag",
-          "type": "boolean"
         }
-      ],
+      ]
+    },
+    {
       "body": [
         {
           "name": "t0",
@@ -87,8 +65,8 @@
           "name": "t2",
           "value": {
             "kind": "bin_op",
-            "op": ">",
             "left": "t0",
+            "op": ">",
             "right": "t1"
           }
         },
@@ -117,8 +95,8 @@
           "name": "t5",
           "value": {
             "kind": "bin_op",
-            "op": ">",
             "left": "t3",
+            "op": ">",
             "right": "t4"
           }
         },
@@ -133,8 +111,8 @@
           "name": "t6",
           "value": {
             "kind": "bin_op",
-            "op": "&&",
             "left": "aAboveThreshold",
+            "op": "&&",
             "right": "bAboveThreshold"
           }
         },
@@ -149,8 +127,8 @@
           "name": "t7",
           "value": {
             "kind": "bin_op",
-            "op": "||",
             "left": "aAboveThreshold",
+            "op": "||",
             "right": "bAboveThreshold"
           }
         },
@@ -187,8 +165,8 @@
           "name": "t10",
           "value": {
             "kind": "bin_op",
-            "op": "&&",
             "left": "eitherAbove",
+            "op": "&&",
             "right": "notFlag"
           }
         },
@@ -196,8 +174,8 @@
           "name": "t11",
           "value": {
             "kind": "bin_op",
-            "op": "||",
             "left": "bothAbove",
+            "op": "||",
             "right": "t10"
           }
         },
@@ -209,7 +187,29 @@
           }
         }
       ],
-      "isPublic": true
+      "isPublic": true,
+      "name": "verify",
+      "params": [
+        {
+          "name": "a",
+          "type": "bigint"
+        },
+        {
+          "name": "b",
+          "type": "bigint"
+        },
+        {
+          "name": "flag",
+          "type": "boolean"
+        }
+      ]
+    }
+  ],
+  "properties": [
+    {
+      "name": "threshold",
+      "readonly": true,
+      "type": "bigint"
     }
   ]
 }

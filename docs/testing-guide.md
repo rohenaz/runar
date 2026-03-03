@@ -13,31 +13,30 @@ Rúnar uses vitest as its test runner. Contract tests compile a `.runar.ts` file
 ```typescript
 import { describe, it, expect } from 'vitest';
 import {
-  TestSmartContract,
-  expectScriptSuccess,
-  expectScriptFailure,
+  TestContract,
 } from 'runar-testing';
-import artifact from '../artifacts/P2PKH.json';
+import { readFileSync } from 'fs';
+
+const source = readFileSync('contracts/P2PKH.runar.ts', 'utf8');
 
 describe('P2PKH', () => {
-  // Construct with the pubkey hash that was used at deploy time
   const pubKeyHash = '89abcdef01234567890abcdef01234567890abcd';
-  const contract = TestSmartContract.fromArtifact(artifact, [pubKeyHash]);
+  const contract = TestContract.fromSource(source, { pubKeyHash });
 
   it('succeeds with valid signature and matching pubkey', () => {
     const sig = '3044022...'; // valid DER signature hex
     const pubKey = '02abc...'; // matching compressed pubkey hex
 
-    const result = contract.call('unlock', [sig, pubKey]);
-    expectScriptSuccess(result);
+    const result = contract.call('unlock', { sig, pubKey });
+    expect(result.success).toBe(true);
   });
 
   it('fails with wrong pubkey', () => {
     const sig = '3044022...';
     const wrongPubKey = '03def...'; // different pubkey
 
-    const result = contract.call('unlock', [sig, wrongPubKey]);
-    expectScriptFailure(result);
+    const result = contract.call('unlock', { sig, pubKey: wrongPubKey });
+    expect(result.success).toBe(false);
   });
 });
 ```
@@ -57,76 +56,60 @@ pnpm test -- --watch
 
 ---
 
-## Using TestSmartContract
+## Using TestContract
 
-`TestSmartContract` is the primary test helper. It loads a compiled artifact and executes methods against the Script VM.
+`TestContract` is the primary test helper. It compiles a contract from source, uses the interpreter (not the VM) to execute methods with mocked crypto, and tracks state changes.
 
 ### Creating an Instance
 
 ```typescript
-import { TestSmartContract } from 'runar-testing';
+import { TestContract } from 'runar-testing';
 
-// From a JSON artifact object
-const contract = TestSmartContract.fromArtifact(artifact, constructorArgs);
+// From source code with initial state
+const contract = TestContract.fromSource(source, { count: 0n });
 
-// With VM options (e.g., enable debug logging)
-const contract = TestSmartContract.fromArtifact(artifact, constructorArgs, {
-  maxOps: 10000,    // maximum opcodes before timeout
-  debug: true,      // log each opcode execution
-});
+// Multi-format: pass fileName to select the parser
+const solContract = TestContract.fromSource(solSource, { count: 0n }, 'Counter.runar.sol');
+
+// From a file path
+const contract = TestContract.fromFile('contracts/Counter.runar.ts', { count: 0n });
 ```
 
-The `constructorArgs` array must match the artifact's ABI constructor parameters in order.
+The `initialState` is a `Record<string, unknown>` mapping property names to their initial values.
 
 ### Calling Methods
 
 ```typescript
-const result = contract.call('methodName', [arg1, arg2, arg3]);
+const result = contract.call('methodName', { arg1: value1, arg2: value2 });
 ```
 
-Arguments are encoded based on their ABI-declared types:
+Arguments are passed as a `Record<string, unknown>` with named keys matching the method parameter names:
 
-| ABI Type | Argument Format |
+| Rúnar Type | Argument Format |
 |----------|----------------|
 | `bigint` | `bigint` value (e.g., `42n`) |
 | `boolean` | `true` or `false` |
 | `PubKey`, `Sig`, `ByteString`, etc. | Hex-encoded string |
 
-The return value is a `VMResult` object:
+The return value is a `TestCallResult` object:
 
 ```typescript
-interface VMResult {
-  success: boolean;          // true if stack top is truthy
-  stack: Uint8Array[];       // final stack contents
-  error?: string;            // error message if script failed
-  opsExecuted: number;       // number of opcodes executed
+interface TestCallResult {
+  success: boolean;          // true if all assertions passed
+  error?: string;            // error message if a method assertion failed
+  outputs: OutputSnapshot[]; // outputs registered via addOutput (stateful contracts)
 }
 ```
 
-### Assertion Helpers
+### Reading State
+
+After calling a method, read the updated state:
 
 ```typescript
-import {
-  expectScriptSuccess,
-  expectScriptFailure,
-  expectStackTop,
-  expectStackTopNum,
-} from 'runar-testing';
-
-// Assert script execution succeeded
-expectScriptSuccess(result);
-
-// Assert script execution failed
-expectScriptFailure(result);
-
-// Assert the top of the stack equals specific bytes
-expectStackTop(result, new Uint8Array([0x01]));
-
-// Assert the top of the stack equals a specific number
-expectStackTopNum(result, 42n);
+const counter = TestContract.fromSource(source, { count: 0n });
+counter.call('increment');
+expect(counter.state.count).toBe(1n);
 ```
-
-Each helper throws a descriptive error on failure, including the actual stack contents and the number of opcodes executed.
 
 ---
 
@@ -201,7 +184,7 @@ const result = interpreter.evaluate('unlock', {
 
 ```typescript
 it('compiler and interpreter agree', () => {
-  const vmResult = contract.call('unlock', [sig, pubKey]);
+  const vmResult = contract.call('unlock', { sig, pubKey });
   const interpResult = interpreter.evaluate('unlock', { sig, pubKey });
 
   // Both should agree on success/failure
@@ -609,7 +592,7 @@ cargo test --test counter -- --nocapture  # Verbose output
 |--------|-----------|----|----|
 | **Test framework** | vitest | `testing.T` | `#[test]` |
 | **Failure assertion** | `expectScriptFailure(result)` | `defer/recover` | `#[should_panic]` |
-| **Contract loading** | `TestSmartContract.fromArtifact(artifact, args)` | Struct literal in same package | `#[path = "..."] mod contract;` |
+| **Contract loading** | `TestContract.fromSource(source, state)` | Struct literal in same package | `#[path = "..."] mod contract;` |
 | **Type imports** | `import { ... } from 'runar-testing'` | `import "runar"` | `use runar::prelude::*;` |
 | **Byte types** | Hex strings / `Uint8Array` | `string` (for `==`) | `Vec<u8>` (for `==` via `PartialEq`) |
 | **Scalar types** | `bigint` | `int64` aliases | `i64` aliases |
@@ -742,8 +725,8 @@ Each compiler pass has its own test file. Tests provide specific input IR, run t
 ```
 Pass 1 tests: source string      --> Rúnar AST assertions
 Pass 2 tests: Rúnar AST           --> validation error/success
-Pass 3 tests: Validated AST      --> type annotation assertions
-Pass 4 tests: Typed AST          --> ANF IR structural assertions
+Pass 3 tests: Validated AST      --> type error/success assertions
+Pass 4 tests: Validated AST      --> ANF IR structural assertions
 Pass 5 tests: ANF IR             --> Stack IR depth assertions
 Pass 6 tests: Stack IR           --> hex script assertions
 ```

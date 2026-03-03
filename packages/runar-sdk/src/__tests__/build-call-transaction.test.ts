@@ -473,3 +473,55 @@ describe('buildCallTransaction — stateless call', () => {
     expect(parsed.outputCount).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fix #18: P2PKH address should use Base58Check decoding, not deterministicHash20
+// ---------------------------------------------------------------------------
+
+describe('buildCallTransaction — P2PKH address decoding', () => {
+  it('builds correct P2PKH script from a Base58Check address', () => {
+    // Use a well-known Bitcoin address to verify proper decoding.
+    // Address 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2 has hash160:
+    // 77bff20c60e522dfaa3350c39b030a5d004e839a
+    // (This is a standard mainnet P2PKH address)
+    const knownAddress = '1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2';
+    const expectedHash160 = '77bff20c60e522dfaa3350c39b030a5d004e839a';
+
+    const utxo = makeUtxo(100000);
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '51',
+      undefined,
+      undefined,
+      knownAddress,
+    );
+
+    const parsed = parseTxHex(txHex);
+
+    // If there's a change output, check it contains the correct P2PKH script
+    if (parsed.outputCount > 0) {
+      const changeOutput = parsed.outputs[parsed.outputCount - 1]!;
+      // P2PKH script: 76a914 + <20-byte hash> + 88ac
+      const expectedScript = '76a914' + expectedHash160 + '88ac';
+      expect(changeOutput.script).toBe(expectedScript);
+    }
+  });
+
+  it('still accepts a raw 40-char hex hash directly', () => {
+    const rawHash = 'aabbccdd'.repeat(5); // 40 hex chars = 20 bytes
+    const utxo = makeUtxo(100000);
+    const { txHex } = buildCallTransaction(
+      utxo,
+      '51',
+      undefined,
+      undefined,
+      rawHash,
+    );
+    const parsed = parseTxHex(txHex);
+
+    if (parsed.outputCount > 0) {
+      const changeOutput = parsed.outputs[parsed.outputCount - 1]!;
+      expect(changeOutput.script).toBe('76a914' + rawHash + '88ac');
+    }
+  });
+});

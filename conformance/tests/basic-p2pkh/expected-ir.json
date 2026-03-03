@@ -1,21 +1,7 @@
 {
   "contractName": "P2PKH",
-  "properties": [
-    {
-      "name": "pubKeyHash",
-      "type": "Addr",
-      "readonly": true
-    }
-  ],
   "methods": [
     {
-      "name": "constructor",
-      "params": [
-        {
-          "name": "pubKeyHash",
-          "type": "Addr"
-        }
-      ],
       "body": [
         {
           "name": "t0",
@@ -27,11 +13,11 @@
         {
           "name": "t1",
           "value": {
-            "kind": "call",
-            "func": "super",
             "args": [
               "t0"
-            ]
+            ],
+            "func": "super",
+            "kind": "call"
           }
         },
         {
@@ -50,20 +36,16 @@
           }
         }
       ],
-      "isPublic": false
-    },
-    {
-      "name": "unlock",
+      "isPublic": false,
+      "name": "constructor",
       "params": [
         {
-          "name": "sig",
-          "type": "Sig"
-        },
-        {
-          "name": "pubKey",
-          "type": "PubKey"
+          "name": "pubKeyHash",
+          "type": "Addr"
         }
-      ],
+      ]
+    },
+    {
       "body": [
         {
           "name": "t0",
@@ -75,11 +57,11 @@
         {
           "name": "t1",
           "value": {
-            "kind": "call",
-            "func": "hash160",
             "args": [
               "t0"
-            ]
+            ],
+            "func": "hash160",
+            "kind": "call"
           }
         },
         {
@@ -93,10 +75,10 @@
           "name": "t3",
           "value": {
             "kind": "bin_op",
-            "op": "===",
             "left": "t1",
-            "right": "t2",
-            "result_type": "bytes"
+            "op": "===",
+            "result_type": "bytes",
+            "right": "t2"
           }
         },
         {
@@ -123,12 +105,12 @@
         {
           "name": "t7",
           "value": {
-            "kind": "call",
-            "func": "checkSig",
             "args": [
               "t5",
               "t6"
-            ]
+            ],
+            "func": "checkSig",
+            "kind": "call"
           }
         },
         {
@@ -139,7 +121,25 @@
           }
         }
       ],
-      "isPublic": true
+      "isPublic": true,
+      "name": "unlock",
+      "params": [
+        {
+          "name": "sig",
+          "type": "Sig"
+        },
+        {
+          "name": "pubKey",
+          "type": "PubKey"
+        }
+      ]
+    }
+  ],
+  "properties": [
+    {
+      "name": "pubKeyHash",
+      "readonly": true,
+      "type": "Addr"
     }
   ]
 }

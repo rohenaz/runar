@@ -111,6 +111,26 @@ func slhADRS18(opts slhADRSOpts) []byte {
 	return full[:18]
 }
 
+// emitReverseN generates an unrolled fixed-length byte reversal for n bytes.
+// Uses (n-1) split-swap-cat operations. Only valid when n is known at compile time.
+func emitReverseN(n int) []StackOp {
+	if n <= 1 {
+		return nil
+	}
+	ops := make([]StackOp, 0, 4*(n-1))
+	// Phase 1: split into n individual bytes
+	for i := 0; i < n-1; i++ {
+		ops = append(ops, StackOp{Op: "push", Value: bigIntPush(1)})
+		ops = append(ops, StackOp{Op: "opcode", Code: "OP_SPLIT"})
+	}
+	// Phase 2: concatenate in reverse order
+	for i := 0; i < n-1; i++ {
+		ops = append(ops, StackOp{Op: "swap"})
+		ops = append(ops, StackOp{Op: "opcode", Code: "OP_CAT"})
+	}
+	return ops
+}
+
 // ===========================================================================
 // 3. SLH Stack Tracker
 // ===========================================================================
@@ -384,7 +404,7 @@ func slhChainStepThen(adrsPrefix []byte, n int) []StackOp {
 	// Convert copy to 4-byte big-endian
 	ops = append(ops, StackOp{Op: "push", Value: bigIntPush(4)})
 	ops = append(ops, StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
-	ops = append(ops, StackOp{Op: "opcode", Code: "OP_REVERSE"})
+	ops = append(ops, emitReverseN(4)...)
 	// Build ADRS = prefix(18) || hashAddrBE(4)
 	ops = append(ops, StackOp{Op: "push", Value: PushValue{Kind: "bytes", Bytes: adrsPrefix}})
 	ops = append(ops, StackOp{Op: "swap"})
@@ -758,7 +778,9 @@ func emitSLHFors(emit func(StackOp), p SLHCodegenParams) {
 		emit(StackOp{Op: "opcode", Code: "OP_SPLIT"})
 		emit(StackOp{Op: "drop"})
 		if take > 1 {
-			emit(StackOp{Op: "opcode", Code: "OP_REVERSE"})
+			for _, op := range emitReverseN(take) {
+				emit(op)
+			}
 		}
 		emit(StackOp{Op: "push", Value: bigIntPush(0)})
 		emit(StackOp{Op: "push", Value: bigIntPush(1)})
@@ -1020,7 +1042,9 @@ func EmitVerifySLHDSA(emit func(StackOp), paramKey string) {
 	t.toTop("_treeBytes")
 	t.rawBlock([]string{"_treeBytes"}, "treeIdx", func(e func(StackOp)) {
 		if treeIdxLen > 1 {
-			e(StackOp{Op: "opcode", Code: "OP_REVERSE"})
+			for _, op := range emitReverseN(treeIdxLen) {
+				e(op)
+			}
 		}
 		e(StackOp{Op: "push", Value: bigIntPush(0)})
 		e(StackOp{Op: "push", Value: bigIntPush(1)})
@@ -1036,7 +1060,9 @@ func EmitVerifySLHDSA(emit func(StackOp), paramKey string) {
 	t.toTop("_leafBytes")
 	t.rawBlock([]string{"_leafBytes"}, "leafIdx", func(e func(StackOp)) {
 		if leafIdxLen > 1 {
-			e(StackOp{Op: "opcode", Code: "OP_REVERSE"})
+			for _, op := range emitReverseN(leafIdxLen) {
+				e(op)
+			}
 		}
 		e(StackOp{Op: "push", Value: bigIntPush(0)})
 		e(StackOp{Op: "push", Value: bigIntPush(1)})

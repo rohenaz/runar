@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { RunarInterpreter } from '../interpreter/index.js';
-import type { ContractNode, MethodNode, Statement, Expression } from 'runar-ir-schema';
+import type { ContractNode, MethodNode, Statement, Expression, BinaryOp } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
 // Helpers to build AST nodes
@@ -18,11 +18,12 @@ function boolLit(value: boolean): Expression {
   return { kind: 'bool_literal', value };
 }
 
+
 function ident(name: string): Expression {
   return { kind: 'identifier', name };
 }
 
-function binaryExpr(op: '+' | '-' | '*' | '/' | '===' | '!==', left: Expression, right: Expression): Expression {
+function binaryExpr(op: BinaryOp, left: Expression, right: Expression): Expression {
   return { kind: 'binary_expr', op, left, right };
 }
 
@@ -313,6 +314,117 @@ describe('RunarInterpreter: built-in functions', () => {
     expect(result.returnValue?.kind).toBe('bytes');
     if (result.returnValue?.kind === 'bytes') {
       expect(result.returnValue.value.length).toBe(20);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix #4: split() should return the right part (top of stack after OP_SPLIT)
+// ---------------------------------------------------------------------------
+
+describe('RunarInterpreter: split returns right part', () => {
+  it('split(data, 2) returns the right part of the byte string', () => {
+    // split(data, index) should return data[index..] (right part)
+    // because OP_SPLIT pushes [left, right] and the compiler binds the
+    // top-of-stack (right) as the result
+    const method = makeMethod('doSplit', [
+      { name: 'data', type: 'bytes' },
+    ], [
+      returnStmt(callExpr('split', [ident('data'), bigintLit(2n)])),
+    ]);
+
+    const contract = makeContract([method]);
+    const interp = new RunarInterpreter({});
+    const result = interp.executeMethod(contract, 'doSplit', {
+      data: { kind: 'bytes', value: new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd]) },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.returnValue?.kind).toBe('bytes');
+    if (result.returnValue?.kind === 'bytes') {
+      // Right part: bytes after index 2 → [0xcc, 0xdd]
+      expect(result.returnValue.value).toEqual(new Uint8Array([0xcc, 0xdd]));
+    }
+  });
+
+  it('split(data, 0) returns the entire byte string (right part is everything)', () => {
+    const method = makeMethod('doSplit', [
+      { name: 'data', type: 'bytes' },
+    ], [
+      returnStmt(callExpr('split', [ident('data'), bigintLit(0n)])),
+    ]);
+
+    const contract = makeContract([method]);
+    const interp = new RunarInterpreter({});
+    const result = interp.executeMethod(contract, 'doSplit', {
+      data: { kind: 'bytes', value: new Uint8Array([0x01, 0x02, 0x03]) },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.returnValue?.kind === 'bytes') {
+      expect(result.returnValue.value).toEqual(new Uint8Array([0x01, 0x02, 0x03]));
+    }
+  });
+
+  it('split(data, len) returns empty bytes (right part is empty)', () => {
+    const method = makeMethod('doSplit', [
+      { name: 'data', type: 'bytes' },
+    ], [
+      returnStmt(callExpr('split', [ident('data'), bigintLit(3n)])),
+    ]);
+
+    const contract = makeContract([method]);
+    const interp = new RunarInterpreter({});
+    const result = interp.executeMethod(contract, 'doSplit', {
+      data: { kind: 'bytes', value: new Uint8Array([0x01, 0x02, 0x03]) },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.returnValue?.kind === 'bytes') {
+      expect(result.returnValue.value).toEqual(new Uint8Array([]));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix #9: TestContract.fromFile should pass fileName to fromSource
+// ---------------------------------------------------------------------------
+
+import { TestContract } from '../test-contract.js';
+import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+describe('TestContract.fromFile passes fileName for format detection', () => {
+  it('fromFile with .runar.sol file uses the Solidity parser', () => {
+    // Create a temp Solidity contract file
+    const tmpDir = mkdtempSync(join(tmpdir(), 'runar-test-'));
+    const solSource = `pragma runar ^0.1.0;
+
+contract SimpleCounter is StatefulSmartContract {
+    bigint count;
+
+    constructor(bigint _count) {
+        count = _count;
+    }
+
+    function increment() public {
+        this.count++;
+    }
+}
+`;
+    const filePath = join(tmpDir, 'SimpleCounter.runar.sol');
+    writeFileSync(filePath, solSource, 'utf8');
+
+    try {
+      // This should NOT throw. Without the fix, it would try to parse
+      // as TypeScript (default) and fail because it's Solidity syntax.
+      const contract = TestContract.fromFile(filePath, { count: 0n });
+      const result = contract.call('increment');
+      expect(result.success).toBe(true);
+      expect(contract.state.count).toBe(1n);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

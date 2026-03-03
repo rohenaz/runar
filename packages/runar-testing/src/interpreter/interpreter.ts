@@ -704,13 +704,12 @@ export class RunarInterpreter {
       }
 
       case 'split': {
-        // Returns two values — for now return the left part.
-        // In practice, this would return a tuple. We can handle it specially.
+        // OP_SPLIT pushes [left, right] on the stack. The compiler's
+        // stack-lower.ts binds the top-of-stack (right part) as the
+        // result. The interpreter must match this convention.
         const data = this.toBytes(args[0]!);
         const index = this.toBigInt(args[1]!);
-        // Since our type system doesn't support tuples directly, this is
-        // best handled by the caller destructuring. For now, return left.
-        return { kind: 'bytes', value: data.slice(0, Number(index)) };
+        return { kind: 'bytes', value: data.slice(Number(index)) };
       }
 
       case 'reverseBytes': {
