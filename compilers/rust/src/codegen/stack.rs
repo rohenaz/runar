@@ -54,7 +54,7 @@ pub enum StackOp {
 #[derive(Debug, Clone)]
 pub enum PushValue {
     Bool(bool),
-    Int(i64),
+    Int(i128),
     Bytes(Vec<u8>),
 }
 
@@ -90,6 +90,7 @@ fn builtin_opcodes(name: &str) -> Option<Vec<&'static str>> {
         "left" => Some(vec!["OP_SPLIT", "OP_DROP"]),
         "int2str" => Some(vec!["OP_NUM2BIN"]),
         "bool" => Some(vec!["OP_0NOTEQUAL"]),
+        "unpack" => Some(vec!["OP_BIN2NUM"]),
         _ => None,
     }
 }
@@ -345,7 +346,7 @@ impl LoweringContext {
                 let removed = self.sm.remove_at_depth(2);
                 self.sm.push(&removed);
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(depth as i64)));
+                self.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
                 self.sm.push(""); // temporary depth literal
                 self.emit_op(StackOp::Roll { depth });
                 self.sm.pop(); // remove depth literal
@@ -358,7 +359,7 @@ impl LoweringContext {
                 let picked = self.sm.peek_at_depth(1).to_string();
                 self.sm.push(&picked);
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(depth as i64)));
+                self.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
                 self.sm.push(""); // temporary
                 self.emit_op(StackOp::Pick { depth });
                 self.sm.pop(); // remove depth literal
@@ -377,25 +378,37 @@ impl LoweringContext {
     fn lower_bindings(&mut self, bindings: &[ANFBinding], terminal_assert: bool) {
         let last_uses = compute_last_uses(bindings);
 
-        // Find the index of the last assert binding (if terminal_assert is set)
-        let last_assert_idx: isize = if terminal_assert {
-            let mut idx: isize = -1;
-            for i in (0..bindings.len()).rev() {
-                if matches!(&bindings[i].value, ANFValue::Assert { .. }) {
-                    idx = i as isize;
-                    break;
+        // Find the terminal binding index (if terminal_assert is set).
+        // If the last binding is an 'if' whose branches end in asserts,
+        // that 'if' is the terminal point (not an earlier standalone assert).
+        let mut last_assert_idx: isize = -1;
+        let mut terminal_if_idx: isize = -1;
+        if terminal_assert {
+            let last_binding = bindings.last();
+            if let Some(b) = last_binding {
+                if matches!(&b.value, ANFValue::If { .. }) {
+                    terminal_if_idx = (bindings.len() - 1) as isize;
+                } else {
+                    for i in (0..bindings.len()).rev() {
+                        if matches!(&bindings[i].value, ANFValue::Assert { .. }) {
+                            last_assert_idx = i as isize;
+                            break;
+                        }
+                    }
                 }
             }
-            idx
-        } else {
-            -1
-        };
+        }
 
         for (i, binding) in bindings.iter().enumerate() {
             if matches!(&binding.value, ANFValue::Assert { .. }) && i as isize == last_assert_idx {
                 // Terminal assert: leave value on stack instead of OP_VERIFY
                 if let ANFValue::Assert { value } = &binding.value {
                     self.lower_assert(value, i, &last_uses, true);
+                }
+            } else if matches!(&binding.value, ANFValue::If { .. }) && i as isize == terminal_if_idx {
+                // Terminal if: propagate terminalAssert into both branches
+                if let ANFValue::If { cond, then, else_branch } = &binding.value {
+                    self.lower_if(&binding.name, cond, then, else_branch, i, &last_uses, true);
                 }
             } else {
                 self.lower_binding(binding, i, &last_uses);
@@ -450,7 +463,7 @@ impl LoweringContext {
                 then,
                 else_branch,
             } => {
-                self.lower_if(name, cond, then, else_branch, binding_index, last_uses);
+                self.lower_if(name, cond, then, else_branch, binding_index, last_uses, false);
             }
             ANFValue::Loop {
                 count,
@@ -548,7 +561,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Push(PushValue::Bool(*b)));
             }
             serde_json::Value::Number(n) => {
-                let i = n.as_i64().unwrap_or(0);
+                let i = n.as_i64().map(|v| v as i128).unwrap_or(0);
                 self.emit_op(StackOp::Push(PushValue::Int(i)));
             }
             serde_json::Value::String(s) => {
@@ -783,6 +796,18 @@ impl LoweringContext {
             return;
         }
 
+        // pack and toByteString are no-ops: the value is already on the stack in
+        // the correct representation. We just consume the arg and rename.
+        if func_name == "pack" || func_name == "toByteString" {
+            if !args.is_empty() {
+                let is_last = self.is_last_use(&args[0], binding_index, last_uses);
+                self.bring_to_top(&args[0], is_last);
+                self.sm.pop();
+            }
+            self.sm.push(binding_name);
+            return;
+        }
+
         // Preimage field extractors — each needs a custom OP_SPLIT sequence
         // because OP_SPLIT produces two stack values and the intermediate stack
         // management cannot be expressed in the simple builtin_opcodes table.
@@ -895,6 +920,7 @@ impl LoweringContext {
         else_bindings: &[ANFBinding],
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
+        terminal_assert: bool,
     ) {
         let is_last = self.is_last_use(cond, binding_index, last_uses);
         self.bring_to_top(cond, is_last);
@@ -903,13 +929,13 @@ impl LoweringContext {
         // Lower then-branch
         let mut then_ctx = LoweringContext::new(&[], &self.properties);
         then_ctx.sm = self.sm.clone();
-        then_ctx.lower_bindings(then_bindings, false);
+        then_ctx.lower_bindings(then_bindings, terminal_assert);
         let then_ops = then_ctx.ops;
 
         // Lower else-branch
         let mut else_ctx = LoweringContext::new(&[], &self.properties);
         else_ctx.sm = self.sm.clone();
-        else_ctx.lower_bindings(else_bindings, false);
+        else_ctx.lower_bindings(else_bindings, terminal_assert);
         let else_ops = else_ctx.ops;
 
         self.emit_op(StackOp::If {
@@ -951,7 +977,7 @@ impl LoweringContext {
         }
 
         for i in 0..count {
-            self.emit_op(StackOp::Push(PushValue::Int(i as i64)));
+            self.emit_op(StackOp::Push(PushValue::Int(i as i128)));
             self.sm.push(iter_var);
 
             let mut last_uses = compute_last_uses(body);
@@ -966,6 +992,16 @@ impl LoweringContext {
 
             for (j, binding) in body.iter().enumerate() {
                 self.lower_binding(binding, j, &last_uses);
+            }
+
+            // Clean up the iteration variable if it was not consumed by the body.
+            // The body may not reference iter_var at all, leaving it on the stack.
+            if self.sm.has(iter_var) {
+                let depth = self.sm.find_depth(iter_var);
+                if let Some(0) = depth {
+                    self.emit_op(StackOp::Drop);
+                    self.sm.pop();
+                }
             }
         }
         self.sm.push(binding_name);
@@ -1362,11 +1398,11 @@ impl LoweringContext {
             }
             "extractOutputHash" | "extractOutputs" => {
                 // End-relative: 32 bytes before the last 8 (nLocktime 4 + sighashType 4).
-                // <preimage> OP_SIZE 44 OP_SUB OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
+                // <preimage> OP_SIZE 40 OP_SUB OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(44)));
+                self.emit_op(StackOp::Push(PushValue::Int(40)));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -1595,10 +1631,36 @@ impl LoweringContext {
         let is_last = self.is_last_use(&args[0], binding_index, last_uses);
         self.bring_to_top(&args[0], is_last);
 
-        // BSV Genesis protocol provides OP_REVERSE (0xd1) for byte string reversal.
-        // This is the most efficient implementation and handles any input length.
+        // Variable-length byte reversal using bounded unrolled loop.
+        // Each iteration peels off the first byte and prepends it to the result.
+        // 520 iterations covers the maximum BSV element size.
         self.sm.pop();
-        self.emit_op(StackOp::Opcode("OP_REVERSE".to_string()));
+
+        // Push empty result (OP_0), swap so data is on top
+        self.emit_op(StackOp::Push(PushValue::Int(0)));
+        self.emit_op(StackOp::Swap);
+
+        // 520 iterations (max BSV element size)
+        for _ in 0..520 {
+            // Stack: [result, data]
+            self.emit_op(StackOp::Opcode("OP_DUP".to_string()));
+            self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
+            self.emit_op(StackOp::Nip);
+            self.emit_op(StackOp::If {
+                then_ops: vec![
+                    StackOp::Push(PushValue::Int(1)),
+                    StackOp::Opcode("OP_SPLIT".to_string()),
+                    StackOp::Swap,
+                    StackOp::Rot,
+                    StackOp::Opcode("OP_CAT".to_string()),
+                    StackOp::Swap,
+                ],
+                else_ops: vec![],
+            });
+        }
+
+        // Drop empty remainder
+        self.emit_op(StackOp::Drop);
 
         self.sm.push(binding_name);
         self.track_depth();
@@ -2165,6 +2227,7 @@ impl LoweringContext {
 
     /// sqrt(n): integer square root via Newton's method, 16 iterations.
     /// Uses: guess = n, then 16x: guess = (guess + n/guess) / 2
+    /// Guards against n == 0 to avoid division by zero.
     fn lower_sqrt(
         &mut self,
         binding_name: &str,
@@ -2180,24 +2243,36 @@ impl LoweringContext {
         self.sm.pop();
 
         // Stack: n
-        // DUP to get initial guess = n
+        // Guard: if n == 0, skip Newton iteration entirely (result is 0).
         self.emit_op(StackOp::Opcode("OP_DUP".to_string()));
+        // Stack: n n
+
+        // Build the Newton iteration ops inside the OP_IF branch
+        let mut newton_ops = Vec::new();
+        // Stack inside IF: n  (the DUP'd copy was consumed by OP_IF)
+        // DUP to get initial guess = n
+        newton_ops.push(StackOp::Opcode("OP_DUP".to_string()));
         // Stack: n guess
 
         // 16 iterations of Newton's method: guess = (guess + n/guess) / 2
         for _ in 0..16 {
             // Stack: n guess
-            self.emit_op(StackOp::Over);                               // n guess n
-            self.emit_op(StackOp::Over);                               // n guess n guess
-            self.emit_op(StackOp::Opcode("OP_DIV".to_string()));      // n guess (n/guess)
-            self.emit_op(StackOp::Opcode("OP_ADD".to_string()));      // n (guess + n/guess)
-            self.emit_op(StackOp::Push(PushValue::Int(2)));            // n (guess + n/guess) 2
-            self.emit_op(StackOp::Opcode("OP_DIV".to_string()));      // n new_guess
+            newton_ops.push(StackOp::Over);                               // n guess n
+            newton_ops.push(StackOp::Over);                               // n guess n guess
+            newton_ops.push(StackOp::Opcode("OP_DIV".to_string()));      // n guess (n/guess)
+            newton_ops.push(StackOp::Opcode("OP_ADD".to_string()));      // n (guess + n/guess)
+            newton_ops.push(StackOp::Push(PushValue::Int(2)));            // n (guess + n/guess) 2
+            newton_ops.push(StackOp::Opcode("OP_DIV".to_string()));      // n new_guess
         }
 
         // Stack: n guess
         // Drop n, keep guess
-        self.emit_op(StackOp::Opcode("OP_NIP".to_string()));
+        newton_ops.push(StackOp::Opcode("OP_NIP".to_string()));
+
+        self.emit_op(StackOp::If {
+            then_ops: newton_ops,
+            else_ops: vec![],  // n == 0, result is already 0 on stack
+        });
 
         self.sm.push(binding_name);
         self.track_depth();
@@ -2294,8 +2369,15 @@ impl LoweringContext {
         self.track_depth();
     }
 
-    /// log2(n): approximate log2 using byte size.
-    /// Stack: n -> OP_SIZE OP_NIP 8 OP_MUL 8 OP_SUB -> result
+    /// log2(n): exact floor(log2(n)) via bit-scanning.
+    ///
+    /// Uses a bounded unrolled loop (64 iterations for bigint range):
+    ///   counter = 0
+    ///   while input > 1: input >>= 1, counter++
+    ///   result = counter
+    ///
+    /// Stack layout during loop: <input> <counter>
+    /// Each iteration: OP_SWAP OP_DUP 1 OP_GREATERTHAN OP_IF 1 OP_RSHIFT OP_SWAP OP_1ADD OP_SWAP OP_ENDIF OP_SWAP
     fn lower_log2(
         &mut self,
         binding_name: &str,
@@ -2310,13 +2392,35 @@ impl LoweringContext {
 
         self.sm.pop();
 
-        // Stack: n
-        self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));         // n size
-        self.emit_op(StackOp::Nip);                                    // size
-        self.emit_op(StackOp::Push(PushValue::Int(8)));                // size 8
-        self.emit_op(StackOp::Opcode("OP_MUL".to_string()));          // size*8
-        self.emit_op(StackOp::Push(PushValue::Int(8)));                // size*8 8
-        self.emit_op(StackOp::Opcode("OP_SUB".to_string()));          // size*8 - 8
+        // Stack: <n>
+        // Push counter = 0
+        self.emit_op(StackOp::Push(PushValue::Int(0))); // n 0
+
+        // 64 iterations (sufficient for Bitcoin Script bigint range)
+        const LOG2_ITERATIONS: usize = 64;
+        for _ in 0..LOG2_ITERATIONS {
+            // Stack: input counter
+            self.emit_op(StackOp::Swap);                                     // counter input
+            self.emit_op(StackOp::Opcode("OP_DUP".to_string()));            // counter input input
+            self.emit_op(StackOp::Push(PushValue::Int(1)));                  // counter input input 1
+            self.emit_op(StackOp::Opcode("OP_GREATERTHAN".to_string()));     // counter input (input>1)
+            self.emit_op(StackOp::If {
+                then_ops: vec![
+                    StackOp::Push(PushValue::Int(1)),                        // counter input 1
+                    StackOp::Opcode("OP_RSHIFT".to_string()),                // counter (input>>1)
+                    StackOp::Swap,                                           // (input>>1) counter
+                    StackOp::Opcode("OP_1ADD".to_string()),                  // (input>>1) (counter+1)
+                    StackOp::Swap,                                           // (counter+1) (input>>1)
+                ],
+                else_ops: vec![],
+            });
+            // Stack: counter input (or input counter if swapped back)
+            // After the if: stack is counter input (swap at start, then if-branch swaps back)
+            self.emit_op(StackOp::Swap);                                     // input counter
+        }
+        // Stack: input counter
+        // Drop input, keep counter
+        self.emit_op(StackOp::Nip); // counter
 
         self.sm.push(binding_name);
         self.track_depth();
@@ -2611,6 +2715,704 @@ mod tests {
             methods[0].max_stack_depth <= 10,
             "max_stack_depth should be reasonable for P2PKH, got: {}",
             methods[0].max_stack_depth
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: collect all opcodes from a StackOp list (including inside If)
+    // -----------------------------------------------------------------------
+
+    fn collect_all_opcodes(ops: &[StackOp]) -> Vec<String> {
+        let mut result = Vec::new();
+        for op in ops {
+            match op {
+                StackOp::Opcode(code) => result.push(code.clone()),
+                StackOp::If { then_ops, else_ops } => {
+                    result.push("OP_IF".to_string());
+                    result.extend(collect_all_opcodes(then_ops));
+                    result.push("OP_ELSE".to_string());
+                    result.extend(collect_all_opcodes(else_ops));
+                    result.push("OP_ENDIF".to_string());
+                }
+                StackOp::Push(PushValue::Int(n)) => {
+                    result.push(format!("PUSH({})", n));
+                }
+                StackOp::Drop => result.push("OP_DROP".to_string()),
+                StackOp::Swap => result.push("OP_SWAP".to_string()),
+                StackOp::Dup => result.push("OP_DUP".to_string()),
+                StackOp::Over => result.push("OP_OVER".to_string()),
+                StackOp::Rot => result.push("OP_ROT".to_string()),
+                StackOp::Nip => result.push("OP_NIP".to_string()),
+                _ => {}
+            }
+        }
+        result
+    }
+
+    fn collect_opcodes_in_if_branches(ops: &[StackOp]) -> (Vec<String>, Vec<String>) {
+        for op in ops {
+            if let StackOp::If { then_ops, else_ops } = op {
+                return (collect_all_opcodes(then_ops), collect_all_opcodes(else_ops));
+            }
+        }
+        (vec![], vec![])
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix #1: extractOutputHash offset must be 40, not 44
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_output_hash_uses_offset_40() {
+        // Build a stateful contract that calls extractOutputHash on a preimage
+        let program = ANFProgram {
+            contract_name: "TestExtract".to_string(),
+            properties: vec![ANFProperty {
+                name: "val".to_string(),
+                prop_type: "bigint".to_string(),
+                readonly: false,
+                initial_value: Some(serde_json::Value::Number(serde_json::Number::from(0))),
+            }],
+            methods: vec![ANFMethod {
+                name: "check".to_string(),
+                params: vec![
+                    ANFParam { name: "preimage".to_string(), param_type: "SigHashPreimage".to_string() },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam { name: "preimage".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t1".to_string(),
+                        value: ANFValue::Call {
+                            func: "extractOutputHash".to_string(),
+                            args: vec!["t0".to_string()],
+                        },
+                    },
+                    ANFBinding {
+                        name: "t2".to_string(),
+                        value: ANFValue::LoadConst { value: serde_json::Value::Bool(true) },
+                    },
+                    ANFBinding {
+                        name: "t3".to_string(),
+                        value: ANFValue::Assert { value: "t2".to_string() },
+                    },
+                ],
+                is_public: true,
+            }],
+        };
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        let opcodes = collect_all_opcodes(&methods[0].ops);
+
+        // The offset 40 should appear as PUSH(40), not PUSH(44)
+        assert!(
+            opcodes.contains(&"PUSH(40)".to_string()),
+            "extractOutputHash should use offset 40 (BIP-143 hashOutputs starts at size-40), ops: {:?}",
+            opcodes
+        );
+        assert!(
+            !opcodes.contains(&"PUSH(44)".to_string()),
+            "extractOutputHash should NOT use offset 44, ops: {:?}",
+            opcodes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix #3: Terminal-if propagation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_terminal_if_propagates_terminal_assert() {
+        // A public method ending with if/else where both branches have asserts.
+        // The terminal asserts in both branches should NOT emit OP_VERIFY.
+        let program = ANFProgram {
+            contract_name: "TerminalIf".to_string(),
+            properties: vec![],
+            methods: vec![ANFMethod {
+                name: "check".to_string(),
+                params: vec![
+                    ANFParam { name: "mode".to_string(), param_type: "boolean".to_string() },
+                    ANFParam { name: "x".to_string(), param_type: "bigint".to_string() },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam { name: "mode".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t1".to_string(),
+                        value: ANFValue::LoadParam { name: "x".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t2".to_string(),
+                        value: ANFValue::If {
+                            cond: "t0".to_string(),
+                            then: vec![
+                                ANFBinding {
+                                    name: "t3".to_string(),
+                                    value: ANFValue::LoadConst {
+                                        value: serde_json::Value::Number(serde_json::Number::from(10)),
+                                    },
+                                },
+                                ANFBinding {
+                                    name: "t4".to_string(),
+                                    value: ANFValue::BinOp {
+                                        op: ">".to_string(),
+                                        left: "t1".to_string(),
+                                        right: "t3".to_string(),
+                                        result_type: None,
+                                    },
+                                },
+                                ANFBinding {
+                                    name: "t5".to_string(),
+                                    value: ANFValue::Assert { value: "t4".to_string() },
+                                },
+                            ],
+                            else_branch: vec![
+                                ANFBinding {
+                                    name: "t6".to_string(),
+                                    value: ANFValue::LoadConst {
+                                        value: serde_json::Value::Number(serde_json::Number::from(5)),
+                                    },
+                                },
+                                ANFBinding {
+                                    name: "t7".to_string(),
+                                    value: ANFValue::BinOp {
+                                        op: ">".to_string(),
+                                        left: "t1".to_string(),
+                                        right: "t6".to_string(),
+                                        result_type: None,
+                                    },
+                                },
+                                ANFBinding {
+                                    name: "t8".to_string(),
+                                    value: ANFValue::Assert { value: "t7".to_string() },
+                                },
+                            ],
+                        },
+                    },
+                ],
+                is_public: true,
+            }],
+        };
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+
+        // Get the opcodes inside the if branches
+        let (then_opcodes, else_opcodes) = collect_opcodes_in_if_branches(&methods[0].ops);
+
+        // Neither branch should contain OP_VERIFY — the asserts are terminal
+        assert!(
+            !then_opcodes.contains(&"OP_VERIFY".to_string()),
+            "then branch should not contain OP_VERIFY (terminal assert), got: {:?}",
+            then_opcodes
+        );
+        assert!(
+            !else_opcodes.contains(&"OP_VERIFY".to_string()),
+            "else branch should not contain OP_VERIFY (terminal assert), got: {:?}",
+            else_opcodes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix #8: pack/unpack/toByteString builtins
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unpack_emits_bin2num() {
+        let program = ANFProgram {
+            contract_name: "TestUnpack".to_string(),
+            properties: vec![],
+            methods: vec![ANFMethod {
+                name: "check".to_string(),
+                params: vec![
+                    ANFParam { name: "data".to_string(), param_type: "ByteString".to_string() },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam { name: "data".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t1".to_string(),
+                        value: ANFValue::Call {
+                            func: "unpack".to_string(),
+                            args: vec!["t0".to_string()],
+                        },
+                    },
+                    ANFBinding {
+                        name: "t2".to_string(),
+                        value: ANFValue::LoadConst {
+                            value: serde_json::Value::Number(serde_json::Number::from(42)),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t3".to_string(),
+                        value: ANFValue::BinOp {
+                            op: "===".to_string(),
+                            left: "t1".to_string(),
+                            right: "t2".to_string(),
+                            result_type: None,
+                        },
+                    },
+                    ANFBinding {
+                        name: "t4".to_string(),
+                        value: ANFValue::Assert { value: "t3".to_string() },
+                    },
+                ],
+                is_public: true,
+            }],
+        };
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        let opcodes = collect_all_opcodes(&methods[0].ops);
+        assert!(
+            opcodes.contains(&"OP_BIN2NUM".to_string()),
+            "unpack should emit OP_BIN2NUM, got: {:?}",
+            opcodes
+        );
+    }
+
+    #[test]
+    fn test_pack_is_noop() {
+        let program = ANFProgram {
+            contract_name: "TestPack".to_string(),
+            properties: vec![],
+            methods: vec![ANFMethod {
+                name: "check".to_string(),
+                params: vec![
+                    ANFParam { name: "x".to_string(), param_type: "bigint".to_string() },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam { name: "x".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t1".to_string(),
+                        value: ANFValue::Call {
+                            func: "pack".to_string(),
+                            args: vec!["t0".to_string()],
+                        },
+                    },
+                    ANFBinding {
+                        name: "t2".to_string(),
+                        value: ANFValue::LoadConst {
+                            value: serde_json::Value::Bool(true),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t3".to_string(),
+                        value: ANFValue::Assert { value: "t2".to_string() },
+                    },
+                ],
+                is_public: true,
+            }],
+        };
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        let opcodes = collect_all_opcodes(&methods[0].ops);
+        // pack should NOT emit any conversion opcode — just pass through
+        assert!(
+            !opcodes.contains(&"OP_BIN2NUM".to_string()),
+            "pack should not emit OP_BIN2NUM, got: {:?}",
+            opcodes
+        );
+        assert!(
+            !opcodes.contains(&"OP_NUM2BIN".to_string()),
+            "pack should not emit OP_NUM2BIN, got: {:?}",
+            opcodes
+        );
+    }
+
+    #[test]
+    fn test_to_byte_string_is_noop() {
+        let program = ANFProgram {
+            contract_name: "TestToByteString".to_string(),
+            properties: vec![],
+            methods: vec![ANFMethod {
+                name: "check".to_string(),
+                params: vec![
+                    ANFParam { name: "x".to_string(), param_type: "bigint".to_string() },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam { name: "x".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t1".to_string(),
+                        value: ANFValue::Call {
+                            func: "toByteString".to_string(),
+                            args: vec!["t0".to_string()],
+                        },
+                    },
+                    ANFBinding {
+                        name: "t2".to_string(),
+                        value: ANFValue::LoadConst {
+                            value: serde_json::Value::Bool(true),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t3".to_string(),
+                        value: ANFValue::Assert { value: "t2".to_string() },
+                    },
+                ],
+                is_public: true,
+            }],
+        };
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        let opcodes = collect_all_opcodes(&methods[0].ops);
+        // toByteString should NOT emit any conversion opcode — just pass through
+        assert!(
+            !opcodes.contains(&"OP_BIN2NUM".to_string()),
+            "toByteString should not emit OP_BIN2NUM, got: {:?}",
+            opcodes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix #25: sqrt(0) guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sqrt_has_zero_guard() {
+        let program = ANFProgram {
+            contract_name: "TestSqrt".to_string(),
+            properties: vec![],
+            methods: vec![ANFMethod {
+                name: "check".to_string(),
+                params: vec![
+                    ANFParam { name: "n".to_string(), param_type: "bigint".to_string() },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam { name: "n".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t1".to_string(),
+                        value: ANFValue::Call {
+                            func: "sqrt".to_string(),
+                            args: vec!["t0".to_string()],
+                        },
+                    },
+                    ANFBinding {
+                        name: "t2".to_string(),
+                        value: ANFValue::LoadConst {
+                            value: serde_json::Value::Number(serde_json::Number::from(0)),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t3".to_string(),
+                        value: ANFValue::BinOp {
+                            op: ">=".to_string(),
+                            left: "t1".to_string(),
+                            right: "t2".to_string(),
+                            result_type: None,
+                        },
+                    },
+                    ANFBinding {
+                        name: "t4".to_string(),
+                        value: ANFValue::Assert { value: "t3".to_string() },
+                    },
+                ],
+                is_public: true,
+            }],
+        };
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        let opcodes = collect_all_opcodes(&methods[0].ops);
+
+        // The sqrt implementation should have OP_DUP followed by OP_IF (the zero guard).
+        // The DUP duplicates n, then IF checks if n != 0 before Newton iteration.
+        let dup_idx = opcodes.iter().position(|o| o == "OP_DUP");
+        let if_idx = opcodes.iter().position(|o| o == "OP_IF");
+
+        assert!(
+            dup_idx.is_some() && if_idx.is_some(),
+            "sqrt should have OP_DUP and OP_IF for zero guard, got: {:?}",
+            opcodes
+        );
+        assert!(
+            dup_idx.unwrap() < if_idx.unwrap(),
+            "OP_DUP should come before OP_IF in sqrt zero guard, got: {:?}",
+            opcodes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix #28: Loop cleanup of unused iteration variables
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_loop_cleans_up_unused_iter_var() {
+        // A loop whose body has only asserts (which consume stack values).
+        // After the body, the iter var ends up on top of the stack (depth 0),
+        // so it should be dropped. The TS reference does this cleanup.
+        let program = ANFProgram {
+            contract_name: "TestLoopCleanup".to_string(),
+            properties: vec![],
+            methods: vec![ANFMethod {
+                name: "check".to_string(),
+                params: vec![
+                    ANFParam { name: "x".to_string(), param_type: "bigint".to_string() },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam { name: "x".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t_loop".to_string(),
+                        value: ANFValue::Loop {
+                            count: 3,
+                            body: vec![
+                                // Body uses x but not iter var __i, and asserts consume
+                                ANFBinding {
+                                    name: "t1".to_string(),
+                                    value: ANFValue::LoadParam { name: "x".to_string() },
+                                },
+                                ANFBinding {
+                                    name: "t2".to_string(),
+                                    value: ANFValue::Assert { value: "t1".to_string() },
+                                },
+                            ],
+                            iter_var: "__i".to_string(),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t_final".to_string(),
+                        value: ANFValue::LoadConst {
+                            value: serde_json::Value::Bool(true),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t_assert".to_string(),
+                        value: ANFValue::Assert { value: "t_final".to_string() },
+                    },
+                ],
+                is_public: true,
+            }],
+        };
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        let opcodes = collect_all_opcodes(&methods[0].ops);
+
+        // Each iteration pushes __i, then the body asserts (consuming its value).
+        // After each iteration, __i is on top (depth 0) and should be dropped.
+        // With 3 iterations, we expect at least 3 OP_DROP ops (one per iter var cleanup).
+        let drop_count = opcodes.iter().filter(|o| o.as_str() == "OP_DROP").count();
+        assert!(
+            drop_count >= 3,
+            "unused iter var should be dropped after each iteration; expected >= 3 OP_DROPs, got {}: {:?}",
+            drop_count,
+            opcodes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix #29: PushValue::Int uses i128 (no overflow for large values)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_push_value_int_large_values() {
+        // Verify that PushValue::Int can hold values larger than i64::MAX
+        let large_val: i128 = (i64::MAX as i128) + 1;
+        let push = PushValue::Int(large_val);
+        if let PushValue::Int(v) = push {
+            assert_eq!(v, large_val, "PushValue::Int should store values > i64::MAX without truncation");
+        } else {
+            panic!("expected PushValue::Int");
+        }
+
+        // Also test negative extreme
+        let neg_val: i128 = (i64::MIN as i128) - 1;
+        let push_neg = PushValue::Int(neg_val);
+        if let PushValue::Int(v) = push_neg {
+            assert_eq!(v, neg_val, "PushValue::Int should store values < i64::MIN without truncation");
+        } else {
+            panic!("expected PushValue::Int");
+        }
+    }
+
+    #[test]
+    fn test_push_value_int_encodes_large_number() {
+        // Verify that a large number (> i64::MAX) can be pushed and encoded
+        use crate::codegen::emit::encode_push_int;
+
+        let large_val: i128 = 1i128 << 100;
+        let (hex, _asm) = encode_push_int(large_val);
+        // Should produce a valid hex encoding, not panic or truncate
+        assert!(!hex.is_empty(), "encoding of 2^100 should produce non-empty hex");
+
+        // Verify the encoding length is reasonable for a 13-byte number
+        // 2^100 needs 13 bytes in script number encoding (sign-magnitude)
+        // Push data: 0x0d (length 13) + 13 bytes = 14 bytes = 28 hex chars
+        assert!(
+            hex.len() >= 26,
+            "2^100 should need at least 13 bytes of push data, got hex length {}: {}",
+            hex.len(),
+            hex
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // log2 uses bit-scanning (OP_RSHIFT + OP_GREATERTHAN), not byte approx
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_log2_uses_bit_scanning_not_byte_approx() {
+        let program = ANFProgram {
+            contract_name: "TestLog2".to_string(),
+            properties: vec![],
+            methods: vec![ANFMethod {
+                name: "check".to_string(),
+                params: vec![
+                    ANFParam { name: "n".to_string(), param_type: "bigint".to_string() },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam { name: "n".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t1".to_string(),
+                        value: ANFValue::Call {
+                            func: "log2".to_string(),
+                            args: vec!["t0".to_string()],
+                        },
+                    },
+                    ANFBinding {
+                        name: "t2".to_string(),
+                        value: ANFValue::LoadConst {
+                            value: serde_json::Value::Number(serde_json::Number::from(0)),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t3".to_string(),
+                        value: ANFValue::BinOp {
+                            op: ">=".to_string(),
+                            left: "t1".to_string(),
+                            right: "t2".to_string(),
+                            result_type: None,
+                        },
+                    },
+                    ANFBinding {
+                        name: "t4".to_string(),
+                        value: ANFValue::Assert { value: "t3".to_string() },
+                    },
+                ],
+                is_public: true,
+            }],
+        };
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        let opcodes = collect_all_opcodes(&methods[0].ops);
+
+        // The bit-scanning implementation must use OP_RSHIFT and OP_GREATERTHAN
+        assert!(
+            opcodes.contains(&"OP_RSHIFT".to_string()),
+            "log2 should use OP_RSHIFT (bit-scanning), got: {:?}",
+            opcodes
+        );
+        assert!(
+            opcodes.contains(&"OP_GREATERTHAN".to_string()),
+            "log2 should use OP_GREATERTHAN (bit-scanning), got: {:?}",
+            opcodes
+        );
+
+        // The old byte-approximation used OP_SIZE and OP_MUL — must NOT be present
+        assert!(
+            !opcodes.contains(&"OP_SIZE".to_string()),
+            "log2 should NOT use OP_SIZE (old byte approximation), got: {:?}",
+            opcodes
+        );
+        assert!(
+            !opcodes.contains(&"OP_MUL".to_string()),
+            "log2 should NOT use OP_MUL (old byte approximation), got: {:?}",
+            opcodes
+        );
+
+        // Should have OP_1ADD for counter increment
+        assert!(
+            opcodes.contains(&"OP_1ADD".to_string()),
+            "log2 should use OP_1ADD (counter increment), got: {:?}",
+            opcodes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // reverseBytes uses OP_SPLIT + OP_CAT (not non-existent OP_REVERSE)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reverse_bytes_uses_split_cat_not_op_reverse() {
+        let program = ANFProgram {
+            contract_name: "TestReverse".to_string(),
+            properties: vec![],
+            methods: vec![ANFMethod {
+                name: "check".to_string(),
+                params: vec![
+                    ANFParam { name: "data".to_string(), param_type: "ByteString".to_string() },
+                ],
+                body: vec![
+                    ANFBinding {
+                        name: "t0".to_string(),
+                        value: ANFValue::LoadParam { name: "data".to_string() },
+                    },
+                    ANFBinding {
+                        name: "t1".to_string(),
+                        value: ANFValue::Call {
+                            func: "reverseBytes".to_string(),
+                            args: vec!["t0".to_string()],
+                        },
+                    },
+                    ANFBinding {
+                        name: "t2".to_string(),
+                        value: ANFValue::LoadConst {
+                            value: serde_json::Value::Bool(true),
+                        },
+                    },
+                    ANFBinding {
+                        name: "t3".to_string(),
+                        value: ANFValue::Assert { value: "t2".to_string() },
+                    },
+                ],
+                is_public: true,
+            }],
+        };
+
+        let methods = lower_to_stack(&program).expect("stack lowering should succeed");
+        let opcodes = collect_all_opcodes(&methods[0].ops);
+
+        // Must NOT contain the non-existent OP_REVERSE
+        assert!(
+            !opcodes.contains(&"OP_REVERSE".to_string()),
+            "reverseBytes must NOT emit OP_REVERSE (does not exist), got: {:?}",
+            opcodes
+        );
+
+        // Must use OP_SPLIT and OP_CAT for byte-by-byte reversal
+        assert!(
+            opcodes.contains(&"OP_SPLIT".to_string()),
+            "reverseBytes should emit OP_SPLIT for byte peeling, got: {:?}",
+            opcodes
+        );
+        assert!(
+            opcodes.contains(&"OP_CAT".to_string()),
+            "reverseBytes should emit OP_CAT for reassembly, got: {:?}",
+            opcodes
+        );
+
+        // Should use OP_SIZE to check remaining length
+        assert!(
+            opcodes.contains(&"OP_SIZE".to_string()),
+            "reverseBytes should emit OP_SIZE for length check, got: {:?}",
+            opcodes
         );
     }
 }

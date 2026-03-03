@@ -189,7 +189,26 @@ Use `OP_PICK` when the value will be needed again later. Use `OP_ROLL` when this
 | `a && b` (after short-circuit lowering) | `OP_BOOLAND` or `OP_IF`/`OP_ENDIF` |
 | `a \|\| b` (after short-circuit lowering) | `OP_BOOLOR` or `OP_IF`/`OP_ENDIF` |
 
-### 5.2 Notes on BSV-Restored Opcodes
+### 5.2 Bitwise Operations
+
+| Hex | Name | Stack Effect | Description |
+|-----|------|-------------|-------------|
+| `0x83` | `OP_INVERT` | `(a -- ~a)` | Bitwise NOT (flip all bits) |
+| `0x84` | `OP_AND` | `(a b -- a&b)` | Bitwise AND |
+| `0x85` | `OP_OR` | `(a b -- a\|b)` | Bitwise OR |
+| `0x86` | `OP_XOR` | `(a b -- a^b)` | Bitwise XOR |
+
+#### 5.2.1 Rúnar Mapping
+
+| Rúnar Expression | Opcode |
+|---|---|
+| `a & b` | `OP_AND` |
+| `a \| b` | `OP_OR` |
+| `a ^ b` | `OP_XOR` |
+| `~a` | `OP_INVERT` |
+| `reverseBytes(data)` | `OP_SPLIT` / `OP_CAT` loop |
+
+### 5.3 Notes on BSV-Restored Opcodes
 
 The following opcodes were disabled in BTC but are **re-enabled in BSV** (post-Genesis):
 
@@ -478,4 +497,9 @@ Rúnar's IR is designed to be opcode-agnostic at the ANF level. The `check_preim
 | `len(x)` | `OP_SIZE OP_NIP` | `0x82 0x77` |
 | `pack(n)` | `OP_NUM2BIN` | `0x80` |
 | `unpack(bs)` | `OP_BIN2NUM` | `0x81` |
+| `a & b` | `OP_AND` | `0x84` |
+| `a \| b` | `OP_OR` | `0x85` |
+| `a ^ b` | `OP_XOR` | `0x86` |
+| `~a` | `OP_INVERT` | `0x83` |
+| `reverseBytes(x)` | `OP_SPLIT` / `OP_CAT` loop | — |
 | `if/else` | `OP_IF OP_ELSE OP_ENDIF` | `0x63 0x67 0x68` |

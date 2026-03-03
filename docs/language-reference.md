@@ -333,8 +333,15 @@ private helper(x: bigint): bigint {
 | Function | Signature | Opcode(s) |
 |----------|-----------|-----------|
 | `len` | `(data: ByteString) => bigint` | `OP_SIZE OP_NIP` |
-| `reverseByteString` | `(data: ByteString, size: bigint) => ByteString` | Sequence of `OP_SPLIT` and `OP_SWAP` |
+| `reverseBytes` | `(data: ByteString) => ByteString` | `OP_SPLIT` / `OP_CAT` loop (bounded, max 520 bytes) |
 | `toByteString` | `(hex: string) => ByteString` | Compile-time literal construction |
+| `cat` | `(a: ByteString, b: ByteString) => ByteString` | `OP_CAT` |
+| `substr` | `(data: ByteString, start: bigint, length: bigint) => ByteString` | `OP_SPLIT` (twice) |
+| `split` | `(data: ByteString, pos: bigint) => ByteString` | `OP_SPLIT` — returns two values on the stack (left and right) |
+| `left` | `(data: ByteString, n: bigint) => ByteString` | `OP_SPLIT OP_DROP` — returns the leftmost n bytes |
+| `right` | `(data: ByteString, n: bigint) => ByteString` | `OP_SWAP OP_SIZE OP_ROT OP_SUB OP_SPLIT OP_NIP` — returns the rightmost n bytes |
+| `int2str` | `(n: bigint, size: bigint) => ByteString` | `OP_NUM2BIN` |
+| `bin2num` | `(data: ByteString) => bigint` | `OP_BIN2NUM` |
 
 ### Conversion
 
@@ -379,7 +386,7 @@ private helper(x: bigint): bigint {
 | `pow` | `(base: bigint, exp: bigint) => bigint` | 32-iteration bounded conditional multiply loop |
 | `sqrt` | `(n: bigint) => bigint` | 16-iteration Newton's method: `guess = (guess + n/guess) / 2` |
 | `gcd` | `(a: bigint, b: bigint) => bigint` | 256-iteration Euclidean algorithm |
-| `divmod` | `(a: bigint, b: bigint) => bigint` | `OP_2DUP OP_DIV OP_ROT OP_ROT OP_MOD OP_DROP` — returns quotient |
+| `divmod` | `(a: bigint, b: bigint) => bigint` | `OP_2DUP OP_DIV OP_ROT OP_ROT OP_MOD OP_DROP` — computes both quotient and remainder, returns quotient (the remainder is discarded). Despite the name suggesting both values, only the quotient is returned to the caller. |
 | `log2` | `(n: bigint) => bigint` | `OP_SIZE OP_NIP <8> OP_MUL <8> OP_SUB` — approximate floor(log2(n)) via byte size |
 
 > **Note on `pow`:** For compile-time constant exponents (e.g. `pow(x, 3n)`), the constant folder evaluates the result at compile time. For runtime exponents, a bounded 32-iteration loop is emitted, supporting exponents up to 32.
@@ -402,11 +409,18 @@ In `StatefulSmartContract`, `checkPreimage` and state continuation are handled a
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `this.txPreimage` | `SigHashPreimage` | Implicit preimage property (StatefulSmartContract only) |
-| `extractOutputHash` | `(preimage: SigHashPreimage) => Sha256` | Extract hashOutputs from preimage |
-| `extractLocktime` | `(preimage: SigHashPreimage) => bigint` | Extract nLocktime from preimage |
-| `extractAmount` | `(preimage: SigHashPreimage) => bigint` | Extract input amount from preimage |
-| `extractVersion` | `(preimage: SigHashPreimage) => bigint` | Extract tx version from preimage |
-| `extractSequence` | `(preimage: SigHashPreimage) => bigint` | Extract sequence number from preimage |
+| `extractVersion` | `(preimage: SigHashPreimage) => bigint` | Extract tx version (nVersion, 4 bytes at offset 0) |
+| `extractHashPrevouts` | `(preimage: SigHashPreimage) => Sha256` | Extract hashPrevouts (32 bytes at offset 4) |
+| `extractHashSequence` | `(preimage: SigHashPreimage) => Sha256` | Extract hashSequence (32 bytes at offset 36) |
+| `extractOutpoint` | `(preimage: SigHashPreimage) => ByteString` | Extract outpoint (txid + vout, 36 bytes at offset 68) |
+| `extractScriptCode` | `(preimage: SigHashPreimage) => ByteString` | Extract scriptCode (variable length, follows outpoint) |
+| `extractAmount` | `(preimage: SigHashPreimage) => bigint` | Extract input amount (value in satoshis, 8 bytes) |
+| `extractSequence` | `(preimage: SigHashPreimage) => bigint` | Extract input nSequence (4 bytes) |
+| `extractOutputHash` | `(preimage: SigHashPreimage) => Sha256` | Extract hashOutputs (32 bytes) |
+| `extractOutputs` | `(preimage: SigHashPreimage) => Sha256` | Alias for `extractOutputHash` |
+| `extractLocktime` | `(preimage: SigHashPreimage) => bigint` | Extract nLocktime (4 bytes) |
+| `extractSigHashType` | `(preimage: SigHashPreimage) => bigint` | Extract sighash type (4 bytes, e.g. 0x41 for ALL\|FORKID) |
+| `extractInputIndex` | `(preimage: SigHashPreimage) => bigint` | Extract prevout index (vout) from the outpoint field |
 
 ### Oracle
 

@@ -214,8 +214,13 @@ function collectRefs(value: ANFValue): string[] {
       refs.push(value.name);
       break;
     case 'load_prop':
-    case 'load_const':
     case 'get_state_script':
+      break;
+    case 'load_const':
+      // load_const with @ref: values reference another binding
+      if (typeof value.value === 'string' && value.value.startsWith('@ref:')) {
+        refs.push(value.value.slice(5));
+      }
       break;
     case 'add_output':
       refs.push(value.satoshis, ...value.stateValues);
@@ -790,8 +795,9 @@ class LoweringContext {
       this.stackMap.push(null);  // left part
       this.stackMap.push(bindingName); // right part (top)
     } else if (func === 'len') {
-      // OP_SIZE leaves original on stack and pushes length on top
-      this.stackMap.push(null);  // original value still present
+      // OP_SIZE leaves original on stack and pushes length on top.
+      // Emit OP_NIP to remove the original value, keeping only the size.
+      this.emitOp({ op: 'nip' });
       this.stackMap.push(bindingName);
     } else {
       this.stackMap.push(bindingName);
@@ -1355,11 +1361,11 @@ class LoweringContext {
 
       case 'extractOutputHash':
         // End-relative: 32 bytes before the last 8 (nLocktime 4 + sighashType 4).
-        // <preimage> OP_SIZE 44 OP_SUB OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
+        // <preimage> OP_SIZE 40 OP_SUB OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
         this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
         this.stackMap.push(null);
         this.stackMap.push(null);
-        this.emitOp({ op: 'push', value: 44n });
+        this.emitOp({ op: 'push', value: 40n });
         this.stackMap.push(null);
         this.emitOp({ op: 'opcode', code: 'OP_SUB' });
         this.stackMap.pop();
@@ -1389,7 +1395,7 @@ class LoweringContext {
         this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
         this.stackMap.push(null);
         this.stackMap.push(null);
-        this.emitOp({ op: 'push', value: 44n });
+        this.emitOp({ op: 'push', value: 40n });
         this.stackMap.push(null);
         this.emitOp({ op: 'opcode', code: 'OP_SUB' });
         this.stackMap.pop();
@@ -1786,6 +1792,11 @@ class LoweringContext {
    * Lower sqrt(n) — integer square root via Newton's method.
    * Emits a bounded iteration (16 rounds suffice for 256-bit numbers).
    * Algorithm: guess = n, then repeatedly guess = (guess + n/guess) / 2
+   *
+   * Guards against division by zero when n=0 by wrapping the Newton
+   * iteration in OP_DUP OP_IF ... OP_ENDIF. When n=0, the initial
+   * guess is also 0, and we skip the iteration entirely — 0 remains
+   * on the stack as the result.
    */
   private lowerSqrt(
     bindingName: string,
@@ -1801,22 +1812,35 @@ class LoweringContext {
     this.stackMap.pop();
 
     // Stack: <n>
+    // Guard: if n == 0, skip Newton iteration (avoid div-by-zero)
+    this.emitOp({ op: 'opcode', code: 'OP_DUP' }); // n n
+
+    // Build the Newton iteration ops for the if-then branch
+    const newtonOps: StackOp[] = [];
+    // At entry of if-branch, OP_IF consumed the top copy, stack: <n>
     // DUP to get initial guess = n
-    this.emitOp({ op: 'opcode', code: 'OP_DUP' }); // n guess(=n)
+    newtonOps.push({ op: 'opcode', code: 'OP_DUP' }); // n guess(=n)
 
     // 16 Newton iterations: guess = (guess + n/guess) / 2
     const SQRT_ITERATIONS = 16;
     for (let i = 0; i < SQRT_ITERATIONS; i++) {
       // Stack: n guess
-      this.emitOp({ op: 'over' });                      // n guess n
-      this.emitOp({ op: 'over' });                      // n guess n guess
-      this.emitOp({ op: 'opcode', code: 'OP_DIV' });    // n guess (n/guess)
-      this.emitOp({ op: 'opcode', code: 'OP_ADD' });    // n (guess + n/guess)
-      this.emitOp({ op: 'push', value: 2n });            // n (guess + n/guess) 2
-      this.emitOp({ op: 'opcode', code: 'OP_DIV' });    // n new_guess
+      newtonOps.push({ op: 'over' });                      // n guess n
+      newtonOps.push({ op: 'over' });                      // n guess n guess
+      newtonOps.push({ op: 'opcode', code: 'OP_DIV' });    // n guess (n/guess)
+      newtonOps.push({ op: 'opcode', code: 'OP_ADD' });    // n (guess + n/guess)
+      newtonOps.push({ op: 'push', value: 2n });            // n (guess + n/guess) 2
+      newtonOps.push({ op: 'opcode', code: 'OP_DIV' });    // n new_guess
     }
     // Stack: n result
-    this.emitOp({ op: 'nip' }); // result (drop n)
+    newtonOps.push({ op: 'nip' }); // result (drop n)
+
+    this.emitOp({
+      op: 'if',
+      then: newtonOps,
+      else: undefined,
+    });
+    // After OP_ENDIF: stack has the result (either 0 from skipped branch, or sqrt(n))
 
     this.stackMap.push(bindingName);
     this.trackDepth();
@@ -1921,16 +1945,15 @@ class LoweringContext {
   }
 
   /**
-   * Lower log2(n) — approximate floor(log2(n)) via byte size.
-   * Uses OP_SIZE on the script number encoding.
-   * floor(log2(n)) ≈ (byteLength - 1) * 8 + highBitPosition
-   * Simplified: (OP_SIZE * 8) - 8 gives a rough approximation.
-   * More precisely: OP_SIZE OP_NIP OP_1SUB 8 OP_MUL
-   * This gives (byteLength - 1) * 8, which is floor(log2(n)) for
-   * numbers that are exact powers of 256.
+   * Lower log2(n) — exact floor(log2(n)) via bit-scanning.
    *
-   * For a simpler but less precise version:
-   * OP_SIZE OP_NIP OP_1SUB gives floor(log256(n)), multiply by 8 for bits.
+   * Uses a bounded unrolled loop (64 iterations for bigint range):
+   *   counter = 0
+   *   while input > 1: input >>= 1, counter++
+   *   result = counter
+   *
+   * Stack layout during loop: <input> <counter>
+   * Each iteration: OP_SWAP OP_DUP OP_1 OP_GREATERTHAN OP_IF OP_1 OP_RSHIFT OP_SWAP OP_1ADD OP_SWAP OP_ENDIF
    */
   private lowerLog2(
     bindingName: string,
@@ -1946,15 +1969,35 @@ class LoweringContext {
     this.stackMap.pop();
 
     // Stack: <n>
-    // OP_SIZE leaves: <n> <byteLen>
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
-    // OP_NIP: <byteLen>
-    this.emitOp({ op: 'nip' });
-    // byteLen * 8 - 8 ≈ floor(log2(n))
-    this.emitOp({ op: 'push', value: 8n });
-    this.emitOp({ op: 'opcode', code: 'OP_MUL' });
-    this.emitOp({ op: 'push', value: 8n });
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
+    // Push counter = 0
+    this.emitOp({ op: 'push', value: 0n }); // n 0
+
+    // 64 iterations (sufficient for Bitcoin Script bigint range)
+    const LOG2_ITERATIONS = 64;
+    for (let i = 0; i < LOG2_ITERATIONS; i++) {
+      // Stack: input counter
+      this.emitOp({ op: 'swap' });              // counter input
+      this.emitOp({ op: 'opcode', code: 'OP_DUP' }); // counter input input
+      this.emitOp({ op: 'push', value: 1n });    // counter input input 1
+      this.emitOp({ op: 'opcode', code: 'OP_GREATERTHAN' }); // counter input (input>1)
+      this.emitOp({
+        op: 'if',
+        then: [
+          { op: 'push', value: 1n },              // counter input 1
+          { op: 'opcode', code: 'OP_RSHIFT' },    // counter (input>>1)
+          { op: 'swap' },                         // (input>>1) counter
+          { op: 'opcode', code: 'OP_1ADD' },      // (input>>1) (counter+1)
+          { op: 'swap' },                         // (counter+1) (input>>1)
+        ],
+        else: undefined,
+      });
+      // Stack: counter input  (or input counter if swapped back)
+      // After the if: stack is counter input (swap at start, then if-branch swaps back)
+      this.emitOp({ op: 'swap' });              // input counter
+    }
+    // Stack: input counter
+    // Drop input, keep counter
+    this.emitOp({ op: 'nip' }); // counter
 
     this.stackMap.push(bindingName);
     this.trackDepth();
@@ -2381,10 +2424,38 @@ class LoweringContext {
     const isLast = this.isLastUse(arg, bindingIndex, lastUses);
     this.bringToTop(arg, isLast);
 
-    // BSV Genesis protocol provides OP_REVERSE (0xd1) for byte string reversal.
-    // This is the most efficient implementation and handles any input length.
+    // Variable-length byte reversal using bounded unrolled loop.
+    // Algorithm: split off first byte repeatedly, prepend each to accumulator.
+    // Stack: [data]
     this.stackMap.pop();
-    this.emitOp({ op: 'opcode', code: 'OP_REVERSE' });
+
+    // Push empty result, swap so data is on top: ["", data]
+    this.emitOp({ op: 'push', value: 0n });  // OP_0 pushes empty byte array
+    this.emitOp({ op: 'swap' });
+
+    // 520 iterations (max BSV element size)
+    const REVERSE_MAX_BYTES = 520;
+    for (let i = 0; i < REVERSE_MAX_BYTES; i++) {
+      // Stack: [result, data]
+      this.emitOp({ op: 'dup' });                              // result data data
+      this.emitOp({ op: 'opcode', code: 'OP_SIZE' });          // result data data len
+      this.emitOp({ op: 'nip' });                              // result data len
+      this.emitOp({
+        op: 'if',
+        then: [
+          { op: 'push', value: 1n },                           // result data 1
+          { op: 'opcode', code: 'OP_SPLIT' },                  // result first remaining
+          { op: 'swap' },                                      // result remaining first
+          { op: 'rot' },                                       // remaining first result
+          { op: 'opcode', code: 'OP_CAT' },                    // remaining (first||result)
+          { op: 'swap' },                                      // (first||result) remaining
+        ],
+        else: undefined,
+      });
+    }
+
+    // Stack: [reversed_result, empty_data]
+    this.emitOp({ op: 'drop' }); // drop empty remainder
 
     this.stackMap.push(bindingName);
     this.trackDepth();

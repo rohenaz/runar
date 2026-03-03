@@ -159,7 +159,7 @@ Where `name` is the constructor parameter name. When deploying, the SDK replaces
 ### 3.8 `ir`
 
 - **Type**: `ANFProgram` object (see `ir-format.md`)
-- **Required**: No (optional, included when compiler flag `--emit-ir` is set)
+- **Required**: No (optional, included when compiler flag `--ir` is set)
 - **Description**: The canonical ANF IR for the contract. Useful for debugging and verification.
 
 ### 3.9 `stateFields`

@@ -1,30 +1,7 @@
 {
   "contractName": "Stateful",
-  "properties": [
-    {
-      "name": "count",
-      "type": "bigint",
-      "readonly": false
-    },
-    {
-      "name": "maxCount",
-      "type": "bigint",
-      "readonly": true
-    }
-  ],
   "methods": [
     {
-      "name": "constructor",
-      "params": [
-        {
-          "name": "count",
-          "type": "bigint"
-        },
-        {
-          "name": "maxCount",
-          "type": "bigint"
-        }
-      ],
       "body": [
         {
           "name": "t0",
@@ -43,12 +20,12 @@
         {
           "name": "t2",
           "value": {
-            "kind": "call",
-            "func": "super",
             "args": [
               "t0",
               "t1"
-            ]
+            ],
+            "func": "super",
+            "kind": "call"
           }
         },
         {
@@ -82,20 +59,20 @@
           }
         }
       ],
-      "isPublic": false
-    },
-    {
-      "name": "increment",
+      "isPublic": false,
+      "name": "constructor",
       "params": [
         {
-          "name": "amount",
+          "name": "count",
           "type": "bigint"
         },
         {
-          "name": "txPreimage",
-          "type": "SigHashPreimage"
+          "name": "maxCount",
+          "type": "bigint"
         }
-      ],
+      ]
+    },
+    {
       "body": [
         {
           "name": "t0",
@@ -136,8 +113,8 @@
           "name": "t5",
           "value": {
             "kind": "bin_op",
-            "op": "+",
             "left": "t3",
+            "op": "+",
             "right": "t4"
           }
         },
@@ -167,8 +144,8 @@
           "name": "t9",
           "value": {
             "kind": "bin_op",
-            "op": "<=",
             "left": "t7",
+            "op": "<=",
             "right": "t8"
           }
         },
@@ -188,11 +165,11 @@
         {
           "name": "t12",
           "value": {
-            "kind": "call",
-            "func": "hash256",
             "args": [
               "t11"
-            ]
+            ],
+            "func": "hash256",
+            "kind": "call"
           }
         },
         {
@@ -205,21 +182,21 @@
         {
           "name": "t14",
           "value": {
-            "kind": "call",
-            "func": "extractOutputHash",
             "args": [
               "t13"
-            ]
+            ],
+            "func": "extractOutputHash",
+            "kind": "call"
           }
         },
         {
           "name": "t15",
           "value": {
             "kind": "bin_op",
-            "op": "===",
             "left": "t12",
-            "right": "t14",
-            "result_type": "bytes"
+            "op": "===",
+            "result_type": "bytes",
+            "right": "t14"
           }
         },
         {
@@ -230,16 +207,20 @@
           }
         }
       ],
-      "isPublic": true
-    },
-    {
-      "name": "reset",
+      "isPublic": true,
+      "name": "increment",
       "params": [
+        {
+          "name": "amount",
+          "type": "bigint"
+        },
         {
           "name": "txPreimage",
           "type": "SigHashPreimage"
         }
-      ],
+      ]
+    },
+    {
       "body": [
         {
           "name": "t0",
@@ -286,11 +267,11 @@
         {
           "name": "t6",
           "value": {
-            "kind": "call",
-            "func": "hash256",
             "args": [
               "t5"
-            ]
+            ],
+            "func": "hash256",
+            "kind": "call"
           }
         },
         {
@@ -303,21 +284,21 @@
         {
           "name": "t8",
           "value": {
-            "kind": "call",
-            "func": "extractOutputHash",
             "args": [
               "t7"
-            ]
+            ],
+            "func": "extractOutputHash",
+            "kind": "call"
           }
         },
         {
           "name": "t9",
           "value": {
             "kind": "bin_op",
-            "op": "===",
             "left": "t6",
-            "right": "t8",
-            "result_type": "bytes"
+            "op": "===",
+            "result_type": "bytes",
+            "right": "t8"
           }
         },
         {
@@ -328,7 +309,26 @@
           }
         }
       ],
-      "isPublic": true
+      "isPublic": true,
+      "name": "reset",
+      "params": [
+        {
+          "name": "txPreimage",
+          "type": "SigHashPreimage"
+        }
+      ]
+    }
+  ],
+  "properties": [
+    {
+      "name": "count",
+      "readonly": false,
+      "type": "bigint"
+    },
+    {
+      "name": "maxCount",
+      "readonly": true,
+      "type": "bigint"
     }
   ]
 }

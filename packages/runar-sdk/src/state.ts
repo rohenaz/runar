@@ -333,5 +333,10 @@ function decodeScriptInt(hex: string): bigint {
     result = (result << 8n) | BigInt(bytes[i]!);
   }
 
+  // Normalize negative zero to positive zero. In Bitcoin Script, 0x80
+  // (and multi-byte variants like 0x0080) represent negative zero which
+  // should be treated as plain zero.
+  if (result === 0n) return 0n;
+
   return negative ? -result : result;
 }

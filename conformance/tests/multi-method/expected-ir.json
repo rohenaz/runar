@@ -1,30 +1,7 @@
 {
   "contractName": "MultiMethod",
-  "properties": [
-    {
-      "name": "owner",
-      "type": "PubKey",
-      "readonly": true
-    },
-    {
-      "name": "backup",
-      "type": "PubKey",
-      "readonly": true
-    }
-  ],
   "methods": [
     {
-      "name": "constructor",
-      "params": [
-        {
-          "name": "owner",
-          "type": "PubKey"
-        },
-        {
-          "name": "backup",
-          "type": "PubKey"
-        }
-      ],
       "body": [
         {
           "name": "t0",
@@ -43,12 +20,12 @@
         {
           "name": "t2",
           "value": {
-            "kind": "call",
-            "func": "super",
             "args": [
               "t0",
               "t1"
-            ]
+            ],
+            "func": "super",
+            "kind": "call"
           }
         },
         {
@@ -82,20 +59,20 @@
           }
         }
       ],
-      "isPublic": false
-    },
-    {
-      "name": "computeThreshold",
+      "isPublic": false,
+      "name": "constructor",
       "params": [
         {
-          "name": "a",
-          "type": "bigint"
+          "name": "owner",
+          "type": "PubKey"
         },
         {
-          "name": "b",
-          "type": "bigint"
+          "name": "backup",
+          "type": "PubKey"
         }
-      ],
+      ]
+    },
+    {
       "body": [
         {
           "name": "t0",
@@ -115,8 +92,8 @@
           "name": "t2",
           "value": {
             "kind": "bin_op",
-            "op": "*",
             "left": "t0",
+            "op": "*",
             "right": "t1"
           }
         },
@@ -131,26 +108,26 @@
           "name": "t4",
           "value": {
             "kind": "bin_op",
-            "op": "+",
             "left": "t2",
+            "op": "+",
             "right": "t3"
           }
         }
       ],
-      "isPublic": false
-    },
-    {
-      "name": "spendWithOwner",
+      "isPublic": false,
+      "name": "computeThreshold",
       "params": [
         {
-          "name": "sig",
-          "type": "Sig"
+          "name": "a",
+          "type": "bigint"
         },
         {
-          "name": "amount",
+          "name": "b",
           "type": "bigint"
         }
-      ],
+      ]
+    },
+    {
       "body": [
         {
           "name": "t0",
@@ -176,13 +153,13 @@
         {
           "name": "t3",
           "value": {
-            "kind": "method_call",
-            "object": "t2",
-            "method": "computeThreshold",
             "args": [
               "t0",
               "t1"
-            ]
+            ],
+            "kind": "method_call",
+            "method": "computeThreshold",
+            "object": "t2"
           }
         },
         {
@@ -203,8 +180,8 @@
           "name": "t5",
           "value": {
             "kind": "bin_op",
-            "op": ">",
             "left": "threshold",
+            "op": ">",
             "right": "t4"
           }
         },
@@ -232,12 +209,12 @@
         {
           "name": "t9",
           "value": {
-            "kind": "call",
-            "func": "checkSig",
             "args": [
               "t7",
               "t8"
-            ]
+            ],
+            "func": "checkSig",
+            "kind": "call"
           }
         },
         {
@@ -248,16 +225,20 @@
           }
         }
       ],
-      "isPublic": true
-    },
-    {
-      "name": "spendWithBackup",
+      "isPublic": true,
+      "name": "spendWithOwner",
       "params": [
         {
           "name": "sig",
           "type": "Sig"
+        },
+        {
+          "name": "amount",
+          "type": "bigint"
         }
-      ],
+      ]
+    },
+    {
       "body": [
         {
           "name": "t0",
@@ -276,12 +257,12 @@
         {
           "name": "t2",
           "value": {
-            "kind": "call",
-            "func": "checkSig",
             "args": [
               "t0",
               "t1"
-            ]
+            ],
+            "func": "checkSig",
+            "kind": "call"
           }
         },
         {
@@ -292,7 +273,26 @@
           }
         }
       ],
-      "isPublic": true
+      "isPublic": true,
+      "name": "spendWithBackup",
+      "params": [
+        {
+          "name": "sig",
+          "type": "Sig"
+        }
+      ]
+    }
+  ],
+  "properties": [
+    {
+      "name": "owner",
+      "readonly": true,
+      "type": "PubKey"
+    },
+    {
+      "name": "backup",
+      "readonly": true,
+      "type": "PubKey"
     }
   ]
 }

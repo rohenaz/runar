@@ -14,6 +14,11 @@ This directory contains the normative documents that define what Rúnar is. All 
 | [type-system.md](./type-system.md) | Type system rules. Covers the type hierarchy (ByteString and its domain subtypes, bigint and its Rabin subtypes), FixedArray, type inference, affine type rules for UTXO safety, property types (readonly vs mutable), type compatibility, and the type checking algorithm. | Draft v0.1.0 |
 | [semantics.md](./semantics.md) | Operational semantics. Defines how Rúnar programs evaluate: the environment and store model, small-step expression evaluation, statement evaluation, assert semantics, method dispatch (single and multiple public methods), private method inlining, state transition semantics (OP_PUSH_TX), the Script execution model, error conditions, and formal properties (termination, determinism, type safety). | Draft v0.1.0 |
 | [ir-format.md](./ir-format.md) | ANF IR specification. Defines the canonical intermediate representation: the top-level structure, all ANF binding value tags, type representations, canonical JSON serialization (RFC 8785), transformation rules from source to ANF, short-circuit lowering, validation rules, and extensibility policy. This is the conformance boundary -- all compilers must produce byte-identical ANF IR. | Draft v0.1.0 |
+| [artifact-format.md](./artifact-format.md) | Compiled artifact format. Specifies the JSON artifact produced by the compiler containing the locking script, ABI, state field descriptors, source map, and deployment metadata. | Draft v0.1.0 |
+| [opcodes.md](./opcodes.md) | Bitcoin SV opcode reference. Complete reference for all opcodes used by Rúnar with hex values, stack effects, and mappings from Rúnar operations to opcodes. | Draft v0.1.0 |
+| [abi.md](./abi.md) | Application Binary Interface specification. Defines the constructor and method signatures, parameter types, and method indexing used by the SDK to interact with compiled contracts. | Draft v0.1.0 |
+| [stack-ir.md](./stack-ir.md) | Stack IR specification. Defines the intermediate representation between ANF IR and Bitcoin Script: stack instruction types, stack scheduling, and the virtual stack model. | Draft v0.1.0 |
+| [frontend-spec.md](./frontend-spec.md) | Frontend specification. Defines requirements for multi-format parser dispatch and frontend implementations across compilers. | Draft v0.1.0 |
 
 ---
 

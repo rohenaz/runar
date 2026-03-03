@@ -99,14 +99,15 @@ impl EmitContext {
 // Script number encoding
 // ---------------------------------------------------------------------------
 
-/// Encode an i64 as a Bitcoin Script number (little-endian, sign-magnitude).
-pub fn encode_script_number(n: i64) -> Vec<u8> {
+/// Encode an i128 as a Bitcoin Script number (little-endian, sign-magnitude).
+/// Bitcoin Script numbers can be up to 2^252, so i128 is needed.
+pub fn encode_script_number(n: i128) -> Vec<u8> {
     if n == 0 {
         return Vec::new();
     }
 
     let negative = n < 0;
-    let mut abs = if negative { -(n as i128) } else { n as i128 } as u64;
+    let mut abs = if negative { (-n) as u128 } else { n as u128 };
 
     let mut bytes = Vec::new();
     while abs > 0 {
@@ -191,7 +192,7 @@ fn encode_push_value(value: &PushValue) -> (String, String) {
 }
 
 /// Encode an integer push, using small-integer opcodes where possible.
-pub fn encode_push_int(n: i64) -> (String, String) {
+pub fn encode_push_int(n: i128) -> (String, String) {
     if n == 0 {
         return ("00".to_string(), "OP_0".to_string());
     }
@@ -323,7 +324,7 @@ fn emit_method_dispatch(
 
         if !is_last {
             ctx.emit_opcode("OP_DUP")?;
-            ctx.emit_push(&PushValue::Int(i as i64));
+            ctx.emit_push(&PushValue::Int(i as i128));
             ctx.emit_opcode("OP_NUMEQUAL")?;
             ctx.emit_opcode("OP_IF")?;
             ctx.emit_opcode("OP_DROP")?;

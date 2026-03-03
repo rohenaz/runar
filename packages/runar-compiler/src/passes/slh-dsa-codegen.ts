@@ -46,6 +46,30 @@ const SLH_PARAMS: Record<string, SLHCodegenParams> = {
 };
 
 // ===========================================================================
+// 1b. Fixed-length byte reversal helper
+// ===========================================================================
+
+/**
+ * Emit an unrolled fixed-length byte reversal for N bytes.
+ * Uses (N-1) split-swap-cat operations. Only valid when N is known at compile time.
+ */
+function emitReverseN(n: number): StackOp[] {
+  if (n <= 1) return [];
+  const ops: StackOp[] = [];
+  // Phase 1: split into N individual bytes
+  for (let i = 0; i < n - 1; i++) {
+    ops.push({ op: 'push', value: 1n });
+    ops.push({ op: 'opcode', code: 'OP_SPLIT' });
+  }
+  // Phase 2: concatenate in reverse order
+  for (let i = 0; i < n - 1; i++) {
+    ops.push({ op: 'swap' });
+    ops.push({ op: 'opcode', code: 'OP_CAT' });
+  }
+  return ops;
+}
+
+// ===========================================================================
 // 2. Compressed ADRS (22 bytes)
 // ===========================================================================
 // [0] layer  [1..8] tree  [9] type  [10..13] keypair
@@ -256,7 +280,7 @@ function slhChainStepThen(adrsPrefix: Uint8Array, n: number): StackOp[] {
   // Convert copy to 4-byte big-endian
   ops.push({ op: 'push', value: 4n });
   ops.push({ op: 'opcode', code: 'OP_NUM2BIN' });
-  ops.push({ op: 'opcode', code: 'OP_REVERSE' });
+  ops.push(...emitReverseN(4));
   // Build ADRS = prefix(18) || hashAddrBE(4)
   ops.push({ op: 'push', value: adrsPrefix });
   ops.push({ op: 'swap' });
@@ -637,7 +661,7 @@ function emitSLHFors(
     emit({ op: 'push', value: BigInt(take) });
     emit({ op: 'opcode', code: 'OP_SPLIT' });
     emit({ op: 'drop' });
-    if (take > 1) emit({ op: 'opcode', code: 'OP_REVERSE' });
+    if (take > 1) { for (const op of emitReverseN(take)) emit(op); }
     emit({ op: 'push', value: 0n });
     emit({ op: 'push', value: 1n });
     emit({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -891,7 +915,7 @@ function emitVerifySLHDSA(
   // Convert _treeBytes -> treeIdx
   t.toTop('_treeBytes');
   t.rawBlock(['_treeBytes'], 'treeIdx', (e) => {
-    if (treeIdxLen > 1) e({ op: 'opcode', code: 'OP_REVERSE' });
+    if (treeIdxLen > 1) { for (const op of emitReverseN(treeIdxLen)) e(op); }
     e({ op: 'push', value: 0n });
     e({ op: 'push', value: 1n });
     e({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -905,7 +929,7 @@ function emitVerifySLHDSA(
   // Convert _leafBytes -> leafIdx
   t.toTop('_leafBytes');
   t.rawBlock(['_leafBytes'], 'leafIdx', (e) => {
-    if (leafIdxLen > 1) e({ op: 'opcode', code: 'OP_REVERSE' });
+    if (leafIdxLen > 1) { for (const op of emitReverseN(leafIdxLen)) e(op); }
     e({ op: 'push', value: 0n });
     e({ op: 'push', value: 1n });
     e({ op: 'opcode', code: 'OP_NUM2BIN' });

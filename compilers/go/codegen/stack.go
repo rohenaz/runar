@@ -72,6 +72,7 @@ var builtinOpcodes = map[string][]string{
 	"left":         {"OP_SPLIT", "OP_DROP"},
 	"int2str":      {"OP_NUM2BIN"},
 	"bool":         {"OP_0NOTEQUAL"},
+	"unpack":       {"OP_BIN2NUM"},
 }
 
 // ---------------------------------------------------------------------------
@@ -364,13 +365,21 @@ func (ctx *loweringContext) isLastUse(ref string, currentIndex int, lastUses map
 func (ctx *loweringContext) lowerBindings(bindings []ir.ANFBinding, terminalAssert bool) {
 	lastUses := computeLastUses(bindings)
 
-	// Find the index of the last assert binding (if terminalAssert is set)
+	// Find the terminal binding index (if terminalAssert is set).
+	// If the last binding is an 'if' whose branches end in asserts,
+	// that 'if' is the terminal point (not an earlier standalone assert).
 	lastAssertIdx := -1
+	terminalIfIdx := -1
 	if terminalAssert {
-		for i := len(bindings) - 1; i >= 0; i-- {
-			if bindings[i].Value.Kind == "assert" {
-				lastAssertIdx = i
-				break
+		lastBinding := bindings[len(bindings)-1]
+		if lastBinding.Value.Kind == "if" {
+			terminalIfIdx = len(bindings) - 1
+		} else {
+			for i := len(bindings) - 1; i >= 0; i-- {
+				if bindings[i].Value.Kind == "assert" {
+					lastAssertIdx = i
+					break
+				}
 			}
 		}
 	}
@@ -379,6 +388,9 @@ func (ctx *loweringContext) lowerBindings(bindings []ir.ANFBinding, terminalAsse
 		if binding.Value.Kind == "assert" && i == lastAssertIdx {
 			// Terminal assert: leave value on stack instead of OP_VERIFY
 			ctx.lowerAssert(binding.Value.ValueRef, i, lastUses, true)
+		} else if binding.Value.Kind == "if" && i == terminalIfIdx {
+			// Terminal if: propagate terminalAssert into both branches
+			ctx.lowerIf(binding.Name, binding.Value.Cond, binding.Value.Then, binding.Value.Else, i, lastUses, true)
 		} else {
 			ctx.lowerBinding(&binding, i, lastUses)
 		}
@@ -686,6 +698,19 @@ func (ctx *loweringContext) lowerCall(bindingName, funcName string, args []strin
 		return
 	}
 
+	// pack() and toByteString() are type-level casts — no-ops at the script level
+	if funcName == "pack" || funcName == "toByteString" {
+		if len(args) >= 1 {
+			arg := args[0]
+			isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
+			ctx.bringToTop(arg, isLast)
+			// Replace the arg's stack entry with the binding name
+			ctx.sm.pop()
+			ctx.sm.push(bindingName)
+		}
+		return
+	}
+
 	// Preimage field extractors — each needs a custom OP_SPLIT sequence
 	// because OP_SPLIT produces two stack values and the intermediate stack
 	// management cannot be expressed in the simple builtinOpcodes table.
@@ -779,7 +804,9 @@ func (ctx *loweringContext) inlineMethodCall(bindingName string, method *ir.ANFM
 	}
 }
 
-func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, elseBindings []ir.ANFBinding, bindingIndex int, lastUses map[string]int) {
+func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, elseBindings []ir.ANFBinding, bindingIndex int, lastUses map[string]int, terminalAssert ...bool) {
+	ta := len(terminalAssert) > 0 && terminalAssert[0]
+
 	isLast := ctx.isLastUse(cond, bindingIndex, lastUses)
 	ctx.bringToTop(cond, isLast)
 	ctx.sm.pop() // OP_IF consumes the condition
@@ -787,13 +814,13 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	// Lower then-branch
 	thenCtx := newLoweringContext(nil, ctx.properties)
 	thenCtx.sm = ctx.sm.clone()
-	thenCtx.lowerBindings(thenBindings, false)
+	thenCtx.lowerBindings(thenBindings, ta)
 	thenOps := thenCtx.ops
 
 	// Lower else-branch
 	elseCtx := newLoweringContext(nil, ctx.properties)
 	elseCtx.sm = ctx.sm.clone()
-	elseCtx.lowerBindings(elseBindings, false)
+	elseCtx.lowerBindings(elseBindings, ta)
 	elseOps := elseCtx.ops
 
 	ifOp := StackOp{
@@ -842,6 +869,16 @@ func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.A
 
 		for j, binding := range body {
 			ctx.lowerBinding(&binding, j, lastUses)
+		}
+
+		// Clean up the iteration variable if it was not consumed by the body.
+		// The body may not reference iterVar at all, leaving it on the stack.
+		if ctx.sm.has(iterVar) {
+			depth := ctx.sm.findDepth(iterVar)
+			if depth == 0 {
+				ctx.emitOp(StackOp{Op: "drop"})
+				ctx.sm.pop()
+			}
 		}
 	}
 	ctx.sm.push(bindingName)
@@ -1209,11 +1246,12 @@ func (ctx *loweringContext) lowerExtractor(bindingName, funcName string, args []
 
 	case "extractOutputHash", "extractOutputs":
 		// End-relative: 32 bytes before the last 8 (nLocktime 4 + sighashType 4).
-		// <preimage> OP_SIZE 44 OP_SUB OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
+		// hashOutputs(32) + nLocktime(4) + sighashType(4) = 40 bytes from end.
+		// <preimage> OP_SIZE 40 OP_SUB OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
 		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
 		ctx.sm.push("")
 		ctx.sm.push("")
-		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(44)})
+		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(40)})
 		ctx.sm.push("")
 		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
 		ctx.sm.pop()
@@ -1369,10 +1407,35 @@ func (ctx *loweringContext) lowerReverseBytes(bindingName string, args []string,
 	isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
 	ctx.bringToTop(arg, isLast)
 
-	// BSV Genesis protocol provides OP_REVERSE (0xd1) for byte string reversal.
-	// This is the most efficient implementation and handles any input length.
+	// Variable-length byte reversal using bounded unrolled loop.
+	// Algorithm: split off first byte repeatedly, prepend each to accumulator.
 	ctx.sm.pop()
-	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_REVERSE"})
+
+	// Push empty result (OP_0), swap so data is on top
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(0)})
+	ctx.emitOp(StackOp{Op: "swap"})
+
+	// 520 iterations (max BSV element size)
+	for i := 0; i < 520; i++ {
+		// Stack: [result, data]
+		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_DUP"})
+		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
+		ctx.emitOp(StackOp{Op: "nip"})
+		ctx.emitOp(StackOp{
+			Op: "if",
+			Then: []StackOp{
+				{Op: "push", Value: bigIntPush(1)},
+				{Op: "opcode", Code: "OP_SPLIT"},
+				{Op: "swap"},
+				{Op: "rot"},
+				{Op: "opcode", Code: "OP_CAT"},
+				{Op: "swap"},
+			},
+		})
+	}
+
+	// Drop empty remainder
+	ctx.emitOp(StackOp{Op: "drop"})
 
 	ctx.sm.push(bindingName)
 	ctx.trackDepth()
@@ -1790,6 +1853,7 @@ func (ctx *loweringContext) lowerPercentOf(bindingName string, args []string, bi
 
 // lowerSqrt lowers sqrt(n) — integer square root via Newton's method.
 // 16 iterations: guess = n, then guess = (guess + n/guess) / 2
+// Guarded for n == 0: if n is 0, skip Newton iteration (avoid division by zero).
 func (ctx *loweringContext) lowerSqrt(bindingName string, args []string, bindingIndex int, lastUses map[string]int) {
 	if len(args) < 1 {
 		panic("sqrt requires 1 argument")
@@ -1801,22 +1865,35 @@ func (ctx *loweringContext) lowerSqrt(bindingName string, args []string, binding
 	ctx.sm.pop()
 
 	// Stack: <n>
+	// Guard: OP_DUP OP_IF <newton> OP_ENDIF
+	// If n == 0, the duplicated 0 is consumed by OP_IF (falsy) and original 0 stays.
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_DUP"}) // n n
+
+	// Build the Newton iteration ops for the then-branch
+	var newtonOps []StackOp
+	// Inside the if: stack is <n> (the OP_IF consumed the dup'd copy)
 	// DUP to get initial guess = n
-	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_DUP"}) // n guess(=n)
+	newtonOps = append(newtonOps, StackOp{Op: "opcode", Code: "OP_DUP"}) // n guess(=n)
 
 	// 16 Newton iterations: guess = (guess + n/guess) / 2
 	const sqrtIterations = 16
 	for i := 0; i < sqrtIterations; i++ {
 		// Stack: n guess
-		ctx.emitOp(StackOp{Op: "over"})                          // n guess n
-		ctx.emitOp(StackOp{Op: "over"})                          // n guess n guess
-		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_DIV"})        // n guess (n/guess)
-		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_ADD"})        // n (guess + n/guess)
-		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(2)})    // n (guess + n/guess) 2
-		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_DIV"})        // n new_guess
+		newtonOps = append(newtonOps, StackOp{Op: "over"})                       // n guess n
+		newtonOps = append(newtonOps, StackOp{Op: "over"})                       // n guess n guess
+		newtonOps = append(newtonOps, StackOp{Op: "opcode", Code: "OP_DIV"})     // n guess (n/guess)
+		newtonOps = append(newtonOps, StackOp{Op: "opcode", Code: "OP_ADD"})     // n (guess + n/guess)
+		newtonOps = append(newtonOps, StackOp{Op: "push", Value: bigIntPush(2)}) // n (guess + n/guess) 2
+		newtonOps = append(newtonOps, StackOp{Op: "opcode", Code: "OP_DIV"})     // n new_guess
 	}
 	// Stack: n result
-	ctx.emitOp(StackOp{Op: "nip"}) // result (drop n)
+	newtonOps = append(newtonOps, StackOp{Op: "nip"}) // result (drop n)
+
+	ctx.emitOp(StackOp{
+		Op:   "if",
+		Then: newtonOps,
+		// Else: empty — if n == 0, original 0 stays on stack
+	})
 
 	ctx.sm.push(bindingName)
 	ctx.trackDepth()
@@ -1901,8 +1978,16 @@ func (ctx *loweringContext) lowerDivmod(bindingName string, args []string, bindi
 	ctx.trackDepth()
 }
 
-// lowerLog2 lowers log2(n) — approximate floor(log2(n)) via byte size.
-// Opcodes: <n> OP_SIZE OP_NIP push(8) OP_MUL push(8) OP_SUB
+// lowerLog2 lowers log2(n) — exact floor(log2(n)) via bit-scanning.
+//
+// Uses a bounded unrolled loop (64 iterations for bigint range):
+//
+//	counter = 0
+//	while input > 1: input >>= 1, counter++
+//	result = counter
+//
+// Stack layout during loop: <input> <counter>
+// Each iteration: OP_SWAP OP_DUP OP_1 OP_GREATERTHAN OP_IF OP_1 OP_RSHIFT OP_SWAP OP_1ADD OP_SWAP OP_ENDIF
 func (ctx *loweringContext) lowerLog2(bindingName string, args []string, bindingIndex int, lastUses map[string]int) {
 	if len(args) < 1 {
 		panic("log2 requires 1 argument")
@@ -1914,15 +1999,34 @@ func (ctx *loweringContext) lowerLog2(bindingName string, args []string, binding
 	ctx.sm.pop()
 
 	// Stack: <n>
-	// OP_SIZE leaves: <n> <byteLen>
-	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
-	// OP_NIP: <byteLen>
-	ctx.emitOp(StackOp{Op: "nip"})
-	// byteLen * 8 - 8 ~ floor(log2(n))
-	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
-	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_MUL"})
-	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
-	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	// Push counter = 0
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(0)}) // n 0
+
+	// 64 iterations (sufficient for Bitcoin Script bigint range)
+	const log2Iterations = 64
+	for i := 0; i < log2Iterations; i++ {
+		// Stack: input counter
+		ctx.emitOp(StackOp{Op: "swap"})                                  // counter input
+		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_DUP"})               // counter input input
+		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(1)})            // counter input input 1
+		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_GREATERTHAN"})        // counter input (input>1)
+		ctx.emitOp(StackOp{
+			Op: "if",
+			Then: []StackOp{
+				{Op: "push", Value: bigIntPush(1)},       // counter input 1
+				{Op: "opcode", Code: "OP_RSHIFT"},        // counter (input>>1)
+				{Op: "swap"},                             // (input>>1) counter
+				{Op: "opcode", Code: "OP_1ADD"},          // (input>>1) (counter+1)
+				{Op: "swap"},                             // (counter+1) (input>>1)
+			},
+		})
+		// Stack: counter input (or input counter if swapped back)
+		// After the if: stack is counter input (swap at start, then if-branch swaps back)
+		ctx.emitOp(StackOp{Op: "swap"}) // input counter
+	}
+	// Stack: input counter
+	// Drop input, keep counter
+	ctx.emitOp(StackOp{Op: "nip"}) // counter
 
 	ctx.sm.push(bindingName)
 	ctx.trackDepth()

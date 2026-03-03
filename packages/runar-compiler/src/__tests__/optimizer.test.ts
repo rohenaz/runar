@@ -148,6 +148,47 @@ describe('Optimizer: Constant Folding', () => {
       }
     });
 
+    it('folds left shift', () => {
+      const program = makeProgram([
+        makeMethod('m', [
+          b('t0', { kind: 'load_const', value: 1n }),
+          b('t1', { kind: 'load_const', value: 3n }),
+          b('t2', { kind: 'bin_op', op: '<<', left: 't0', right: 't1' }),
+        ]),
+      ]);
+      const folded = foldConstants(program);
+      expect(folded.methods[0]!.body[2]!.value).toEqual({ kind: 'load_const', value: 8n });
+    });
+
+    it('folds right shift for non-negative operands', () => {
+      const program = makeProgram([
+        makeMethod('m', [
+          b('t0', { kind: 'load_const', value: 16n }),
+          b('t1', { kind: 'load_const', value: 2n }),
+          b('t2', { kind: 'bin_op', op: '>>', left: 't0', right: 't1' }),
+        ]),
+      ]);
+      const folded = foldConstants(program);
+      expect(folded.methods[0]!.body[2]!.value).toEqual({ kind: 'load_const', value: 4n });
+    });
+
+    it('does not fold right shift with negative left operand (Fix #17)', () => {
+      // JavaScript >> is arithmetic (sign-extending) but Bitcoin Script's
+      // OP_RSHIFT is logical. The constant folder must NOT fold this case
+      // because JS (-8n >> 1n) == -4n but Bitcoin OP_RSHIFT gives a
+      // different (logical shift) result.
+      const program = makeProgram([
+        makeMethod('m', [
+          b('t0', { kind: 'load_const', value: -8n }),
+          b('t1', { kind: 'load_const', value: 1n }),
+          b('t2', { kind: 'bin_op', op: '>>', left: 't0', right: 't1' }),
+        ]),
+      ]);
+      const folded = foldConstants(program);
+      // Should NOT be folded — must remain a bin_op for runtime evaluation
+      expect(folded.methods[0]!.body[2]!.value.kind).toBe('bin_op');
+    });
+
     it('folds bitwise operators', () => {
       const program = makeProgram([
         makeMethod('m', [

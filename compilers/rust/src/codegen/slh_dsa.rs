@@ -12,6 +12,30 @@
 use super::stack::{PushValue, StackOp};
 
 // ===========================================================================
+// 0. Helpers
+// ===========================================================================
+
+/// Emit an unrolled fixed-length byte reversal for `n` bytes.
+/// Uses (n-1) split-swap-cat operations. Only valid when n is known at compile time.
+fn emit_reverse_n(n: usize) -> Vec<StackOp> {
+    if n <= 1 {
+        return vec![];
+    }
+    let mut ops = Vec::with_capacity(4 * (n - 1));
+    // Phase 1: split into n individual bytes
+    for _ in 0..n - 1 {
+        ops.push(StackOp::Push(PushValue::Int(1)));
+        ops.push(StackOp::Opcode("OP_SPLIT".into()));
+    }
+    // Phase 2: concatenate in reverse order
+    for _ in 0..n - 1 {
+        ops.push(StackOp::Swap);
+        ops.push(StackOp::Opcode("OP_CAT".into()));
+    }
+    ops
+}
+
+// ===========================================================================
 // 1. Parameter Sets (FIPS 205 Table 1, SHA2)
 // ===========================================================================
 
@@ -162,7 +186,7 @@ impl<'a> SLHTracker<'a> {
         self.nm.push(n.to_string());
     }
 
-    fn push_int(&mut self, n: &str, v: i64) {
+    fn push_int(&mut self, n: &str, v: i128) {
         (self.e)(StackOp::Push(PushValue::Int(v)));
         self.nm.push(n.to_string());
     }
@@ -230,7 +254,7 @@ impl<'a> SLHTracker<'a> {
             self.rot();
             return;
         }
-        (self.e)(StackOp::Push(PushValue::Int(d as i64)));
+        (self.e)(StackOp::Push(PushValue::Int(d as i128)));
         self.nm.push(String::new());
         (self.e)(StackOp::Opcode("OP_ROLL".into()));
         self.nm.pop(); // pop the push
@@ -248,7 +272,7 @@ impl<'a> SLHTracker<'a> {
             self.over(n);
             return;
         }
-        (self.e)(StackOp::Push(PushValue::Int(d as i64)));
+        (self.e)(StackOp::Push(PushValue::Int(d as i128)));
         self.nm.push(String::new());
         (self.e)(StackOp::Opcode("OP_PICK".into()));
         self.nm.pop(); // pop the push
@@ -358,7 +382,7 @@ fn emit_slh_t(t: &mut SLHTracker, n: usize, adrs: &str, msg: &str, result: &str)
     t.cat("_pre");
     t.sha256("_h32");
     if n < 32 {
-        t.push_int("", n as i64);
+        t.push_int("", n as i128);
         t.split(result, "_tr");
         t.drop();
     } else {
@@ -376,7 +400,7 @@ fn emit_slh_t_raw(e: &mut dyn FnMut(StackOp), n: usize) {
     e(StackOp::Opcode("OP_CAT".into()));
     e(StackOp::Opcode("OP_SHA256".into()));
     if n < 32 {
-        e(StackOp::Push(PushValue::Int(n as i64)));
+        e(StackOp::Push(PushValue::Int(n as i128)));
         e(StackOp::Opcode("OP_SPLIT".into()));
         e(StackOp::Drop);
     }
@@ -397,7 +421,7 @@ fn slh_chain_step_then(adrs_prefix: &[u8], n: usize) -> Vec<StackOp> {
     // Convert copy to 4-byte big-endian
     ops.push(StackOp::Push(PushValue::Int(4)));
     ops.push(StackOp::Opcode("OP_NUM2BIN".into()));
-    ops.push(StackOp::Opcode("OP_REVERSE".into()));
+    ops.extend(emit_reverse_n(4));
     // Build ADRS = prefix(18) || hashAddrBE(4)
     ops.push(StackOp::Push(PushValue::Bytes(adrs_prefix.to_vec())));
     ops.push(StackOp::Swap);
@@ -415,7 +439,7 @@ fn slh_chain_step_then(adrs_prefix: &[u8], n: usize) -> Vec<StackOp> {
     ops.push(StackOp::Opcode("OP_CAT".into()));
     ops.push(StackOp::Opcode("OP_SHA256".into()));
     if n < 32 {
-        ops.push(StackOp::Push(PushValue::Int(n as i64)));
+        ops.push(StackOp::Push(PushValue::Int(n as i128)));
         ops.push(StackOp::Opcode("OP_SPLIT".into()));
         ops.push(StackOp::Drop);
     }
@@ -452,7 +476,7 @@ fn emit_slh_one_chain(emit: &mut dyn FnMut(StackOp), n: usize, layer: usize, cha
 
     // Split n-byte sig element
     emit(StackOp::Swap);
-    emit(StackOp::Push(PushValue::Int(n as i64)));
+    emit(StackOp::Push(PushValue::Int(n as i128)));
     emit(StackOp::Opcode("OP_SPLIT".into()));
     emit(StackOp::Opcode("OP_TOALTSTACK".into())); // alt: ..., csum, sigRest(top)
     emit(StackOp::Swap);
@@ -636,7 +660,7 @@ fn emit_slh_merkle(emit: &mut dyn FnMut(StackOp), p: &SLHCodegenParams, layer: u
     for j in 0..hp {
         emit(StackOp::Opcode("OP_TOALTSTACK".into())); // node -> alt
 
-        emit(StackOp::Push(PushValue::Int(n as i64)));
+        emit(StackOp::Push(PushValue::Int(n as i128)));
         emit(StackOp::Opcode("OP_SPLIT".into()));
         emit(StackOp::Swap); // authPathRest authJ
 
@@ -649,7 +673,7 @@ fn emit_slh_merkle(emit: &mut dyn FnMut(StackOp), p: &SLHCodegenParams, layer: u
 
         // bit = (leafIdx >> j) & 1
         if j > 0 {
-            emit(StackOp::Push(PushValue::Int(j as i64)));
+            emit(StackOp::Push(PushValue::Int(j as i128)));
             emit(StackOp::Opcode("OP_RSHIFT".into()));
         }
         emit(StackOp::Push(PushValue::Int(1)));
@@ -675,7 +699,7 @@ fn emit_slh_merkle(emit: &mut dyn FnMut(StackOp), p: &SLHCodegenParams, layer: u
             StackOp::Opcode("OP_SHA256".into()),
         ];
         if n < 32 {
-            mk_tweak_hash.push(StackOp::Push(PushValue::Int(n as i64)));
+            mk_tweak_hash.push(StackOp::Push(PushValue::Int(n as i128)));
             mk_tweak_hash.push(StackOp::Opcode("OP_SPLIT".into()));
             mk_tweak_hash.push(StackOp::Drop);
         }
@@ -737,15 +761,17 @@ fn emit_slh_fors(emit: &mut dyn FnMut(StackOp), p: &SLHCodegenParams) {
         let take = if a > bits_in_first { 2 } else { 1 };
 
         if byte_start > 0 {
-            emit(StackOp::Push(PushValue::Int(byte_start as i64)));
+            emit(StackOp::Push(PushValue::Int(byte_start as i128)));
             emit(StackOp::Opcode("OP_SPLIT".into()));
             emit(StackOp::Nip);
         }
-        emit(StackOp::Push(PushValue::Int(take as i64)));
+        emit(StackOp::Push(PushValue::Int(take as i128)));
         emit(StackOp::Opcode("OP_SPLIT".into()));
         emit(StackOp::Drop);
         if take > 1 {
-            emit(StackOp::Opcode("OP_REVERSE".into()));
+            for op in emit_reverse_n(take) {
+                emit(op);
+            }
         }
         emit(StackOp::Push(PushValue::Int(0)));
         emit(StackOp::Push(PushValue::Int(1)));
@@ -755,17 +781,17 @@ fn emit_slh_fors(emit: &mut dyn FnMut(StackOp), p: &SLHCodegenParams) {
         let total_bits = take * 8;
         let right_shift = total_bits - bit_offset - a;
         if right_shift > 0 {
-            emit(StackOp::Push(PushValue::Int(right_shift as i64)));
+            emit(StackOp::Push(PushValue::Int(right_shift as i128)));
             emit(StackOp::Opcode("OP_RSHIFT".into()));
         }
-        emit(StackOp::Push(PushValue::Int(((1i64 << a) - 1) as i64)));
+        emit(StackOp::Push(PushValue::Int(((1i128 << a) - 1) as i128)));
         emit(StackOp::Opcode("OP_AND".into()));
 
         // Save idx to alt
         emit(StackOp::Opcode("OP_TOALTSTACK".into()));
 
         // Split sk(n) from sigRem
-        emit(StackOp::Push(PushValue::Int(n as i64)));
+        emit(StackOp::Push(PushValue::Int(n as i128)));
         emit(StackOp::Opcode("OP_SPLIT".into()));
         emit(StackOp::Swap);
 
@@ -784,7 +810,7 @@ fn emit_slh_fors(emit: &mut dyn FnMut(StackOp), p: &SLHCodegenParams) {
         for j in 0..a {
             emit(StackOp::Opcode("OP_TOALTSTACK".into())); // node -> alt
 
-            emit(StackOp::Push(PushValue::Int(n as i64)));
+            emit(StackOp::Push(PushValue::Int(n as i128)));
             emit(StackOp::Opcode("OP_SPLIT".into()));
             emit(StackOp::Swap);
 
@@ -797,7 +823,7 @@ fn emit_slh_fors(emit: &mut dyn FnMut(StackOp), p: &SLHCodegenParams) {
 
             // bit = (idx >> j) & 1
             if j > 0 {
-                emit(StackOp::Push(PushValue::Int(j as i64)));
+                emit(StackOp::Push(PushValue::Int(j as i128)));
                 emit(StackOp::Opcode("OP_RSHIFT".into()));
             }
             emit(StackOp::Push(PushValue::Int(1)));
@@ -822,7 +848,7 @@ fn emit_slh_fors(emit: &mut dyn FnMut(StackOp), p: &SLHCodegenParams) {
                 StackOp::Opcode("OP_SHA256".into()),
             ];
             if n < 32 {
-                hash_tail.push(StackOp::Push(PushValue::Int(n as i64)));
+                hash_tail.push(StackOp::Push(PushValue::Int(n as i128)));
                 hash_tail.push(StackOp::Opcode("OP_SPLIT".into()));
                 hash_tail.push(StackOp::Drop);
             }
@@ -893,7 +919,7 @@ fn emit_slh_hmsg(emit: &mut dyn FnMut(StackOp), n: usize, out_len: usize) {
         emit(StackOp::Opcode("OP_CAT".into()));
         emit(StackOp::Opcode("OP_SHA256".into()));
         if out_len < 32 {
-            emit(StackOp::Push(PushValue::Int(out_len as i64)));
+            emit(StackOp::Push(PushValue::Int(out_len as i128)));
             emit(StackOp::Opcode("OP_SPLIT".into()));
             emit(StackOp::Drop);
         }
@@ -918,7 +944,7 @@ fn emit_slh_hmsg(emit: &mut dyn FnMut(StackOp), n: usize, out_len: usize) {
             if ctr == blocks - 1 {
                 let rem = out_len - ctr * 32;
                 if rem < 32 {
-                    emit(StackOp::Push(PushValue::Int(rem as i64)));
+                    emit(StackOp::Push(PushValue::Int(rem as i128)));
                     emit(StackOp::Opcode("OP_SPLIT".into()));
                     emit(StackOp::Drop);
                 }
@@ -964,7 +990,7 @@ pub fn emit_verify_slh_dsa(emit: &mut dyn FnMut(StackOp), param_key: &str) {
 
     // ---- 1. Parse pubkey -> pkSeed, pkRoot ----
     t.to_top("pubkey");
-    t.push_int("", n as i64);
+    t.push_int("", n as i128);
     t.split("pkSeed", "pkRoot");
 
     // Build pkSeedPad = pkSeed || zeros(64-n), push to alt
@@ -979,7 +1005,7 @@ pub fn emit_verify_slh_dsa(emit: &mut dyn FnMut(StackOp), param_key: &str) {
 
     // ---- 2. Parse R from sig ----
     t.to_top("sig");
-    t.push_int("", n as i64);
+    t.push_int("", n as i128);
     t.split("R", "sigRest");
 
     // ---- 3. Compute Hmsg(R, pkSeed, pkRoot, msg) ----
@@ -993,18 +1019,20 @@ pub fn emit_verify_slh_dsa(emit: &mut dyn FnMut(StackOp), param_key: &str) {
 
     // ---- 4. Extract md, treeIdx, leafIdx ----
     t.to_top("digest");
-    t.push_int("", md_len as i64);
+    t.push_int("", md_len as i128);
     t.split("md", "_drest");
 
     t.to_top("_drest");
-    t.push_int("", tree_idx_len as i64);
+    t.push_int("", tree_idx_len as i128);
     t.split("_treeBytes", "_leafBytes");
 
     // Convert _treeBytes -> treeIdx
     t.to_top("_treeBytes");
     t.raw_block(&["_treeBytes"], "treeIdx", |e| {
         if tree_idx_len > 1 {
-            e(StackOp::Opcode("OP_REVERSE".into()));
+            for op in emit_reverse_n(tree_idx_len) {
+                e(op);
+            }
         }
         e(StackOp::Push(PushValue::Int(0)));
         e(StackOp::Push(PushValue::Int(1)));
@@ -1012,11 +1040,11 @@ pub fn emit_verify_slh_dsa(emit: &mut dyn FnMut(StackOp), param_key: &str) {
         e(StackOp::Opcode("OP_CAT".into()));
         e(StackOp::Opcode("OP_BIN2NUM".into()));
         let shift = p.h - hp;
-        // Compute mask safely: for shift >= 63, use i64::MAX
-        let mask: i64 = if shift >= 63 {
-            i64::MAX
+        // Compute mask safely: for shift >= 127, use i128::MAX
+        let mask: i128 = if shift >= 127 {
+            i128::MAX
         } else {
-            (1i64 << shift) - 1
+            (1i128 << shift) - 1
         };
         e(StackOp::Push(PushValue::Int(mask)));
         e(StackOp::Opcode("OP_AND".into()));
@@ -1026,17 +1054,19 @@ pub fn emit_verify_slh_dsa(emit: &mut dyn FnMut(StackOp), param_key: &str) {
     t.to_top("_leafBytes");
     t.raw_block(&["_leafBytes"], "leafIdx", |e| {
         if leaf_idx_len > 1 {
-            e(StackOp::Opcode("OP_REVERSE".into()));
+            for op in emit_reverse_n(leaf_idx_len) {
+                e(op);
+            }
         }
         e(StackOp::Push(PushValue::Int(0)));
         e(StackOp::Push(PushValue::Int(1)));
         e(StackOp::Opcode("OP_NUM2BIN".into()));
         e(StackOp::Opcode("OP_CAT".into()));
         e(StackOp::Opcode("OP_BIN2NUM".into()));
-        let hp_mask: i64 = if hp >= 63 {
-            i64::MAX
+        let hp_mask: i128 = if hp >= 127 {
+            i128::MAX
         } else {
-            (1i64 << hp) - 1
+            (1i128 << hp) - 1
         };
         e(StackOp::Push(PushValue::Int(hp_mask)));
         e(StackOp::Opcode("OP_AND".into()));
@@ -1044,7 +1074,7 @@ pub fn emit_verify_slh_dsa(emit: &mut dyn FnMut(StackOp), param_key: &str) {
 
     // ---- 5. Parse FORS sig ----
     t.to_top("sigRest");
-    t.push_int("", fors_sig_len as i64);
+    t.push_int("", fors_sig_len as i128);
     t.split("forsSig", "htSigRest");
 
     // ---- 6. FORS -> forsPk ----
@@ -1058,13 +1088,13 @@ pub fn emit_verify_slh_dsa(emit: &mut dyn FnMut(StackOp), param_key: &str) {
     for layer in 0..d {
         // Split xmssSig from htSigRest
         t.to_top("htSigRest");
-        t.push_int("", xmss_sig_len as i64);
+        t.push_int("", xmss_sig_len as i128);
         let xsig_name = format!("xsig{}", layer);
         t.split(&xsig_name, "htSigRest");
 
         // Split wotsSig and authPath
         t.to_top(&xsig_name);
-        t.push_int("", (ln * n) as i64);
+        t.push_int("", (ln * n) as i128);
         let wsig_name = format!("wsig{}", layer);
         let auth_name = format!("auth{}", layer);
         t.split(&wsig_name, &auth_name);
@@ -1095,17 +1125,17 @@ pub fn emit_verify_slh_dsa(emit: &mut dyn FnMut(StackOp), param_key: &str) {
         if layer < d - 1 {
             t.to_top("treeIdx");
             t.dup("_tic");
-            let hp_mask: i64 = if hp >= 63 {
-                i64::MAX
+            let hp_mask: i128 = if hp >= 127 {
+                i128::MAX
             } else {
-                (1i64 << hp) - 1
+                (1i128 << hp) - 1
             };
             t.push_int("", hp_mask);
             t.op("OP_AND");
             t.rename("leafIdx");
 
             t.to_top("_tic");
-            t.push_int("", hp as i64);
+            t.push_int("", hp as i128);
             t.op("OP_RSHIFT");
             t.rename("treeIdx");
         }

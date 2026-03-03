@@ -130,27 +130,29 @@ Create a test file `P2PKH.test.ts` using vitest:
 
 ```typescript
 import { describe, it, expect } from 'vitest';
-import { TestSmartContract, expectScriptSuccess, expectScriptFailure } from 'runar-testing';
-import artifact from './artifacts/P2PKH.json';
+import { readFileSync } from 'fs';
+import { TestContract } from 'runar-testing';
+
+const source = readFileSync('P2PKH.runar.ts', 'utf8');
 
 describe('P2PKH', () => {
   const pubKeyHash = '89abcdef01234567890abcdef01234567890abcd';
-  const contract = TestSmartContract.fromArtifact(artifact, [pubKeyHash]);
+  const contract = TestContract.fromSource(source, { pubKeyHash });
 
   it('should unlock with valid signature and public key', () => {
     const validSig = '3044...'; // DER-encoded signature hex
     const validPubKey = '02abc...'; // 33-byte compressed pubkey hex
 
-    const result = contract.call('unlock', [validSig, validPubKey]);
-    expectScriptSuccess(result);
+    const result = contract.call('unlock', { sig: validSig, pubKey: validPubKey });
+    expect(result.success).toBe(true);
   });
 
   it('should reject an invalid signature', () => {
     const invalidSig = '3044...'; // wrong signature
     const validPubKey = '02abc...';
 
-    const result = contract.call('unlock', [invalidSig, validPubKey]);
-    expectScriptFailure(result);
+    const result = contract.call('unlock', { sig: invalidSig, pubKey: validPubKey });
+    expect(result.success).toBe(false);
   });
 });
 ```
@@ -163,7 +165,7 @@ runar test
 pnpm test
 ```
 
-The `TestSmartContract` class loads your compiled artifact, builds unlocking scripts from the arguments you provide, and executes them against the locking script in Rúnar's built-in Script VM.
+The `TestContract` class compiles your contract source, then uses the interpreter (with mocked crypto) to execute methods and verify business logic.
 
 ---
 

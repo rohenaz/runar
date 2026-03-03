@@ -820,4 +820,103 @@ describe('Pass 1: Parse', () => {
       expect(result.contract!.properties.map(p => p.name)).toEqual(['count']);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Fix #19: Compound assignment reuses parsed LHS (no double parse)
+  // ---------------------------------------------------------------------------
+
+  describe('compound assignment LHS reuse (Fix #19)', () => {
+    it('compound assignment target and binary expr left refer to the same expression', () => {
+      const source = `
+        class C extends SmartContract {
+          count: bigint;
+          constructor(count: bigint) { super(count); this.count = count; }
+          public m() {
+            this.count += 1n;
+            assert(true);
+          }
+        }
+      `;
+      const result = parse(source);
+      expect(result.errors.filter(e => e.severity === 'error')).toEqual([]);
+      const method = result.contract!.methods[0]!;
+      const assignStmt = method.body[0]!;
+      expect(assignStmt.kind).toBe('assignment');
+      if (assignStmt.kind === 'assignment') {
+        expect(assignStmt.value.kind).toBe('binary_expr');
+        if (assignStmt.value.kind === 'binary_expr') {
+          expect(assignStmt.value.op).toBe('+');
+          // The target and the left operand of the binary expression
+          // should be structurally equal (same logical value).
+          // Before the fix, target was parsed from a separate call.
+          // After the fix, they reference the same parsed expression.
+          expect(assignStmt.target).toEqual(assignStmt.value.left);
+        }
+      }
+    });
+
+    it('compound -= works correctly', () => {
+      const source = `
+        class C extends SmartContract {
+          count: bigint;
+          constructor(count: bigint) { super(count); this.count = count; }
+          public m() {
+            this.count -= 1n;
+            assert(true);
+          }
+        }
+      `;
+      const result = parse(source);
+      expect(result.errors.filter(e => e.severity === 'error')).toEqual([]);
+      const method = result.contract!.methods[0]!;
+      const assignStmt = method.body[0]!;
+      if (assignStmt.kind === 'assignment') {
+        expect(assignStmt.target).toEqual(assignStmt.value.kind === 'binary_expr' ? assignStmt.value.left : null);
+      }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix #27: FixedArray size=0 rejected by parser
+  // ---------------------------------------------------------------------------
+
+  describe('FixedArray size=0 rejection (Fix #27)', () => {
+    it('rejects FixedArray<bigint, 0> with an error', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly arr: FixedArray<bigint, 0>;
+          constructor(arr: FixedArray<bigint, 0>) {
+            super(arr);
+            this.arr = arr;
+          }
+          public m() { assert(true); }
+        }
+      `;
+      const result = parse(source);
+      const errors = result.errors.filter(e => e.severity === 'error');
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors.some(e => e.message.includes('positive integer literal'))).toBe(true);
+    });
+
+    it('still accepts FixedArray<bigint, 1> (minimum valid size)', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly arr: FixedArray<bigint, 1>;
+          constructor(arr: FixedArray<bigint, 1>) {
+            super(arr);
+            this.arr = arr;
+          }
+          public m() { assert(true); }
+        }
+      `;
+      const result = parse(source);
+      const errors = result.errors.filter(e => e.severity === 'error');
+      expect(errors).toEqual([]);
+      const prop = result.contract!.properties[0]!;
+      expect(prop.type.kind).toBe('fixed_array_type');
+      if (prop.type.kind === 'fixed_array_type') {
+        expect(prop.type.length).toBe(1);
+      }
+    });
+  });
 });

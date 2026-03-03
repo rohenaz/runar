@@ -153,7 +153,7 @@ fn match_window_2(a: &StackOp, b: &StackOp) -> Option<Vec<StackOp>> {
     None
 }
 
-fn is_push_int(op: &StackOp, n: i64) -> bool {
+fn is_push_int(op: &StackOp, n: i128) -> bool {
     matches!(op, StackOp::Push(PushValue::Int(v)) if *v == n)
 }
 

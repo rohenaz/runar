@@ -11,7 +11,7 @@ The Rúnar compiler is structured as six small, composable passes. Each pass doe
 ```
 .runar.ts --> [Parse] --> [Validate] --> [Type-check] --> [ANF Lower] --> [Stack Lower] --> [Emit]
 source       Pass 1       Pass 2         Pass 3           Pass 4          Pass 5          Pass 6
-            ~150 LOC     ~120 LOC       ~200 LOC         ~180 LOC        ~160 LOC        ~100 LOC
+           ~1100 LOC     ~700 LOC      ~1100 LOC         ~880 LOC       ~2660 LOC        ~570 LOC
 ```
 
 Each pass lives in its own file under `packages/runar-compiler/src/passes/`:
@@ -20,8 +20,8 @@ Each pass lives in its own file under `packages/runar-compiler/src/passes/`:
 |------|------|-------|--------|
 | `01-parse.ts` | Parse | `.runar.ts` source | Rúnar AST |
 | `02-validate.ts` | Validate | Rúnar AST | Validated AST |
-| `03-typecheck.ts` | Type-check | Validated AST | Typed AST |
-| `04-anf-lower.ts` | ANF Lower | Typed AST | ANF IR |
+| `03-typecheck.ts` | Type-check | Validated AST | Validated AST (type-checked, not transformed) |
+| `04-anf-lower.ts` | ANF Lower | Validated AST | ANF IR |
 | `05-stack-lower.ts` | Stack Lower | ANF IR | Stack IR |
 | `slh-dsa-codegen.ts` | SLH-DSA Codegen | (called by Pass 5) | Stack IR fragment |
 | `06-emit.ts` | Emit | Stack IR | Bitcoin Script (hex) |
@@ -49,7 +49,7 @@ The parser uses **ts-morph** (a wrapper around the TypeScript compiler API) to p
 
 ### Alternative Frontends
 
-The Go compiler uses **tree-sitter** with a TypeScript grammar for parsing. The planned Rust compiler would use **SWC**. All three frontends must produce structurally equivalent Rúnar AST nodes. The conformance suite verifies this by checking that all compilers produce byte-identical ANF IR for the same source.
+The Go compiler uses **tree-sitter** with a TypeScript grammar for parsing `.runar.ts` files, plus hand-written recursive descent parsers for `.runar.sol`, `.runar.move`, and `.runar.go`. The Rust compiler similarly uses tree-sitter for `.runar.ts` and hand-written parsers for `.runar.sol`, `.runar.move`, and `.runar.rs`. All three frontends must produce structurally equivalent Rúnar AST nodes. The conformance suite verifies this by checking that all compilers produce byte-identical ANF IR for the same source.
 
 ---
 
@@ -63,7 +63,7 @@ The validation pass enforces the subset rules that distinguish Rúnar from gener
 
 ### Checks Performed
 
-- Exactly one class per file extending `SmartContract` directly.
+- Exactly one class per file extending `SmartContract` or `StatefulSmartContract`.
 - No decorators on the class, properties, or methods.
 - No generic type parameters.
 - Constructor calls `super(...)` as its first statement.
@@ -85,9 +85,9 @@ Each violation produces a clear error message referencing the source location.
 
 **File:** `packages/runar-compiler/src/passes/03-typecheck.ts`
 **Input:** Validated AST
-**Output:** Typed AST (every node annotated with its resolved type)
+**Output:** Validated AST (type-checked but not structurally transformed)
 
-The type checker resolves types for all expressions and enforces the Rúnar type system, including subtyping and affine type rules.
+The type checker validates types for all expressions and enforces the Rúnar type system, including subtyping and affine type rules. It does not produce a new AST -- it validates the existing AST and rejects programs with type errors.
 
 ### Phases
 
@@ -259,11 +259,11 @@ All three produce byte-identical Bitcoin Script, verified by the conformance sui
 
 ## Optimizer
 
-The optimizer runs after Pass 5 (Stack Lower) and before Pass 6 (Emit). It consists of two components in `packages/runar-compiler/src/optimizer/`:
+The optimizer consists of two components in `packages/runar-compiler/src/optimizer/`, running at different points in the pipeline:
 
 ### Peephole Optimizer (`peephole.ts`)
 
-Pattern-matches on sequences of Stack IR instructions and replaces them with shorter equivalents:
+Runs on Stack IR between Pass 5 (Stack Lower) and Pass 6 (Emit). Always enabled. Pattern-matches on sequences of Stack IR instructions and replaces them with shorter equivalents:
 
 | Pattern | Replacement | Savings |
 |---------|-------------|---------|
@@ -276,7 +276,7 @@ Pattern-matches on sequences of Stack IR instructions and replaces them with sho
 
 ### Constant Folder (`constant-fold.ts`)
 
-Evaluates constant expressions at compile time. For example, `3n + 4n` is folded to `7n` and emitted as a single `OP_7` instead of `OP_3 OP_4 OP_ADD`.
+Available between Pass 4 (ANF Lower) and Pass 5 (Stack Lower), but disabled by default to preserve ANF conformance (see whitepaper Section 4.5). When enabled, evaluates constant expressions at compile time. For example, `3n + 4n` is folded to `7n` and emitted as a single `OP_7` instead of `OP_3 OP_4 OP_ADD`.
 
 ---
 
@@ -311,11 +311,11 @@ Rúnar defines a canonical IR conformance boundary at the ANF level. Any compile
 
 | Compiler | Frontend | Status |
 |----------|----------|--------|
-| **TypeScript** (reference) | ts-morph | In progress |
-| **Go** | tree-sitter | Planned |
-| **Rust** | SWC | Planned |
+| **TypeScript** (reference) | ts-morph (`.runar.ts`), hand-written recursive descent (`.runar.sol`, `.runar.move`) | Complete |
+| **Go** | tree-sitter (`.runar.ts`), hand-written recursive descent (`.runar.sol`, `.runar.move`, `.runar.go`) | Complete |
+| **Rust** | tree-sitter (`.runar.ts`), hand-written recursive descent (`.runar.sol`, `.runar.move`, `.runar.rs`) | Complete |
 
-All three compilers share the same ANF-to-Script pipeline (Passes 4-6) semantically. The Go and Rust compilers implement their own Passes 1-3 (parsing, validation, type-checking) using language-native tools, but must produce identical ANF IR.
+All three compilers share the same ANF-to-Script pipeline (Passes 4-6) semantically. The Go and Rust compilers implement their own Passes 1-3 (parsing, validation, type-checking) using language-native tools, but must produce identical ANF IR. Each compiler supports multi-format parsing: TypeScript, Solidity-like, Move-style, and its own native syntax (Go or Rust DSL).
 
 ### Why Multiple Compilers?
 

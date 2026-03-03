@@ -120,9 +120,6 @@ pub static OPCODES: LazyLock<HashMap<&'static str, u8>> = LazyLock::new(|| {
     m.insert("OP_CHECKMULTISIG", 0xae);
     m.insert("OP_CHECKMULTISIGVERIFY", 0xaf);
 
-    // BSV Genesis protocol extensions
-    m.insert("OP_REVERSE", 0xd1);
-
     m
 });
 

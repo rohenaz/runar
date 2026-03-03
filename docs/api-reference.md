@@ -80,7 +80,7 @@ runar deploy <artifact-path> [options]
 |------|----------|-------------|
 | `--network <net>` | Yes | `mainnet` or `testnet` |
 | `--key <wif>` | Yes | WIF-encoded private key for funding the deployment |
-| `--satoshis <n>` | Yes | Amount of satoshis to lock in the contract UTXO |
+| `--satoshis <n>` | No (default: `10000`) | Amount of satoshis to lock in the contract UTXO |
 
 **Example:**
 
@@ -105,7 +105,7 @@ runar deploy ./artifacts/P2PKH.json --network testnet --key cN1... --satoshis 10
 Verify a deployed contract matches a compiled artifact. Fetches the transaction from the blockchain and compares the on-chain locking script against the artifact's expected script.
 
 ```bash
-runar verify <artifact-path> --txid <txid> --network <net>
+runar verify <txid> --artifact <path> --network <net>
 ```
 
 ---
@@ -281,10 +281,17 @@ Delegates signing to an external service or hardware wallet.
 ```typescript
 import { ExternalSigner } from 'runar-sdk';
 
-const signer = new ExternalSigner(signingCallback);
+const signer = new ExternalSigner(
+  pubKeyHex,       // 33-byte compressed public key, hex
+  addressStr,      // Base58Check BSV address
+  async (txHex, inputIndex) => {
+    // Sign the transaction and return DER signature + sighash byte, hex
+    return await myHardwareWallet.sign(txHex, inputIndex);
+  },
+);
 ```
 
-The callback receives the transaction data and returns a signature. This pattern supports integration with browser wallets, hardware security modules, or custodial APIs.
+The constructor takes three parameters: the public key hex, the BSV address, and a signing callback. The callback receives the raw transaction hex and input index, and returns a DER-encoded signature. This pattern supports integration with browser wallets, hardware security modules, or custodial APIs.
 
 ---
 

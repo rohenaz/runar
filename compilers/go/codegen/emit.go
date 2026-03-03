@@ -67,7 +67,6 @@ var opcodes = map[string]byte{
 	"OP_BIN2NUM":              0x81,
 	"OP_SIZE":                 0x82,
 	"OP_INVERT":               0x83,
-	"OP_REVERSE":              0xd1,
 	"OP_AND":                  0x84,
 	"OP_OR":                   0x85,
 	"OP_XOR":                  0x86,
