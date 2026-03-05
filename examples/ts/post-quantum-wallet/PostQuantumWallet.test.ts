@@ -2,9 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { TestContract } from 'runar-testing';
-// Import directly from the source path (vitest resolves via alias)
-import { wotsKeygen, wotsSign } from '../../../packages/runar-testing/src/crypto/wots.js';
+import { TestContract, wotsKeygen, wotsSign } from 'runar-testing';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(__dirname, 'PostQuantumWallet.runar.ts'), 'utf8');

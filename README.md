@@ -147,7 +147,8 @@ runar compile MyContract.runar.ts    # => artifacts/MyContract.runar.json
 ### Go
 
 ```bash
-# In your go.mod, add: require runar v0.0.0
+# In your go.mod, add:
+#   require github.com/icellan/runar/packages/runar-go v0.1.0
 # Contracts are real Go — test with go test, compile with the Rúnar Go compiler
 go test ./...
 ```
@@ -155,7 +156,7 @@ go test ./...
 ### Rust
 
 ```bash
-# In Cargo.toml: runar = { path = "..." }
+# In Cargo.toml: runar = { package = "runar-lang", version = "0.1.0" }
 # Contracts are real Rust — test with cargo test, compile with the Rúnar Rust compiler
 cargo test
 ```

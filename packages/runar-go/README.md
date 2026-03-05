@@ -12,7 +12,10 @@ The Go SDK provides the runtime layer between compiled contract artifacts and th
 go get github.com/icellan/runar/packages/runar-go
 ```
 
-The module name is `runar`. If using the go.work workspace, `import "runar"` resolves directly.
+The package name is `runar`. Import with:
+```go
+import runar "github.com/icellan/runar/packages/runar-go"
+```
 
 ---
 
@@ -36,7 +39,7 @@ A Runar contract goes through four stages:
 ### Full Example
 
 ```go
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 // 1. Load the artifact (compiled contract JSON)
 artifact := &runar.RunarArtifact{ /* loaded from JSON */ }

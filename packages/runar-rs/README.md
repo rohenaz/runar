@@ -12,7 +12,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-runar = { path = "../runar-rs" }  # or from registry when published
+runar = { package = "runar-lang", version = "0.1.0" }
 ```
 
 ---

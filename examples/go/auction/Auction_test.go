@@ -1,8 +1,8 @@
 package contract
 
 import (
+	runar "github.com/icellan/runar/packages/runar-go"
 	"testing"
-	"runar"
 )
 
 func newAuction() *Auction {

@@ -12,6 +12,15 @@
     "typecheck": "tsc --noEmit"
   },
   "files": ["dist"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/icellan/runar",
+    "directory": "packages/runar-sdk"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@bsv/sdk": "^2.0.5",
     "runar-lang": "workspace:*",

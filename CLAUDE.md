@@ -186,7 +186,7 @@ Key SDK concepts:
 
 ### Module Resolution
 - pnpm workspace packages are not hoisted to root `node_modules`. The `vitest.config.ts` at root provides aliases so `examples/` tests can import `runar-testing` by name.
-- `go.work` at the project root connects `compilers/go`, `conformance`, `end2end-example/go`, `end2end-example/webapp`, `end2end-example/webapp-blackjack`, `examples/go`, and `packages/runar-go` so `import "runar"` resolves everywhere.
+- `go.work` at the project root connects `compilers/go`, `conformance`, `end2end-example/go`, `end2end-example/webapp`, `end2end-example/webapp-blackjack`, `examples/go`, and `packages/runar-go` so `import runar "github.com/icellan/runar/packages/runar-go"` resolves everywhere.
 - Rust example tests use `Cargo.toml` at `examples/rust/` with `[[test]]` entries pointing to each contract's `_test.rs` file.
 
 ## Style

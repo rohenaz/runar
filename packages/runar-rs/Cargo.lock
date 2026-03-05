@@ -810,20 +810,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runar"
-version = "0.1.0"
-dependencies = [
- "bs58",
- "k256",
- "ripemd",
- "runar-compiler-rust",
- "runar-macros",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "runar-compiler-rust"
 version = "0.1.0"
 dependencies = [
@@ -838,7 +824,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "runar-macros"
+name = "runar-lang"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "k256",
+ "ripemd",
+ "runar-compiler-rust",
+ "runar-lang-macros",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "runar-lang-macros"
 version = "0.1.0"
 
 [[package]]

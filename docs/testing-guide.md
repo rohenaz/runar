@@ -330,7 +330,7 @@ go.work
 └── conformance          # Cross-compiler tests
 ```
 
-This workspace allows `import "runar"` to resolve to the mock package everywhere.
+This workspace allows `import runar "github.com/icellan/runar/packages/runar-go"` to resolve to the mock package everywhere. Within the monorepo, the `go.work` file provides local replacement; external consumers use the published module path directly.
 
 ### Basic Test Structure
 
@@ -339,7 +339,7 @@ package contract
 
 import (
 	"testing"
-	"runar"
+	runar "github.com/icellan/runar/packages/runar-go"
 )
 
 func TestP2PKH_Unlock(t *testing.T) {
@@ -470,7 +470,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-runar = { path = "../../packages/runar-rs" }
+runar = { package = "runar-lang", version = "0.1.0" }
 
 [[test]]
 name = "p2pkh"
@@ -635,7 +635,7 @@ cargo test --test counter -- --nocapture  # Verbose output
 | **Test framework** | vitest | `testing.T` | `#[test]` |
 | **Failure assertion** | `expectScriptFailure(result)` (see note below) | `defer/recover` | `#[should_panic]` |
 | **Contract loading** | `TestContract.fromSource(source, state)` | Struct literal in same package | `#[path = "..."] mod contract;` |
-| **Type imports** | `import { ... } from 'runar-testing'` | `import "runar"` | `use runar::prelude::*;` |
+| **Type imports** | `import { ... } from 'runar-testing'` | `import runar "github.com/icellan/runar/packages/runar-go"` | `use runar::prelude::*;` |
 | **Byte types** | Hex strings / `Uint8Array` | `string` (for `==`) | `Vec<u8>` (for `==` via `PartialEq`) |
 | **Scalar types** | `bigint` | `int64` aliases | `i64` aliases |
 | **Output tracking** | `contract.state` after `call()` | `c.Outputs()` method | Manual `Vec<Output>` field |

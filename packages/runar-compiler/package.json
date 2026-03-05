@@ -12,6 +12,15 @@
     "typecheck": "tsc --noEmit"
   },
   "files": ["dist"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/icellan/runar",
+    "directory": "packages/runar-compiler"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "ts-morph": "^24.0.0",
     "runar-lang": "workspace:*",

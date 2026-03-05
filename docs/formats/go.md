@@ -21,10 +21,10 @@ This format is **only supported by the Go compiler** (`compilers/go`). The TypeS
 ```go
 package contracts
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 ```
 
-The package name is ignored by the compiler. The `"runar"` import provides the base types and built-in functions.
+The package name is ignored by the compiler. The `runar` import provides the base types and built-in functions. The import is aliased to `runar` for use in the contract code.
 
 ### Struct Declaration
 
@@ -250,7 +250,7 @@ EC constants are available as package-level variables:
 ```go
 package contracts
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 type P2PKH struct {
     runar.SmartContract
@@ -268,7 +268,7 @@ func (c *P2PKH) Unlock(sig runar.Sig, pubKey runar.PubKey) {
 ```go
 package contracts
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 type Counter struct {
     runar.StatefulSmartContract
@@ -290,7 +290,7 @@ func (c *Counter) Decrement() {
 ```go
 package contracts
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 type Escrow struct {
     runar.SmartContract
@@ -321,7 +321,7 @@ func (c *Escrow) RefundByArbiter(sig runar.Sig) {
 ```go
 package contracts
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 type Auction struct {
     runar.StatefulSmartContract
@@ -350,7 +350,7 @@ func (c *Auction) Close(sig runar.Sig) {
 ```go
 package contracts
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 type OraclePriceFeed struct {
     runar.SmartContract
@@ -371,7 +371,7 @@ func (c *OraclePriceFeed) Settle(price int64, rabinSig runar.RabinSig, padding r
 ```go
 package contracts
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 type CovenantVault struct {
     runar.SmartContract
@@ -392,7 +392,7 @@ func (c *CovenantVault) Spend(sig runar.Sig, amount int64, txPreimage runar.SigH
 ```go
 package contracts
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 type FungibleToken struct {
     runar.StatefulSmartContract
@@ -427,7 +427,7 @@ func (c *FungibleToken) Merge(sig runar.Sig, totalBalance int64, outputSatoshis 
 ```go
 package contracts
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 type SimpleNFT struct {
     runar.StatefulSmartContract

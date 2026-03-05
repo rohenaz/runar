@@ -690,7 +690,7 @@ Deployment SDKs are available in all three languages. Each provides the same API
 ### Go SDK (`packages/runar-go/`)
 
 ```go
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 // Load artifact
 artifact := runar.RunarArtifact{}

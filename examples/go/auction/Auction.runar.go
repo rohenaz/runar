@@ -1,6 +1,6 @@
 package contract
 
-import "runar"
+import runar "github.com/icellan/runar/packages/runar-go"
 
 type Auction struct {
 	runar.StatefulSmartContract

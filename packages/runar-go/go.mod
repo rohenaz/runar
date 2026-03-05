@@ -1,4 +1,4 @@
-module runar
+module github.com/icellan/runar/packages/runar-go
 
 go 1.26
 
