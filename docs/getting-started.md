@@ -10,7 +10,7 @@ Before you begin, make sure you have the following installed:
 
 | Tool | Minimum Version | Purpose |
 |------|-----------------|---------|
-| **Node.js** | 22.0.0+         | Runtime for the compiler and CLI |
+| **Node.js** | 20.0.0+         | Runtime for the compiler and CLI |
 | **pnpm** | 9.0.0+          | Package manager (workspace support required) |
 | **Go** | 1.26+           | Only needed if you want to build/use the Go compiler |
 | **Rust** | 1.75+           | Only needed if you want to build/use the Rust compiler |
@@ -18,7 +18,7 @@ Before you begin, make sure you have the following installed:
 Verify your installations:
 
 ```bash
-node --version   # v22.x.x or higher
+node --version   # v20.x.x or higher
 pnpm --version   # 9.x.x or higher
 go version       # go1.26.x or higher (optional)
 ```

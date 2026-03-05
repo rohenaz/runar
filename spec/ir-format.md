@@ -375,6 +375,24 @@ Add an output to the transaction being constructed (used by stateful contracts f
 | `satoshis` | `string` | Name of binding holding the satoshis amount |
 | `stateValues` | `string[]` | Names of bindings for each mutable property value, in declaration order |
 
+### 4.15 `deserialize_state`
+
+Deserialize contract state fields from a verified preimage (used by stateful contracts). The compiler emits this node after `check_preimage` to extract the current values of mutable state properties from the transaction preimage.
+
+```json
+{
+    "kind": "deserialize_state",
+    "preimage": "t5"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `kind` | `"deserialize_state"` | Node discriminator |
+| `preimage` | `string` | Name of binding holding the verified preimage (from `check_preimage`) |
+
+After this node executes, the compiler creates bindings for each mutable property's current value, extracted from the preimage's output script.
+
 ---
 
 ## 5. ANF Types

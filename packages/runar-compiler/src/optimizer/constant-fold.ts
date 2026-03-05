@@ -46,7 +46,12 @@ function evalBinOp(op: string, left: ConstValue, right: ConstValue): ConstValue 
       case '&': return left & right;
       case '|': return left | right;
       case '^': return left ^ right;
-      case '<<': return left << right;
+      case '<<':
+        // Bitcoin Script's OP_LSHIFT operates on raw byte arrays (big-endian
+        // unsigned shift), not Script numbers. Skip folding for negative left
+        // operands to avoid producing incorrect results at compile time.
+        if (left < 0n) return null;
+        return left << right;
       case '>>':
         // JavaScript's >> is arithmetic (sign-extending) but Bitcoin Script's
         // OP_RSHIFT is logical. Skip folding for negative left operands to

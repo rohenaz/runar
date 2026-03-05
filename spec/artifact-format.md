@@ -267,13 +267,13 @@ The SDK constructs the unlocking script:
 
 ```
 For single-method contracts:
-    <param_n> <param_n-1> ... <param_1>
+    <param_1> <param_2> ... <param_n>
 
 For multi-method contracts:
-    <param_n> <param_n-1> ... <param_1> <method_index>
+    <param_1> <param_2> ... <param_n> <method_index>
 ```
 
-Parameters are pushed in **reverse declaration order** so that the first parameter ends up on top of the stack when the locking script begins execution.
+Parameters are pushed in **forward declaration order** (matching the order in the ABI `params` array). The first parameter is pushed first (ending up deepest on the stack) and the last parameter is pushed last (ending up on top).
 
 ### Step 3: Create Transaction Input
 

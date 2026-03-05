@@ -56,9 +56,11 @@ pnpm test -- --watch
 
 ---
 
-## Using TestContract
+## Using TestContract (Interpreter-Based Testing)
 
-`TestContract` is the primary test helper. It compiles a contract from source, uses the interpreter (not the VM) to execute methods with mocked crypto, and tracks state changes.
+`TestContract` is the primary test helper. It compiles a contract from source, uses the **interpreter** (not the Script VM) to execute methods, and tracks state changes.
+
+> **Important:** `TestContract` uses mocked cryptographic operations — `checkSig`, `checkPreimage`, `verifyWOTS`, and all signature-related builtins always return `true`. This is intentional: it lets you test business logic (state transitions, assertions, arithmetic) without managing real keys or signatures. For tests that verify actual compiled Script execution, use `TestSmartContract` or `ScriptExecutionContract` instead.
 
 ### Creating an Instance
 
@@ -136,9 +138,9 @@ expect(result.success).toBe(true);
 
 ---
 
-## Script VM Testing
+## Script VM Testing (Compiled Script Execution)
 
-The `ScriptVM` class can be used directly for lower-level testing without the `TestSmartContract` wrapper.
+The `ScriptVM` class can be used directly for lower-level testing without the `TestSmartContract` wrapper. Unlike `TestContract` (which interprets ANF IR with mocked crypto), `ScriptVM` executes actual compiled Bitcoin Script opcodes.
 
 ```typescript
 import { ScriptVM, hexToBytes, bytesToHex, disassemble } from 'runar-testing';
@@ -823,7 +825,7 @@ Rúnar employs a layered testing strategy:
 |-------|--------------|------|
 | **Unit tests per pass** | Each compiler pass in isolation | vitest |
 | **End-to-end compilation** | Full pipeline: source to script | vitest + conformance golden files |
-| **VM execution** | Compiled script with specific inputs | `TestContract` + `ScriptVM` (note: `TestSmartContract` is the lower-level VM-based wrapper for compiled artifacts) |
+| **VM execution** | Compiled script with specific inputs | `TestSmartContract` / `ScriptVM` (execute compiled Bitcoin Script) |
 | **Interpreter oracle** | ANF IR evaluation matches VM execution | `RunarInterpreter` vs `ScriptVM` |
 | **Property-based fuzzing** | Random valid programs compile correctly | fast-check generators |
 | **Differential fuzzing** | Compiler + VM agree with interpreter | `conformance/fuzzer` |
