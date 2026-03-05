@@ -19,6 +19,8 @@ import type { StackOp } from '../ir/index.js';
 const FIELD_P = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn;
 /** p - 2, used for Fermat's little theorem modular inverse */
 const FIELD_P_MINUS_2 = FIELD_P - 2n;
+/** secp256k1 curve order */
+const CURVE_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 /** secp256k1 generator x-coordinate */
 const GEN_X = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798n;
 /** secp256k1 generator y-coordinate */
@@ -215,14 +217,17 @@ function fieldInv(t: ECTracker, aName: string, resultName: string): void {
 
   // Start: result = a (bit 255 = 1)
   t.copyToTop(aName, '_inv_r');
-  // Bits 254 down to 32: all 1's (223 bits)
-  for (let i = 0; i < 223; i++) {
+  // Bits 254 down to 33: all 1's (222 bits). Bit 32 is 0 (handled below).
+  for (let i = 0; i < 222; i++) {
     fieldSqr(t, '_inv_r', '_inv_r2');
     t.rename('_inv_r');
     t.copyToTop(aName, '_inv_a');
     fieldMul(t, '_inv_r', '_inv_a', '_inv_m');
     t.rename('_inv_r');
   }
+  // Bit 32 is 0: square only (no multiply)
+  fieldSqr(t, '_inv_r', '_inv_r2');
+  t.rename('_inv_r');
   // Bits 31 down to 0 of p-2
   const lowBits = Number(FIELD_P_MINUS_2 & 0xffffffffn);
   for (let i = 31; i >= 0; i--) {
@@ -447,8 +452,9 @@ function jacobianDouble(t: ECTracker): void {
   t.pushInt('_two2', 2n);
   fieldMul(t, '_yz', '_two2', '_nz');
 
-  // Clean up leftover _B, rename results
+  // Clean up leftovers: _B (used via _B_save/_B1) and old jz (only copied, never consumed)
   t.toTop('_B'); t.drop();
+  t.toTop('jz'); t.drop();
   t.toTop('_nx'); t.rename('jx');
   t.toTop('_ny'); t.rename('jy');
   t.toTop('_nz'); t.rename('jz');
@@ -576,23 +582,35 @@ export function emitEcAdd(emit: (op: StackOp) => void): void {
  * Stack in: [point, scalar] (scalar on top)
  * Stack out: [result_point]
  *
- * Uses 256-iteration double-and-add with Jacobian coordinates.
+ * Uses 255-iteration MSB-first double-and-add with Jacobian coordinates.
+ * Adds curve order n to k to guarantee bit 255 is set (k+n always has
+ * bit 255 set since n starts with 0xFFFF...). k+n may overflow to 257
+ * bits for large k, but OP_DIV handles arbitrary-precision integers.
  */
 export function emitEcMul(emit: (op: StackOp) => void): void {
   const t = new ECTracker(['_pt', '_k'], emit);
-  // Decompose to affine base point
   decomposePoint(t, '_pt', 'ax', 'ay');
-  // Initialize Jacobian accumulator = base point (Z=1)
+
+  // k' = k + n: guarantees bit 255 is set for the MSB-first double-and-add.
+  // Since k ∈ [1, n-1] and n starts with 0xFFFF..., k+n always has bit 255 set.
+  // k+n may be up to 257 bits for large k, but OP_DIV handles big numbers.
+  t.toTop('_k');
+  t.pushInt('_n', CURVE_N);
+  t.rawBlock(['_k', '_n'], '_kn', (e) => {
+    e({ op: 'opcode', code: 'OP_ADD' });
+  });
+  t.rename('_k');
+
+  // Init accumulator = P (bit 255 of k+n is always 1)
   t.copyToTop('ax', 'jx');
   t.copyToTop('ay', 'jy');
   t.pushInt('jz', 1n);
 
   // 255 iterations: bits 254 down to 0
   for (let bit = 254; bit >= 0; bit--) {
-    // Double accumulator
     jacobianDouble(t);
 
-    // Extract bit: (k >> bit) & 1, using OP_DIV for right-shift
+    // Extract bit: (k >> bit) % 2
     t.copyToTop('_k', '_k_copy');
     if (bit > 0) {
       const divisor = 1n << BigInt(bit);
@@ -603,29 +621,28 @@ export function emitEcMul(emit: (op: StackOp) => void): void {
     } else {
       t.rename('_shifted');
     }
-    t.pushInt('_one', 1n);
-    t.rawBlock(['_shifted', '_one'], '_bit', (e) => {
-      e({ op: 'opcode', code: 'OP_AND' });
+    t.pushInt('_two', 2n);
+    t.rawBlock(['_shifted', '_two'], '_bit', (e) => {
+      e({ op: 'opcode', code: 'OP_MOD' });
     });
 
-    // Conditional add: if bit is 1, add base point to accumulator
+    // Move _bit to TOS and remove from tracker BEFORE generating add ops,
+    // because OP_IF consumes _bit and the add ops run with _bit already gone.
+    t.toTop('_bit');
+    t.nm.pop(); // _bit consumed by IF
     const addOps: StackOp[] = [];
     const addEmit = (op: StackOp) => addOps.push(op);
     buildJacobianAddAffineInline(addEmit, t);
-    t.toTop('_bit');
-    t.nm.pop(); // consumed by IF
     emit({ op: 'if', then: addOps, else: [] });
   }
 
-  // Convert Jacobian to affine
   jacobianToAffine(t, '_rx', '_ry');
 
-  // Clean up base point and scalar
+  // Clean up
   t.toTop('ax'); t.drop();
   t.toTop('ay'); t.drop();
   t.toTop('_k'); t.drop();
 
-  // Compose result
   composePoint(t, '_rx', '_ry', '_result');
 }
 
@@ -716,8 +733,8 @@ export function emitEcEncodeCompressed(emit: (op: StackOp) => void): void {
   emit({ op: 'opcode', code: 'OP_SPLIT' });
   // Stack: [x_bytes, y_prefix, last_byte]
   emit({ op: 'opcode', code: 'OP_BIN2NUM' });
-  emit({ op: 'push', value: 1n });
-  emit({ op: 'opcode', code: 'OP_AND' });
+  emit({ op: 'push', value: 2n });
+  emit({ op: 'opcode', code: 'OP_MOD' });
   // Stack: [x_bytes, y_prefix, parity]
   emit({ op: 'swap' });
   emit({ op: 'drop' }); // drop y_prefix

@@ -15,6 +15,10 @@
     "conformance:rust": "cd compilers/rust && PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --test compiler_tests",
     "conformance:multi": "cd conformance && npx tsx runner/index.ts --tests-dir tests --multi-format",
     "conformance:all": "pnpm run conformance:ts && pnpm run conformance:go && pnpm run conformance:rust",
+    "integration": "cd integration && go test -tags integration -v -timeout 600s",
+    "integration:regtest:start": "cd integration && ./regtest.sh start",
+    "integration:regtest:stop": "cd integration && ./regtest.sh stop",
+    "integration:regtest:clean": "cd integration && ./regtest.sh clean",
     "whitepaper": "cd docs && pdflatex -interaction=nonstopmode runar-whitepaper.tex && pdflatex -interaction=nonstopmode runar-whitepaper.tex && pdflatex -interaction=nonstopmode runar-whitepaper.tex"
   },
   "devDependencies": {

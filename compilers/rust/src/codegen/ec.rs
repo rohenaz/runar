@@ -15,6 +15,15 @@ use super::stack::{PushValue, StackOp};
 /// Low 32 bits of (p - 2) = 0xFFFFFC2D.
 const FIELD_P_MINUS_2_LOW32: u32 = 0xFFFF_FC2D;
 
+/// secp256k1 curve order n as a Bitcoin script number (little-endian sign-magnitude).
+/// n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+/// Reversed to LE with 0x00 sign byte appended (MSB 0xff has bit 7 set).
+const CURVE_N_SCRIPT_NUM: [u8; 33] = [
+    0x41, 0x41, 0x36, 0xd0, 0x8c, 0x5e, 0xd2, 0xbf, 0x3b, 0xa0, 0x48, 0xaf,
+    0xe6, 0xdc, 0xae, 0xba, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+];
+
 /// secp256k1 generator x-coordinate (32 bytes, big-endian).
 const GEN_X_BYTES: [u8; 32] = [
     0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95,
@@ -315,14 +324,17 @@ fn field_inv(t: &mut ECTracker, a_name: &str, result_name: &str) {
 
     // Start: result = a (bit 255 = 1)
     t.copy_to_top(a_name, "_inv_r");
-    // Bits 254 down to 32: all 1's (223 bits)
-    for _i in 0..223 {
+    // Bits 254 down to 33: all 1's (222 bits). Bit 32 is 0 (handled below).
+    for _i in 0..222 {
         field_sqr(t, "_inv_r", "_inv_r2");
         t.rename("_inv_r");
         t.copy_to_top(a_name, "_inv_a");
         field_mul(t, "_inv_r", "_inv_a", "_inv_m");
         t.rename("_inv_r");
     }
+    // Bit 32 is 0: square only (no multiply)
+    field_sqr(t, "_inv_r", "_inv_r2");
+    t.rename("_inv_r");
     // Bits 31 down to 0 of p-2
     let low_bits = FIELD_P_MINUS_2_LOW32;
     for i in (0..=31).rev() {
@@ -537,8 +549,9 @@ fn jacobian_double(t: &mut ECTracker) {
     t.push_int("_two2", 2);
     field_mul(t, "_yz", "_two2", "_nz");
 
-    // Clean up leftover _B, rename results
+    // Clean up leftovers: _B (used via _B_save/_B1) and old jz (only copied, never consumed)
     t.to_top("_B"); t.drop();
+    t.to_top("jz"); t.drop();
     t.to_top("_nx"); t.rename("jx");
     t.to_top("_ny"); t.rename("jy");
     t.to_top("_nz"); t.rename("jz");
@@ -666,7 +679,16 @@ pub fn emit_ec_mul(emit: &mut dyn FnMut(StackOp)) {
     let mut t = ECTracker::new(&["_pt", "_k"], emit);
     // Decompose to affine base point
     decompose_point(&mut t, "_pt", "ax", "ay");
-    // Initialize Jacobian accumulator = base point (Z=1)
+
+    // k' = k + n: guarantees bit 255 is set.
+    t.to_top("_k");
+    t.push_bytes("_n", CURVE_N_SCRIPT_NUM.to_vec());
+    t.raw_block(&["_k", "_n"], Some("_kn"), |e| {
+        e(StackOp::Opcode("OP_ADD".into()));
+    });
+    t.rename("_k");
+
+    // Init accumulator = P (bit 255 is always 1, serves as initializer)
     t.copy_to_top("ax", "jx");
     t.copy_to_top("ay", "jy");
     t.push_int("jz", 1);
@@ -693,17 +715,18 @@ pub fn emit_ec_mul(emit: &mut dyn FnMut(StackOp)) {
         } else {
             t.rename("_shifted");
         }
-        t.push_int("_one", 1);
-        t.raw_block(&["_shifted", "_one"], Some("_bit"), |e| {
-            e(StackOp::Opcode("OP_AND".into()));
+        t.push_int("_two", 2);
+        t.raw_block(&["_shifted", "_two"], Some("_bit"), |e| {
+            e(StackOp::Opcode("OP_MOD".into()));
         });
 
-        // Conditional add: if bit is 1, add base point to accumulator
+        // Move _bit to TOS and remove from tracker BEFORE generating add ops,
+        // because OP_IF consumes _bit and the add ops run with _bit already gone.
+        t.to_top("_bit");
+        t.nm.pop(); // _bit consumed by IF
         let add_ops = collect_ops(|add_emit| {
             build_jacobian_add_affine_inline(add_emit, &t);
         });
-        t.to_top("_bit");
-        t.nm.pop(); // consumed by IF
         (t.e)(StackOp::If {
             then_ops: add_ops,
             else_ops: vec![],
@@ -799,8 +822,8 @@ pub fn emit_ec_encode_compressed(emit: &mut dyn FnMut(StackOp)) {
     emit(StackOp::Opcode("OP_SPLIT".into()));
     // Stack: [x_bytes, y_prefix, last_byte]
     emit(StackOp::Opcode("OP_BIN2NUM".into()));
-    emit(StackOp::Push(PushValue::Int(1)));
-    emit(StackOp::Opcode("OP_AND".into()));
+    emit(StackOp::Push(PushValue::Int(2)));
+    emit(StackOp::Opcode("OP_MOD".into()));
     // Stack: [x_bytes, y_prefix, parity]
     emit(StackOp::Swap);
     emit(StackOp::Drop); // drop y_prefix

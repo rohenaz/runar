@@ -129,6 +129,11 @@ export interface CheckPreimage {
   preimage: string; // reference to a temp name
 }
 
+export interface DeserializeState {
+  kind: 'deserialize_state';
+  preimage: string; // reference to a temp name holding the verified preimage
+}
+
 export interface AddOutput {
   kind: 'add_output';
   satoshis: string;       // reference to a temp holding satoshis bigint
@@ -149,4 +154,5 @@ export type ANFValue =
   | UpdateProp
   | GetStateScript
   | CheckPreimage
+  | DeserializeState
   | AddOutput;

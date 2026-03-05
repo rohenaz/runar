@@ -14,7 +14,7 @@
  * Used by the Rúnar interpreter for real verification in dual-oracle tests.
  */
 
-import { createHash, randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 // ---------------------------------------------------------------------------
 // Constants

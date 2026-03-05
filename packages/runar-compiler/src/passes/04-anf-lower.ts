@@ -91,6 +91,15 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       const checkResult = methodCtx.emit({ kind: 'check_preimage', preimage: preimageRef });
       methodCtx.emit({ kind: 'assert', value: checkResult });
 
+      // Deserialize mutable state from the preimage's scriptCode.
+      // On subsequent spends, the state is embedded in the script (after OP_RETURN),
+      // so we extract it from the scriptCode field rather than using hardcoded initial values.
+      const stateProps = contract.properties.filter(p => p.kind === 'property' && !p.readonly);
+      if (stateProps.length > 0) {
+        const preimageRef3 = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
+        methodCtx.emit({ kind: 'deserialize_state', preimage: preimageRef3 });
+      }
+
       // Lower the developer's method body
       lowerStatements(method.body, methodCtx);
 
@@ -108,10 +117,14 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
         const eqRef = methodCtx.emit({ kind: 'bin_op', op: '===', left: hashRef, right: outputHashRef, result_type: 'bytes' });
         methodCtx.emit({ kind: 'assert', value: eqRef });
       } else if (methodMutatesState(method, contract)) {
-        // Single-output continuation (existing behavior)
+        // Single-output continuation: build full output serialization hash and
+        // compare with hashOutputs from the BIP-143 preimage.
+        // computeStateOutputHash extracts codePart and amount from the preimage,
+        // builds: amount(8LE) + varint(scriptLen) + codePart + OP_RETURN + stateBytes,
+        // and returns hash256 of the result.
         const stateScriptRef = methodCtx.emit({ kind: 'get_state_script' });
-        const hashRef = methodCtx.emit({ kind: 'call', func: 'hash256', args: [stateScriptRef] });
         const preimageRef2 = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
+        const hashRef = methodCtx.emit({ kind: 'call', func: 'computeStateOutputHash', args: [preimageRef2, stateScriptRef] });
         const outputHashRef = methodCtx.emit({ kind: 'call', func: 'extractOutputHash', args: [preimageRef2] });
         const eqRef = methodCtx.emit({ kind: 'bin_op', op: '===', left: hashRef, right: outputHashRef, result_type: 'bytes' });
         methodCtx.emit({ kind: 'assert', value: eqRef });
@@ -161,6 +174,9 @@ class LoweringContext {
   private readonly paramNames: Set<string> = new Set();
   private readonly localNames: Set<string> = new Set();
   private readonly _addOutputRefs: string[] = [];
+  /** Maps local variable names to their current ANF binding name.
+   *  Updated after if-statements that reassign locals in both branches. */
+  private readonly localAliases: Map<string, string> = new Map();
 
   constructor(contract: ContractNode) {
     this.contract = contract;
@@ -199,6 +215,16 @@ class LoweringContext {
 
   isLocal(name: string): boolean {
     return this.localNames.has(name);
+  }
+
+  /** Set the current ANF binding for a local variable (after if-statement reassignment). */
+  setLocalAlias(localName: string, bindingName: string): void {
+    this.localAliases.set(localName, bindingName);
+  }
+
+  /** Get the current ANF binding for a local variable, or undefined if not aliased. */
+  getLocalAlias(localName: string): string | undefined {
+    return this.localAliases.get(localName);
   }
 
   isProperty(name: string): boolean {
@@ -242,9 +268,10 @@ class LoweringContext {
   subContext(): LoweringContext {
     const sub = new LoweringContext(this.contract);
     sub.counter = this.counter;
-    // Share the parameter and local name sets
+    // Share the parameter, local name sets, and aliases
     for (const p of this.paramNames) sub.paramNames.add(p);
     for (const l of this.localNames) sub.localNames.add(l);
+    for (const [k, v] of this.localAliases) sub.localAliases.set(k, v);
     return sub;
   }
 
@@ -345,12 +372,23 @@ function lowerIfStatement(
   }
   ctx.syncCounter(elseCtx);
 
-  ctx.emit({
+  const ifName = ctx.emit({
     kind: 'if',
     cond: condRef,
     then: thenCtx.bindings,
     else: elseCtx.bindings,
   });
+
+  // If both branches end by reassigning the same local variable,
+  // alias that variable to the if-expression result so that subsequent
+  // references resolve to the branch output, not the dead initial value.
+  const thenLast = thenCtx.bindings[thenCtx.bindings.length - 1];
+  const elseLast = elseCtx.bindings[elseCtx.bindings.length - 1];
+  if (thenLast && elseLast &&
+      thenLast.name === elseLast.name &&
+      ctx.isLocal(thenLast.name)) {
+    ctx.setLocalAlias(thenLast.name, ifName);
+  }
 }
 
 function lowerForStatement(
@@ -511,8 +549,9 @@ function lowerIdentifier(
   }
 
   // Check if it's a local variable -- reference it directly
+  // (or use its alias if reassigned by an if-statement)
   if (ctx.isLocal(name)) {
-    return name;
+    return ctx.getLocalAlias(name) ?? name;
   }
 
   // Check if it's a contract property

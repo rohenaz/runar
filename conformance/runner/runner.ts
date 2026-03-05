@@ -208,13 +208,13 @@ function runGoCompiler(source: string, sourceFile: string): CompilerOutput | und
     // Get IR output
     const irOutput = execSync(
       `${binary} --source ${shellEscape(tmpFile)} --emit-ir`,
-      { timeout: 30_000, encoding: 'utf-8', cwd: GO_COMPILER_DIR },
+      { timeout: 30_000, encoding: 'utf-8', cwd: GO_COMPILER_DIR, maxBuffer: 10 * 1024 * 1024 },
     ).trim();
 
     // Get script hex output
     const scriptHexOutput = execSync(
       `${binary} --source ${shellEscape(tmpFile)} --hex`,
-      { timeout: 30_000, encoding: 'utf-8', cwd: GO_COMPILER_DIR },
+      { timeout: 30_000, encoding: 'utf-8', cwd: GO_COMPILER_DIR, maxBuffer: 10 * 1024 * 1024 },
     ).trim();
 
     const durationMs = performance.now() - start;
@@ -261,6 +261,7 @@ function runRustCompiler(source: string, sourceFile: string): CompilerOutput | u
         encoding: 'utf-8',
         cwd: RUST_COMPILER_DIR,
         env: cargoAwareEnv(),
+        maxBuffer: 10 * 1024 * 1024,
       },
     ).trim();
 
@@ -272,6 +273,7 @@ function runRustCompiler(source: string, sourceFile: string): CompilerOutput | u
         encoding: 'utf-8',
         cwd: RUST_COMPILER_DIR,
         env: cargoAwareEnv(),
+        maxBuffer: 10 * 1024 * 1024,
       },
     ).trim();
 

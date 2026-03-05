@@ -7,5 +7,6 @@ use (
 	./end2end-example/webapp
 	./end2end-example/webapp-blackjack
 	./examples/go
+	./integration
 	./packages/runar-go
 )

@@ -133,6 +133,9 @@ pub enum ANFValue {
     #[serde(rename = "check_preimage")]
     CheckPreimage { preimage: String },
 
+    #[serde(rename = "deserialize_state")]
+    DeserializeState { preimage: String },
+
     #[serde(rename = "add_output")]
     AddOutput {
         satoshis: String,

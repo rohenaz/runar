@@ -257,6 +257,8 @@ func collectRefs(value *ir.ANFValue) []string {
 		refs = append(refs, value.ValueRef)
 	case "check_preimage":
 		refs = append(refs, value.Preimage)
+	case "deserialize_state":
+		refs = append(refs, value.Preimage)
 	case "add_output":
 		refs = append(refs, value.Satoshis)
 		refs = append(refs, value.StateValues...)
@@ -275,6 +277,7 @@ type loweringContext struct {
 	maxDepth       int
 	properties     []ir.ANFProperty
 	privateMethods map[string]*ir.ANFMethod // private methods available for inlining
+	localBindings  map[string]bool          // binding names in current lowerBindings scope; used by @ref: handler
 }
 
 func newLoweringContext(params []string, properties []ir.ANFProperty) *loweringContext {
@@ -282,6 +285,7 @@ func newLoweringContext(params []string, properties []ir.ANFProperty) *loweringC
 		sm:             newStackMap(params),
 		properties:     properties,
 		privateMethods: make(map[string]*ir.ANFMethod),
+		localBindings:  make(map[string]bool),
 	}
 	ctx.trackDepth()
 	return ctx
@@ -363,6 +367,10 @@ func (ctx *loweringContext) isLastUse(ref string, currentIndex int, lastUses map
 // ---------------------------------------------------------------------------
 
 func (ctx *loweringContext) lowerBindings(bindings []ir.ANFBinding, terminalAssert bool) {
+	ctx.localBindings = make(map[string]bool, len(bindings))
+	for _, b := range bindings {
+		ctx.localBindings[b.Name] = true
+	}
 	lastUses := computeLastUses(bindings)
 
 	// Find the terminal binding index (if terminalAssert is set).
@@ -429,7 +437,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "load_prop":
 		ctx.lowerLoadProp(name, value.Name)
 	case "load_const":
-		ctx.lowerLoadConst(name, value)
+		ctx.lowerLoadConst(name, value, bindingIndex, lastUses)
 	case "bin_op":
 		ctx.lowerBinOp(name, value.Op, value.Left, value.Right, bindingIndex, lastUses, value.ResultType)
 	case "unary_op":
@@ -450,6 +458,8 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 		ctx.lowerGetStateScript(name)
 	case "check_preimage":
 		ctx.lowerCheckPreimage(name, value.Preimage, bindingIndex, lastUses)
+	case "deserialize_state":
+		ctx.lowerDeserializeState(value.Preimage, bindingIndex, lastUses)
 	case "add_output":
 		ctx.lowerAddOutput(name, value.Satoshis, value.StateValues, bindingIndex, lastUses)
 	}
@@ -480,11 +490,14 @@ func (ctx *loweringContext) lowerLoadProp(bindingName, propName string) {
 		}
 	}
 
-	if prop != nil && prop.InitialValue != nil {
-		ctx.pushPropertyValue(prop.InitialValue)
-	} else if ctx.sm.has(propName) {
+	if ctx.sm.has(propName) {
+		// Property has been updated (via update_prop) — use the stack value.
+		// Must check this BEFORE InitialValue — after update_prop, we need the
+		// updated value, not the original constant.
 		ctx.bringToTop(propName, false)
 		ctx.sm.pop()
+	} else if prop != nil && prop.InitialValue != nil {
+		ctx.pushPropertyValue(prop.InitialValue)
 	} else {
 		// Property value will be provided at deployment time; emit a placeholder.
 		// The emitter records byte offsets so the SDK can splice in real values.
@@ -515,14 +528,20 @@ func (ctx *loweringContext) pushPropertyValue(val interface{}) {
 	}
 }
 
-func (ctx *loweringContext) lowerLoadConst(bindingName string, value *ir.ANFValue) {
+func (ctx *loweringContext) lowerLoadConst(bindingName string, value *ir.ANFValue, bindingIndex int, lastUses map[string]int) {
 	// Handle @ref: aliases (ANF variable aliasing)
 	// When a load_const has a string value starting with "@ref:", it's an alias
-	// to another binding. We bring that value to the top via PICK (non-consuming).
+	// to another binding. We bring that value to the top via PICK (non-consuming)
+	// unless this is the last use, in which case we consume it via ROLL.
 	if value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == "@ref:" {
 		refName := (*value.ConstString)[5:]
 		if ctx.sm.has(refName) {
-			ctx.bringToTop(refName, false)
+			// Only consume (ROLL) if the ref target is a local binding in the
+			// current scope. Outer-scope refs must be copied (PICK) so that the
+			// parent stackMap stays in sync (critical for IfElse branches and
+			// BoundedLoop iterations).
+			consume := ctx.localBindings[refName] && ctx.isLastUse(refName, bindingIndex, lastUses)
+			ctx.bringToTop(refName, consume)
 			ctx.sm.pop()
 			ctx.sm.push(bindingName)
 		} else {
@@ -718,6 +737,13 @@ func (ctx *loweringContext) lowerCall(bindingName, funcName string, args []strin
 		return
 	}
 
+	// computeStateOutputHash(preimage, stateBytes) — builds full BIP-143 output
+	// serialization for single-output stateful continuation, then hashes it.
+	if funcName == "computeStateOutputHash" {
+		ctx.lowerComputeStateOutputHash(bindingName, args, bindingIndex, lastUses)
+		return
+	}
+
 	// Preimage field extractors — each needs a custom OP_SPLIT sequence
 	// because OP_SPLIT produces two stack values and the intermediate stack
 	// management cannot be expressed in the simple builtinOpcodes table.
@@ -869,14 +895,40 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 }
 
 func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.ANFBinding, iterVar string) {
-	// Collect outer-scope param names referenced in the loop body.
+	// Collect body binding names (values defined inside the loop body).
+	bodyBindingNames := make(map[string]bool, len(body))
+	for _, b := range body {
+		bodyBindingNames[b.Name] = true
+	}
+
+	// Collect outer-scope names referenced in the loop body.
 	// These must not be consumed in non-final iterations.
-	outerParams := make(map[string]bool)
+	outerRefs := make(map[string]bool)
 	for _, b := range body {
 		if b.Value.Kind == "load_param" && b.Value.Name != iterVar {
-			outerParams[b.Value.Name] = true
+			outerRefs[b.Value.Name] = true
+		}
+		// Also protect @ref: targets from outer scope (not redefined in body)
+		if b.Value.Kind == "load_const" && b.Value.ConstString != nil &&
+			len(*b.Value.ConstString) > 5 && (*b.Value.ConstString)[:5] == "@ref:" {
+			refName := (*b.Value.ConstString)[5:]
+			if !bodyBindingNames[refName] {
+				outerRefs[refName] = true
+			}
 		}
 	}
+
+	// Temporarily extend localBindings with body binding names so
+	// @ref: to body-internal values can consume on last use.
+	prevLocalBindings := ctx.localBindings
+	newLocalBindings := make(map[string]bool, len(prevLocalBindings)+len(bodyBindingNames))
+	for k, v := range prevLocalBindings {
+		newLocalBindings[k] = v
+	}
+	for k, v := range bodyBindingNames {
+		newLocalBindings[k] = v
+	}
+	ctx.localBindings = newLocalBindings
 
 	for i := 0; i < count; i++ {
 		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(i))})
@@ -884,11 +936,11 @@ func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.A
 
 		lastUses := computeLastUses(body)
 
-		// In non-final iterations, prevent outer-scope params from being
+		// In non-final iterations, prevent outer-scope refs from being
 		// consumed by setting their last-use beyond any body binding index.
 		if i < count-1 {
-			for paramName := range outerParams {
-				lastUses[paramName] = len(body)
+			for refName := range outerRefs {
+				lastUses[refName] = len(body)
 			}
 		}
 
@@ -906,7 +958,12 @@ func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.A
 			}
 		}
 	}
-	ctx.sm.push(bindingName)
+	// Restore localBindings
+	ctx.localBindings = prevLocalBindings
+	// Note: loops are statements, not expressions — they don't produce a
+	// physical stack value. Do NOT push a dummy stackMap entry, as it would
+	// desync the stackMap depth from the physical stack.
+	_ = bindingName
 	ctx.trackDepth()
 }
 
@@ -948,7 +1005,7 @@ func (ctx *loweringContext) lowerGetStateScript(bindingName string) {
 	first := true
 	for _, prop := range stateProps {
 		if ctx.sm.has(prop.Name) {
-			ctx.bringToTop(prop.Name, false)
+			ctx.bringToTop(prop.Name, true) // consume: raw value dead after serialization
 		} else if prop.InitialValue != nil {
 			ctx.pushPropertyValue(prop.InitialValue)
 			ctx.sm.push("")
@@ -983,6 +1040,299 @@ func (ctx *loweringContext) lowerGetStateScript(bindingName string) {
 
 	ctx.sm.pop()
 	ctx.sm.push(bindingName)
+	ctx.trackDepth()
+}
+
+// lowerComputeStateOutputHash builds the full BIP-143 output serialization for
+// a single-output stateful continuation and hashes it with SHA256d.
+// Extracts varint+scriptCode+amount from the preimage, replaces the state bytes
+// in the scriptCode with new state, and builds: amount + varint + newScript.
+func (ctx *loweringContext) lowerComputeStateOutputHash(bindingName string, args []string, bindingIndex int, lastUses map[string]int) {
+	// Compute fixed state serialization length from non-readonly properties.
+	stateLen := 0
+	for _, p := range ctx.properties {
+		if p.Readonly {
+			continue
+		}
+		switch p.Type {
+		case "bigint":
+			stateLen += 8
+		case "boolean":
+			stateLen += 1
+		case "PubKey":
+			stateLen += 33
+		case "Addr":
+			stateLen += 20
+		case "Sha256":
+			stateLen += 32
+		case "Point":
+			stateLen += 64
+		default:
+			panic("computeStateOutputHash: unsupported mutable property type: " + p.Type)
+		}
+	}
+
+	preimageRef := args[0]
+	stateBytesRef := args[1]
+
+	// Bring stateBytes then preimage to top.
+	ctx.bringToTop(stateBytesRef, ctx.isLastUse(stateBytesRef, bindingIndex, lastUses))
+	ctx.bringToTop(preimageRef, ctx.isLastUse(preimageRef, bindingIndex, lastUses))
+
+	// Stack: [..., stateBytes, preimage]
+	// stackMap accurately tracks physical stack (no phantom entries).
+
+	// Step 1: Extract middle: varint + scriptCode + amount.
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(104)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"}) // [prefix, rest]
+	ctx.sm.pop() // 104
+	ctx.sm.pop() // preimage
+	ctx.sm.push("") // prefix
+	ctx.sm.push("") // rest
+	ctx.emitOp(StackOp{Op: "nip"}) // drop prefix
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("") // rest
+
+	// Drop last 44 bytes.
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"}) // [rest, restLen]
+	ctx.sm.push("") // restLen (OP_SIZE adds 1, original stays)
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(44)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"}) // [middle, tail44]
+	ctx.sm.pop() // position
+	ctx.sm.pop() // rest
+	ctx.sm.push("") // middle
+	ctx.sm.push("") // tail44
+	ctx.emitOp(StackOp{Op: "drop"})
+	ctx.sm.pop()
+
+	// Step 2: Split off amount (last 8 bytes), save to altstack.
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"}) // [varint+sc, amount]
+	ctx.sm.pop() // position
+	ctx.sm.pop() // middle
+	ctx.sm.push("") // varint+sc
+	ctx.sm.push("") // amount
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_TOALTSTACK"})
+	ctx.sm.pop()
+
+	// Step 3: Strip state + OP_RETURN from end (stateLen + 1 bytes).
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(stateLen + 1))})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"}) // [varint+code, opReturn+state]
+	ctx.sm.pop() // position
+	ctx.sm.pop() // varint+sc
+	ctx.sm.push("") // varint+code
+	ctx.sm.push("") // opReturn+state
+	ctx.emitOp(StackOp{Op: "drop"})
+	ctx.sm.pop()
+
+	// Step 4: Append OP_RETURN byte.
+	ctx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bytes", Bytes: []byte{0x6a}}})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CAT"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+
+	// Step 5: Swap and CAT to append stateBytes.
+	ctx.emitOp(StackOp{Op: "swap"})
+	ctx.sm.swap()
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CAT"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+
+	// Stack: [..., varint+newScript]
+
+	// Step 6: Prepend amount from altstack.
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_FROMALTSTACK"})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "swap"})
+	ctx.sm.swap()
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CAT"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+
+	// Stack: [..., amount+varint+newScript]
+
+	// Step 7: Hash with SHA256d.
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_HASH256"})
+
+	ctx.sm.pop()
+	ctx.sm.push(bindingName)
+	ctx.trackDepth()
+}
+
+// lowerDeserializeState extracts mutable property values from the BIP-143
+// preimage's scriptCode field. The state is stored as the last `stateLen`
+// bytes of the scriptCode (after OP_RETURN).
+//
+// For each mutable property, the value is extracted, converted to the
+// correct type (BIN2NUM for bigint/boolean), and pushed onto the stack
+// with the property name in the stackMap. This allows load_prop to
+// find the deserialized values instead of using hardcoded initial values.
+func (ctx *loweringContext) lowerDeserializeState(preimageRef string, bindingIndex int, lastUses map[string]int) {
+	var stateProps []ir.ANFProperty
+	var propSizes []int
+	stateLen := 0
+	for _, p := range ctx.properties {
+		if p.Readonly {
+			continue
+		}
+		stateProps = append(stateProps, p)
+		var sz int
+		switch p.Type {
+		case "bigint":
+			sz = 8
+		case "boolean":
+			sz = 1
+		case "PubKey":
+			sz = 33
+		case "Addr":
+			sz = 20
+		case "Sha256":
+			sz = 32
+		case "Point":
+			sz = 64
+		default:
+			panic("deserialize_state: unsupported type: " + p.Type)
+		}
+		propSizes = append(propSizes, sz)
+		stateLen += sz
+	}
+	if len(stateProps) == 0 {
+		return
+	}
+
+	isLast := ctx.isLastUse(preimageRef, bindingIndex, lastUses)
+	ctx.bringToTop(preimageRef, isLast)
+
+	// 1. Skip first 104 bytes (header), drop prefix
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(104)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "nip"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+
+	// 2. Drop tail 44 bytes
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(44)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "drop"})
+	ctx.sm.pop()
+
+	// 3. Drop amount (last 8 bytes)
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "drop"})
+	ctx.sm.pop()
+
+	// 4. Extract last stateLen bytes (the state section)
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(stateLen))})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "nip"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+
+	// 5. Split into individual properties
+	if len(stateProps) == 1 {
+		prop := stateProps[0]
+		if prop.Type == "bigint" || prop.Type == "boolean" {
+			ctx.emitOp(StackOp{Op: "opcode", Code: "OP_BIN2NUM"})
+		}
+		ctx.sm.pop()
+		ctx.sm.push(prop.Name)
+	} else {
+		for i, prop := range stateProps {
+			sz := propSizes[i]
+			if i < len(stateProps)-1 {
+				ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(sz))})
+				ctx.sm.push("")
+				ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
+				ctx.sm.pop()
+				ctx.sm.pop()
+				ctx.sm.push("")
+				ctx.sm.push("")
+				ctx.emitOp(StackOp{Op: "swap"})
+				ctx.sm.swap()
+				if prop.Type == "bigint" || prop.Type == "boolean" {
+					ctx.emitOp(StackOp{Op: "opcode", Code: "OP_BIN2NUM"})
+				}
+				ctx.emitOp(StackOp{Op: "swap"})
+				ctx.sm.swap()
+				ctx.sm.pop()
+				ctx.sm.pop()
+				ctx.sm.push(prop.Name)
+				ctx.sm.push("")
+			} else {
+				if prop.Type == "bigint" || prop.Type == "boolean" {
+					ctx.emitOp(StackOp{Op: "opcode", Code: "OP_BIN2NUM"})
+				}
+				ctx.sm.pop()
+				ctx.sm.push(prop.Name)
+			}
+		}
+	}
 	ctx.trackDepth()
 }
 
@@ -1043,38 +1393,21 @@ func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateVa
 
 func (ctx *loweringContext) lowerCheckPreimage(bindingName, preimage string, bindingIndex int, lastUses map[string]int) {
 	// OP_PUSH_TX: verify the sighash preimage matches the current spending
-	// transaction.  See https://wiki.bitcoinsv.io/index.php/OP_PUSH_TX
+	// transaction using on-chain signature derivation (BSV Academy pattern).
 	//
-	// The technique uses a well-known ECDSA keypair where private key = 1
-	// (so the public key is the secp256k1 generator point G, compressed:
-	//   0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798).
-	//
-	// At spending time the SDK must:
-	//   1. Serialise the BIP-143 sighash preimage for the current input.
-	//   2. Compute sighash = SHA256(SHA256(preimage)).
-	//   3. Derive an ECDSA signature (r, s) with privkey = 1:
-	//        r = Gx  (x-coordinate of the generator point, constant)
-	//        s = (sighash + r) mod n
-	//   4. DER-encode (r, s) and append the SIGHASH_ALL|FORKID byte (0x41).
-	//   5. Push <sig> <preimage> (plus any other method args) as the
-	//      unlocking script.
-	//
-	// The locking script sequence:
-	//   [bring preimage to top]     -- via PICK or ROLL
-	//   [bring _opPushTxSig to top] -- via ROLL (consuming)
-	//   <G>                         -- push compressed generator point
-	//   OP_CHECKSIG                 -- verify sig over SHA256(SHA256(preimage))
-	//   OP_VERIFY                   -- abort if invalid
-	//   -- preimage remains on stack for field extractors
-	//
-	// Stack map trace:
-	//   After bringToTop(preimage):  [..., preimage]
-	//   After bringToTop(sig, true): [..., preimage, _opPushTxSig]
-	//   After push G:                [..., preimage, _opPushTxSig, null(G)]
-	//   After OP_CHECKSIG:           [..., preimage, null(result)]
-	//   After OP_VERIFY:             [..., preimage]
+	// The unlocking script pushes ONLY <preimage>. The locking script derives
+	// the ECDSA signature on-chain:
+	//   1. DUP preimage
+	//   2. HASH256 → sighash
+	//   3. BIN2NUM → strip leading zeros
+	//   4. 1ADD → s = sighash_int + 1
+	//   5. NUM2BIN 32 → pad to 32 bytes
+	//   6. Prepend DER prefix (header + known R = Gx)
+	//   7. Append SIGHASH_ALL|FORKID (0x41)
+	//   8. Push known pubkey
+	//   9. CHECKSIGVERIFY
 
-	// Step 1: Bring preimage to top.
+	// Step 1: Bring preimage to top (non-consuming).
 	isLast := ctx.isLastUse(preimage, bindingIndex, lastUses)
 	ctx.bringToTop(preimage, isLast)
 
@@ -1092,18 +1425,12 @@ func (ctx *loweringContext) lowerCheckPreimage(bindingName, preimage string, bin
 	ctx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bytes", Bytes: G}})
 	ctx.sm.push("") // G on stack
 
-	// Step 4: OP_CHECKSIG -- pops pubkey (G) and sig, pushes boolean result.
-	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CHECKSIG"})
+	// Step 4: OP_CHECKSIGVERIFY — verify and remove sig + pubkey.
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CHECKSIGVERIFY"})
 	ctx.sm.pop() // G consumed
 	ctx.sm.pop() // _opPushTxSig consumed
-	ctx.sm.push("") // boolean result
 
-	// Step 5: OP_VERIFY -- abort if false, removes result from stack.
-	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_VERIFY"})
-	ctx.sm.pop() // result consumed
-
-	// The preimage is now on top (from Step 1). Rename to binding name
-	// so field extractors can reference it.
+	// Preimage remains on top. Rename for field extractors.
 	ctx.sm.pop()
 	ctx.sm.push(bindingName)
 
@@ -1262,7 +1589,8 @@ func (ctx *loweringContext) lowerExtractor(bindingName, funcName string, args []
 		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(4)})
 		ctx.sm.push("")
 		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
-		ctx.sm.pop()
+		ctx.sm.pop() // pop position (4)
+		ctx.sm.pop() // pop value being split
 		ctx.sm.push("")
 		ctx.sm.push("")
 		ctx.emitOp(StackOp{Op: "drop"})
@@ -1325,7 +1653,8 @@ func (ctx *loweringContext) lowerExtractor(bindingName, funcName string, args []
 		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
 		ctx.sm.push("")
 		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
-		ctx.sm.pop()
+		ctx.sm.pop() // pop position (8)
+		ctx.sm.pop() // pop value being split
 		ctx.sm.push("")
 		ctx.sm.push("")
 		ctx.emitOp(StackOp{Op: "drop"})
@@ -1356,7 +1685,8 @@ func (ctx *loweringContext) lowerExtractor(bindingName, funcName string, args []
 		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(4)})
 		ctx.sm.push("")
 		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
-		ctx.sm.pop()
+		ctx.sm.pop() // pop position (4)
+		ctx.sm.pop() // pop value being split
 		ctx.sm.push("")
 		ctx.sm.push("")
 		ctx.emitOp(StackOp{Op: "drop"})
@@ -1408,7 +1738,8 @@ func (ctx *loweringContext) lowerExtractor(bindingName, funcName string, args []
 		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(4)})
 		ctx.sm.push("")
 		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"})
-		ctx.sm.pop()
+		ctx.sm.pop() // pop position (4)
+		ctx.sm.pop() // pop value being split
 		ctx.sm.push("")
 		ctx.sm.push("")
 		ctx.emitOp(StackOp{Op: "drop"})
@@ -2119,8 +2450,6 @@ func lowerMethodWithPrivateMethods(method *ir.ANFMethod, properties []ir.ANFProp
 
 	// If the method uses checkPreimage, the unlocking script pushes an
 	// implicit <sig> before all declared parameters (OP_PUSH_TX pattern).
-	// Insert _opPushTxSig at the base of the stack so it can be consumed
-	// by lowerCheckPreimage later.
 	if methodUsesCheckPreimage(method.Body) {
 		paramNames = append([]string{"_opPushTxSig"}, paramNames...)
 	}
@@ -2131,13 +2460,25 @@ func lowerMethodWithPrivateMethods(method *ir.ANFMethod, properties []ir.ANFProp
 	// its value on the stack (Bitcoin Script requires a truthy top-of-stack).
 	ctx.lowerBindings(method.Body, method.IsPublic)
 
-	// For public methods, ensure the script leaves a single truthy value on
-	// the main stack. Any additional values below the top are implementation
-	// artifacts and must be removed to satisfy CLEANSTACK policy.
-	if method.IsPublic {
-		for ctx.sm.depth() > 1 {
-			// NIP removes the second item from the top of the stack, preserving
-			// the final assertion value.
+	// Clean up excess stack items left by deserialize_state.
+	// Stateful methods that deserialize state from the preimage leave the
+	// deserialized property values on the stack. These must be removed so
+	// only the final assertion result remains (CLEANSTACK policy).
+	// NOTE: This must NOT be applied universally to all public methods,
+	// because the stackMap overestimates depth after if/else (branches
+	// consume items from cloned stackMaps, but the parent doesn't track
+	// this). Universal NIP would underflow the real stack on stateless
+	// contracts.
+	hasDeserializeState := false
+	for _, b := range method.Body {
+		if b.Value.Kind == "deserialize_state" {
+			hasDeserializeState = true
+			break
+		}
+	}
+	if method.IsPublic && hasDeserializeState && ctx.sm.depth() > 1 {
+		excess := ctx.sm.depth() - 1
+		for i := 0; i < excess; i++ {
 			ctx.emitOp(StackOp{Op: "nip"})
 			ctx.sm.removeAtDepth(1)
 		}
@@ -2163,20 +2504,25 @@ func lowerMethod(method *ir.ANFMethod, properties []ir.ANFProperty) (*StackMetho
 		paramNames[i] = p.Name
 	}
 
-	// If the method uses checkPreimage, insert the implicit _opPushTxSig param.
-	if methodUsesCheckPreimage(method.Body) {
-		paramNames = append([]string{"_opPushTxSig"}, paramNames...)
-	}
+	// OP_PUSH_TX no longer requires an implicit _opPushTxSig parameter.
 
 	ctx := newLoweringContext(paramNames, properties)
 	// Pass terminalAssert=true for public methods so the last assert leaves
 	// its value on the stack (Bitcoin Script requires a truthy top-of-stack).
 	ctx.lowerBindings(method.Body, method.IsPublic)
 
-	// For public methods, enforce CLEANSTACK by dropping any residual
-	// values below the final assertion result.
-	if method.IsPublic {
-		for ctx.sm.depth() > 1 {
+	// Clean up excess stack items left by deserialize_state (see comment
+	// in lowerMethodWithPrivateMethods for rationale on scoping).
+	hasDeserializeState := false
+	for _, b := range method.Body {
+		if b.Value.Kind == "deserialize_state" {
+			hasDeserializeState = true
+			break
+		}
+	}
+	if method.IsPublic && hasDeserializeState && ctx.sm.depth() > 1 {
+		excess := ctx.sm.depth() - 1
+		for i := 0; i < excess; i++ {
 			ctx.emitOp(StackOp{Op: "nip"})
 			ctx.sm.removeAtDepth(1)
 		}

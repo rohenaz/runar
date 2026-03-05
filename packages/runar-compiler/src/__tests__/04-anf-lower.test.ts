@@ -595,17 +595,17 @@ describe('Pass 4: ANF Lower', () => {
       expect(checkPreimages.length).toBeGreaterThanOrEqual(1);
     });
 
-    it('injects state continuation (get_state_script + hash256 + assert) for state-mutating methods', () => {
+    it('injects state continuation (get_state_script + computeStateOutputHash + assert) for state-mutating methods', () => {
       const program = lowerSource(COUNTER_STATEFUL);
       const method = findMethod(program, 'increment');
 
       const getStateScripts = bindingsOfKind(method.body, 'get_state_script');
       expect(getStateScripts.length).toBeGreaterThanOrEqual(1);
 
-      // Check that hash256 is called
+      // Check that computeStateOutputHash is called (builds full output serialization hash)
       const calls = bindingsOfKind(method.body, 'call');
-      const hash256Call = calls.find(b => (b.value as { func: string }).func === 'hash256');
-      expect(hash256Call).toBeDefined();
+      const computeHashCall = calls.find(b => (b.value as { func: string }).func === 'computeStateOutputHash');
+      expect(computeHashCall).toBeDefined();
 
       const extractOutputHashCall = calls.find(b => (b.value as { func: string }).func === 'extractOutputHash');
       expect(extractOutputHashCall).toBeDefined();

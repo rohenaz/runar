@@ -19,7 +19,7 @@
 //! - Local variables are tracked via localNames set
 //! - Properties are checked against the contract
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::ast::*;
 use crate::ir::{ANFBinding, ANFMethod, ANFParam, ANFProgram, ANFProperty, ANFValue};
@@ -95,6 +95,19 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 value: check_result,
             });
 
+            // Deserialize mutable state from the preimage's scriptCode.
+            // On subsequent spends, the state is embedded in the script (after OP_RETURN),
+            // so we extract it from the scriptCode field rather than using hardcoded initial values.
+            let has_state_prop = contract.properties.iter().any(|p| !p.readonly);
+            if has_state_prop {
+                let preimage_ref3 = method_ctx.emit(ANFValue::LoadParam {
+                    name: "txPreimage".to_string(),
+                });
+                method_ctx.emit(ANFValue::DeserializeState {
+                    preimage: preimage_ref3,
+                });
+            }
+
             // Lower the developer's method body
             lower_statements(&method.body, &mut method_ctx);
 
@@ -128,14 +141,15 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 });
                 method_ctx.emit(ANFValue::Assert { value: eq_ref });
             } else if method_mutates_state(method, contract) {
-                // Single-output continuation (existing behavior)
+                // Single-output continuation: build full output serialization hash
+                // and compare with hashOutputs from the BIP-143 preimage.
                 let state_script_ref = method_ctx.emit(ANFValue::GetStateScript {});
-                let hash_ref = method_ctx.emit(ANFValue::Call {
-                    func: "hash256".to_string(),
-                    args: vec![state_script_ref],
-                });
                 let preimage_ref2 = method_ctx.emit(ANFValue::LoadParam {
                     name: "txPreimage".to_string(),
+                });
+                let hash_ref = method_ctx.emit(ANFValue::Call {
+                    func: "computeStateOutputHash".to_string(),
+                    args: vec![preimage_ref2.clone(), state_script_ref],
                 });
                 let output_hash_ref = method_ctx.emit(ANFValue::Call {
                     func: "extractOutputHash".to_string(),
@@ -204,6 +218,9 @@ struct LoweringContext<'a> {
     param_names: HashSet<String>,
     local_names: HashSet<String>,
     add_output_refs: Vec<String>,
+    /// Maps local variable names to their current ANF binding name.
+    /// Updated after if-statements that reassign locals in both branches.
+    local_aliases: HashMap<String, String>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -215,6 +232,7 @@ impl<'a> LoweringContext<'a> {
             param_names: HashSet::new(),
             local_names: HashSet::new(),
             add_output_refs: Vec::new(),
+            local_aliases: HashMap::new(),
         }
     }
 
@@ -261,17 +279,29 @@ impl<'a> LoweringContext<'a> {
         self.local_names.contains(name)
     }
 
+    /// Set the current ANF binding for a local variable (after if-statement reassignment).
+    fn set_local_alias(&mut self, local_name: &str, binding_name: &str) {
+        self.local_aliases
+            .insert(local_name.to_string(), binding_name.to_string());
+    }
+
+    /// Get the current ANF binding for a local variable, or None if not aliased.
+    fn get_local_alias(&self, name: &str) -> Option<&String> {
+        self.local_aliases.get(name)
+    }
+
     fn is_property(&self, name: &str) -> bool {
         self.contract.properties.iter().any(|p| p.name == name)
     }
 
     /// Create a sub-context for nested blocks (if/else, loops).
-    /// The counter continues from the parent. Local names and param names are shared.
+    /// The counter continues from the parent. Local names, param names, and aliases are shared.
     fn sub_context(&self) -> LoweringContext<'a> {
         let mut sub = LoweringContext::new(self.contract);
         sub.counter = self.counter;
         sub.param_names = self.param_names.clone();
         sub.local_names = self.local_names.clone();
+        sub.local_aliases = self.local_aliases.clone();
         // Note: add_output_refs is NOT propagated to sub-contexts
         // because addOutput calls in sub-blocks should flow up to
         // the parent context via explicit tracking.
@@ -397,11 +427,30 @@ fn lower_if_statement(
     }
     ctx.sync_counter(&else_ctx);
 
-    ctx.emit(ANFValue::If {
+    let then_bindings = then_ctx.bindings;
+    let else_bindings = else_ctx.bindings;
+
+    // If both branches end by reassigning the same local variable,
+    // alias that variable to the if-expression result so that subsequent
+    // references resolve to the branch output, not the dead initial value.
+    let then_last = then_bindings.last();
+    let else_last = else_bindings.last();
+    let alias_local = match (then_last, else_last) {
+        (Some(tl), Some(el)) if tl.name == el.name && ctx.is_local(&tl.name) => {
+            Some(tl.name.clone())
+        }
+        _ => None,
+    };
+
+    let if_name = ctx.emit(ANFValue::If {
         cond: cond_ref,
-        then: then_ctx.bindings,
-        else_branch: else_ctx.bindings,
+        then: then_bindings,
+        else_branch: else_bindings,
     });
+
+    if let Some(local_name) = alias_local {
+        ctx.set_local_alias(&local_name, &if_name);
+    }
 }
 
 fn lower_for_statement(
@@ -561,8 +610,12 @@ fn lower_identifier(name: &str, ctx: &mut LoweringContext) -> String {
     }
 
     // Check if it's a local variable -- reference it directly
+    // (or use its alias if reassigned by an if-statement)
     if ctx.is_local(name) {
-        return name.to_string();
+        return ctx
+            .get_local_alias(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
     }
 
     // Check if it's a contract property

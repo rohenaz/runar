@@ -299,14 +299,17 @@ func ecFieldInv(t *ECTracker, aName, resultName string) {
 
 	// Start: result = a (bit 255 = 1)
 	t.copyToTop(aName, "_inv_r")
-	// Bits 254 down to 32: all 1's (223 bits)
-	for i := 0; i < 223; i++ {
+	// Bits 254 down to 33: all 1's (222 bits). Bit 32 is 0 (handled below).
+	for i := 0; i < 222; i++ {
 		ecFieldSqr(t, "_inv_r", "_inv_r2")
 		t.rename("_inv_r")
 		t.copyToTop(aName, "_inv_a")
 		ecFieldMul(t, "_inv_r", "_inv_a", "_inv_m")
 		t.rename("_inv_r")
 	}
+	// Bit 32 is 0: square only (no multiply)
+	ecFieldSqr(t, "_inv_r", "_inv_r2")
+	t.rename("_inv_r")
 	// Bits 31 down to 0 of p-2
 	lowBits := uint32(ecFieldPMinus2.Uint64() & 0xffffffff)
 	for i := 31; i >= 0; i-- {
@@ -524,8 +527,10 @@ func ecJacobianDouble(t *ECTracker) {
 	t.pushInt("_two2", 2)
 	ecFieldMul(t, "_yz", "_two2", "_nz")
 
-	// Clean up leftover _B, rename results
+	// Clean up leftovers: _B and old jz (only copied, never consumed)
 	t.toTop("_B")
+	t.drop()
+	t.toTop("jz")
 	t.drop()
 	t.toTop("_nx")
 	t.rename("jx")
@@ -660,7 +665,17 @@ func EmitEcMul(emit func(StackOp)) {
 	t := NewECTracker([]string{"_pt", "_k"}, emit)
 	// Decompose to affine base point
 	ecDecomposePoint(t, "_pt", "ax", "ay")
-	// Initialize Jacobian accumulator = base point (Z=1)
+
+	// k' = k + n: guarantees bit 255 is set.
+	curveN, _ := new(big.Int).SetString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
+	t.toTop("_k")
+	t.pushBigInt("_n", curveN)
+	t.rawBlock([]string{"_k", "_n"}, "_kn", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})
+	})
+	t.rename("_k")
+
+	// Init accumulator = P (bit 255 is always 1, serves as initializer)
 	t.copyToTop("ax", "jx")
 	t.copyToTop("ay", "jy")
 	t.pushInt("jz", 1)
@@ -681,20 +696,18 @@ func EmitEcMul(emit func(StackOp)) {
 		} else {
 			t.rename("_shifted")
 		}
-		t.pushInt("_one", 1)
-		t.rawBlock([]string{"_shifted", "_one"}, "_bit", func(e func(StackOp)) {
-			e(StackOp{Op: "opcode", Code: "OP_AND"})
+		t.pushInt("_two", 2)
+		t.rawBlock([]string{"_shifted", "_two"}, "_bit", func(e func(StackOp)) {
+			e(StackOp{Op: "opcode", Code: "OP_MOD"})
 		})
 
-		// Conditional add: if bit is 1, add base point to accumulator
+		// Move _bit to TOS and remove from tracker BEFORE generating add ops,
+		// because OP_IF consumes _bit and the add ops run with _bit already gone.
+		t.toTop("_bit")
+		t.nm = t.nm[:len(t.nm)-1] // _bit consumed by IF
 		var addOps []StackOp
 		addEmit := func(op StackOp) { addOps = append(addOps, op) }
 		ecBuildJacobianAddAffineInline(addEmit, t)
-		t.toTop("_bit")
-		// consumed by IF
-		if len(t.nm) > 0 {
-			t.nm = t.nm[:len(t.nm)-1]
-		}
 		emit(StackOp{Op: "if", Then: addOps, Else: []StackOp{}})
 	}
 
@@ -790,8 +803,8 @@ func EmitEcEncodeCompressed(emit func(StackOp)) {
 	emit(StackOp{Op: "opcode", Code: "OP_SPLIT"})
 	// Stack: [x_bytes, y_prefix, last_byte]
 	emit(StackOp{Op: "opcode", Code: "OP_BIN2NUM"})
-	emit(StackOp{Op: "push", Value: bigIntPush(1)})
-	emit(StackOp{Op: "opcode", Code: "OP_AND"})
+	emit(StackOp{Op: "push", Value: bigIntPush(2)})
+	emit(StackOp{Op: "opcode", Code: "OP_MOD"})
 	// Stack: [x_bytes, y_prefix, parity]
 	emit(StackOp{Op: "swap"})
 	emit(StackOp{Op: "drop"}) // drop y_prefix

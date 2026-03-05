@@ -1099,5 +1099,208 @@ func TestECPrimitives_CheckX_Fail(t *testing.T) {
 	}
 }
 
+// secp256k1 curve order
+var ecOrderN, _ = new(big.Int).SetString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
+
+func TestECPrimitives_CheckAdd(t *testing.T) {
+	// Use G as this.pt, add 2G to get 3G (distinct points, avoids doubling edge case)
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	curve := ec.S256()
+	twoGx, twoGy := curve.Double(ecGenX, ecGenY)
+	threeGx, threeGy := curve.Add(ecGenX, ecGenY, twoGx, twoGy)
+
+	// checkAdd(other=2G, expectedX=3Gx, expectedY=3Gy) — method index 5
+	otherHex := fmt.Sprintf("%064x%064x", twoGx, twoGy)
+	unlockingHex := encodePushBytes(hexToBytes(otherHex)) +
+		encodePushBigInt(threeGx) +
+		encodePushBigInt(threeGy) +
+		encodePushInt(5)
+	if err := executeScript(lockingHex, unlockingHex); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+func TestECPrimitives_CheckMul(t *testing.T) {
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	curve := ec.S256()
+	scalar := big.NewInt(7)
+	rx, ry := curve.ScalarMult(ecGenX, ecGenY, scalar.Bytes())
+
+	unlockingHex := encodePushBigInt(scalar) +
+		encodePushBigInt(rx) +
+		encodePushBigInt(ry) +
+		encodePushInt(6)
+	if err := executeScript(lockingHex, unlockingHex); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+func TestECPrimitives_CheckMulGen(t *testing.T) {
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	curve := ec.S256()
+	scalar := big.NewInt(42)
+	rx, ry := curve.ScalarBaseMult(scalar.Bytes())
+
+	unlockingHex := encodePushBigInt(scalar) +
+		encodePushBigInt(rx) +
+		encodePushBigInt(ry) +
+		encodePushInt(7)
+	if err := executeScript(lockingHex, unlockingHex); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+func TestECPrimitives_CheckMakePoint(t *testing.T) {
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// checkMakePoint(x=Gx, y=Gy, expectedX=Gx, expectedY=Gy) — method index 8
+	unlockingHex := encodePushBigInt(ecGenX) +
+		encodePushBigInt(ecGenY) +
+		encodePushBigInt(ecGenX) +
+		encodePushBigInt(ecGenY) +
+		encodePushInt(8)
+	if err := executeScript(lockingHex, unlockingHex); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+func TestECPrimitives_CheckEncodeCompressed(t *testing.T) {
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Build expected compressed key: 02 or 03 prefix + 32-byte x
+	prefix := byte(0x02)
+	if ecGenY.Bit(0) == 1 {
+		prefix = 0x03
+	}
+	xBytes := make([]byte, 32)
+	xb := ecGenX.Bytes()
+	copy(xBytes[32-len(xb):], xb)
+	compressed := append([]byte{prefix}, xBytes...)
+
+	// checkEncodeCompressed(expected) — method index 9
+	unlockingHex := encodePushBytes(compressed) + encodePushInt(9)
+	if err := executeScript(lockingHex, unlockingHex); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+func TestECPrimitives_CheckMulIdentity(t *testing.T) {
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// checkMulIdentity() — method index 10
+	// ecMul(G, 1) should return G
+	unlockingHex := encodePushInt(10)
+	if err := executeScript(lockingHex, unlockingHex); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+func TestECPrimitives_CheckNegateRoundtrip(t *testing.T) {
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// checkNegateRoundtrip() — method index 11
+	unlockingHex := encodePushInt(11)
+	if err := executeScript(lockingHex, unlockingHex); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+func TestECPrimitives_CheckAddOnCurve(t *testing.T) {
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Compute 2*G to use as "other" point
+	curve := ec.S256()
+	twoGx, twoGy := curve.Double(ecGenX, ecGenY)
+	otherHex := fmt.Sprintf("%064x%064x", twoGx, twoGy)
+
+	// checkAddOnCurve(other=2G) — method index 12
+	unlockingHex := encodePushBytes(hexToBytes(otherHex)) + encodePushInt(12)
+	if err := executeScript(lockingHex, unlockingHex); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+func TestECPrimitives_CheckMulGenOnCurve(t *testing.T) {
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// checkMulGenOnCurve(scalar=42) — method index 13
+	unlockingHex := encodePushBigInt(big.NewInt(42)) + encodePushInt(13)
+	if err := executeScript(lockingHex, unlockingHex); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+func TestECPrimitives_CheckAdd_Fail(t *testing.T) {
+	ptHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+
+	lockingHex, err := compileRúnar("ec-primitives", fmt.Sprintf(`{"pt":"%s"}`, ptHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Pass wrong expected coordinates — should fail
+	otherHex := fmt.Sprintf("%064x%064x", ecGenX, ecGenY)
+	unlockingHex := encodePushBytes(hexToBytes(otherHex)) +
+		encodePushBigInt(big.NewInt(42)) +
+		encodePushBigInt(big.NewInt(42)) +
+		encodePushInt(5)
+	if err := executeScript(lockingHex, unlockingHex); err == nil {
+		t.Fatal("expected script failure with wrong expected point but execution succeeded")
+	}
+}
+
+func hexToBytes(h string) []byte {
+	b, _ := hex.DecodeString(h)
+	return b
+}
+
 // Ensure the binary and big packages are used.
 var _ = binary.LittleEndian

@@ -150,6 +150,21 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			checkResult := methodCtx.emit(ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef})
 			methodCtx.emit(makeAssert(checkResult))
 
+			// Deserialize mutable state from the preimage's scriptCode.
+			// On subsequent spends, the state is embedded in the script (after OP_RETURN),
+			// so we extract it from the scriptCode field rather than using hardcoded initial values.
+			hasStateProp := false
+			for _, p := range contract.Properties {
+				if !p.Readonly {
+					hasStateProp = true
+					break
+				}
+			}
+			if hasStateProp {
+				preimageRef3 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+				methodCtx.emit(ir.ANFValue{Kind: "deserialize_state", Preimage: preimageRef3})
+			}
+
 			// Lower the developer's method body
 			methodCtx.lowerStatements(method.Body)
 
@@ -167,10 +182,11 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 				eqRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: hashRef, Right: outputHashRef, ResultType: "bytes"})
 				methodCtx.emit(makeAssert(eqRef))
 			} else if methodMutatesState(method, contract) {
-				// Single-output continuation (existing behavior)
+				// Single-output continuation: build full output serialization hash
+				// and compare with hashOutputs from the BIP-143 preimage.
 				stateScriptRef := methodCtx.emit(ir.ANFValue{Kind: "get_state_script"})
-				hashRef := methodCtx.emit(makeCall("hash256", []string{stateScriptRef}))
 				preimageRef2 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+				hashRef := methodCtx.emit(makeCall("computeStateOutputHash", []string{preimageRef2, stateScriptRef}))
 				outputHashRef := methodCtx.emit(makeCall("extractOutputHash", []string{preimageRef2}))
 				eqRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: hashRef, Right: outputHashRef, ResultType: "bytes"})
 				methodCtx.emit(makeAssert(eqRef))
@@ -227,16 +243,18 @@ type lowerCtx struct {
 	bindings      []ir.ANFBinding
 	counter       int
 	contract      *ContractNode
-	localNames    map[string]bool // tracks variable names registered via addLocal
-	paramNames    map[string]bool // tracks parameter names registered via addParam
-	addOutputRefs []string        // tracks addOutput binding refs for multi-output continuation
+	localNames    map[string]bool   // tracks variable names registered via addLocal
+	paramNames    map[string]bool   // tracks parameter names registered via addParam
+	addOutputRefs []string          // tracks addOutput binding refs for multi-output continuation
+	localAliases  map[string]string // maps local variable names to their current ANF binding name (updated after if-statements that reassign locals in both branches)
 }
 
 func newLowerCtx(contract *ContractNode) *lowerCtx {
 	return &lowerCtx{
-		contract:   contract,
-		localNames: make(map[string]bool),
-		paramNames: make(map[string]bool),
+		contract:     contract,
+		localNames:   make(map[string]bool),
+		paramNames:   make(map[string]bool),
+		localAliases: make(map[string]string),
 	}
 }
 
@@ -277,6 +295,16 @@ func (ctx *lowerCtx) addParam(name string) {
 // isParam checks if a name is a registered parameter.
 func (ctx *lowerCtx) isParam(name string) bool {
 	return ctx.paramNames[name]
+}
+
+// setLocalAlias sets the current ANF binding for a local variable (after if-statement reassignment).
+func (ctx *lowerCtx) setLocalAlias(localName, bindingName string) {
+	ctx.localAliases[localName] = bindingName
+}
+
+// getLocalAlias returns the current ANF binding for a local variable, or "" if not aliased.
+func (ctx *lowerCtx) getLocalAlias(localName string) string {
+	return ctx.localAliases[localName]
 }
 
 // addOutputRef tracks an addOutput binding ref for multi-output continuation.
@@ -328,10 +356,11 @@ func (ctx *lowerCtx) getPropertyType(name string) (string, bool) {
 // The counter continues from the parent. Local names and param names are shared.
 func (ctx *lowerCtx) subContext() *lowerCtx {
 	sub := &lowerCtx{
-		contract:   ctx.contract,
-		counter:    ctx.counter,
-		localNames: make(map[string]bool),
-		paramNames: make(map[string]bool),
+		contract:     ctx.contract,
+		counter:      ctx.counter,
+		localNames:   make(map[string]bool),
+		paramNames:   make(map[string]bool),
+		localAliases: make(map[string]string),
 	}
 	// Share local name set
 	for k := range ctx.localNames {
@@ -340,6 +369,10 @@ func (ctx *lowerCtx) subContext() *lowerCtx {
 	// Share param name set
 	for k := range ctx.paramNames {
 		sub.paramNames[k] = true
+	}
+	// Share local aliases
+	for k, v := range ctx.localAliases {
+		sub.localAliases[k] = v
 	}
 	return sub
 }
@@ -426,12 +459,23 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt) {
 	}
 	ctx.syncCounter(elseCtx)
 
-	ctx.emit(ir.ANFValue{
+	ifName := ctx.emit(ir.ANFValue{
 		Kind: "if",
 		Cond: condRef,
 		Then: thenCtx.bindings,
 		Else: elseCtx.bindings,
 	})
+
+	// If both branches end by reassigning the same local variable,
+	// alias that variable to the if-expression result so that subsequent
+	// references resolve to the branch output, not the dead initial value.
+	if len(thenCtx.bindings) > 0 && len(elseCtx.bindings) > 0 {
+		thenLast := thenCtx.bindings[len(thenCtx.bindings)-1]
+		elseLast := elseCtx.bindings[len(elseCtx.bindings)-1]
+		if thenLast.Name == elseLast.Name && ctx.isLocal(thenLast.Name) {
+			ctx.setLocalAlias(thenLast.Name, ifName)
+		}
+	}
 }
 
 func (ctx *lowerCtx) lowerForStatement(stmt ForStmt) {
@@ -603,7 +647,11 @@ func (ctx *lowerCtx) lowerIdentifier(id Identifier) string {
 	}
 
 	// Check if it's a local variable -- reference it directly
+	// (or use its alias if reassigned by an if-statement)
 	if ctx.isLocal(name) {
+		if alias := ctx.getLocalAlias(name); alias != "" {
+			return alias
+		}
 		return name
 	}
 
