@@ -262,6 +262,9 @@ func collectRefs(value *ir.ANFValue) []string {
 	case "add_output":
 		refs = append(refs, value.Satoshis)
 		refs = append(refs, value.StateValues...)
+		if value.Preimage != "" {
+			refs = append(refs, value.Preimage)
+		}
 	}
 
 	return refs
@@ -461,7 +464,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "deserialize_state":
 		ctx.lowerDeserializeState(value.Preimage, bindingIndex, lastUses)
 	case "add_output":
-		ctx.lowerAddOutput(name, value.Satoshis, value.StateValues, bindingIndex, lastUses)
+		ctx.lowerAddOutput(name, value.Satoshis, value.StateValues, value.Preimage, bindingIndex, lastUses)
 	}
 }
 
@@ -1336,10 +1339,10 @@ func (ctx *loweringContext) lowerDeserializeState(preimageRef string, bindingInd
 	ctx.trackDepth()
 }
 
-func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateValues []string, bindingIndex int, lastUses map[string]int) {
-	// Serialize a transaction output: <8-byte LE satoshis> <serialized state values>
-	// This mirrors lowerGetStateScript but uses the provided value refs instead
-	// of loading from the stack, and prepends the satoshis amount.
+func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateValues []string, preimage string, bindingIndex int, lastUses map[string]int) {
+	// Build a full BIP-143 output serialization:
+	//   amount(8LE) + varint(scriptLen) + codePart + OP_RETURN + stateBytes
+	// This matches what extractOutputHash (SHA256d of concatenated outputs) expects.
 
 	var stateProps []ir.ANFProperty
 	for _, p := range ctx.properties {
@@ -1348,15 +1351,104 @@ func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateVa
 		}
 	}
 
-	// Step 1: Serialize satoshis as 8-byte LE
-	isLastSatoshis := ctx.isLastUse(satoshis, bindingIndex, lastUses)
-	ctx.bringToTop(satoshis, isLastSatoshis)
+	// Compute fixed state serialization length.
+	stateLen := 0
+	for _, p := range stateProps {
+		switch p.Type {
+		case "bigint":
+			stateLen += 8
+		case "boolean":
+			stateLen += 1
+		case "PubKey":
+			stateLen += 33
+		case "Addr":
+			stateLen += 20
+		case "Sha256":
+			stateLen += 32
+		case "Point":
+			stateLen += 64
+		default:
+			panic("addOutput: unsupported mutable property type: " + p.Type)
+		}
+	}
+
+	// --- Extract varint + codePart from preimage ---
+	preIsLast := ctx.isLastUse(preimage, bindingIndex, lastUses)
+	ctx.bringToTop(preimage, preIsLast)
+
+	// Step 1: Extract middle: varint + scriptCode + amount.
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(104)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"}) // [prefix, rest]
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("") // prefix
+	ctx.sm.push("") // rest
+	ctx.emitOp(StackOp{Op: "nip"}) // drop prefix
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("") // rest
+
+	// Drop last 44 bytes.
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(44)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"}) // [middle, tail44]
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("") // middle
+	ctx.sm.push("") // tail44
+	ctx.emitOp(StackOp{Op: "drop"})
+	ctx.sm.pop()
+
+	// Step 2: Split off amount (last 8 bytes) and drop it.
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
+	ctx.sm.push("")
 	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
 	ctx.sm.push("")
-	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
-	ctx.sm.pop() // pop the width
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"}) // [varint+sc, amount]
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("") // varint+sc
+	ctx.sm.push("") // amount
+	ctx.emitOp(StackOp{Op: "drop"}) // drop amount
+	ctx.sm.pop()
 
-	// Step 2: Serialize each state value and concatenate
+	// Step 3: Strip state + OP_RETURN from end (stateLen + 1 bytes).
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(stateLen + 1))})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SUB"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SPLIT"}) // [varint+code, opReturn+state]
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("") // varint+code
+	ctx.sm.push("") // opReturn+state
+	ctx.emitOp(StackOp{Op: "drop"})
+	ctx.sm.pop()
+
+	// Step 4: Append OP_RETURN byte.
+	ctx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bytes", Bytes: []byte{0x6a}}})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CAT"})
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.sm.push("")
+
+	// Step 5: Serialize each state value and concatenate.
 	for i := 0; i < len(stateValues) && i < len(stateProps); i++ {
 		valueRef := stateValues[i]
 		prop := stateProps[i]
@@ -1364,7 +1456,6 @@ func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateVa
 		isLast := ctx.isLastUse(valueRef, bindingIndex, lastUses)
 		ctx.bringToTop(valueRef, isLast)
 
-		// Convert numeric/boolean values to fixed-width bytes
 		if prop.Type == "bigint" {
 			ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
 			ctx.sm.push("")
@@ -1376,14 +1467,26 @@ func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateVa
 			ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
 			ctx.sm.pop()
 		}
-		// Byte types used as-is
 
-		// Concatenate with accumulator
 		ctx.sm.pop()
 		ctx.sm.pop()
 		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CAT"})
 		ctx.sm.push("")
 	}
+
+	// Step 6: Prepend satoshis as 8-byte LE.
+	isLastSatoshis := ctx.isLastUse(satoshis, bindingIndex, lastUses)
+	ctx.bringToTop(satoshis, isLastSatoshis)
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
+	ctx.sm.pop()
+	ctx.emitOp(StackOp{Op: "swap"})
+	ctx.sm.swap()
+	ctx.sm.pop()
+	ctx.sm.pop()
+	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CAT"}) // satoshis || varint+script
+	ctx.sm.push("")
 
 	// Rename top to binding name
 	ctx.sm.pop()
@@ -2132,7 +2235,7 @@ func (ctx *loweringContext) lowerPow(bindingName string, args []string, bindingI
 		// Stack: exp base acc
 		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(2)})
 		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_PICK"})              // exp base acc exp
-		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(i + 1))})
+		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(i))})
 		ctx.emitOp(StackOp{Op: "opcode", Code: "OP_GREATERTHAN"})       // exp base acc (exp > i)
 		ctx.emitOp(StackOp{
 			Op: "if",
@@ -2461,14 +2564,6 @@ func lowerMethodWithPrivateMethods(method *ir.ANFMethod, properties []ir.ANFProp
 	ctx.lowerBindings(method.Body, method.IsPublic)
 
 	// Clean up excess stack items left by deserialize_state.
-	// Stateful methods that deserialize state from the preimage leave the
-	// deserialized property values on the stack. These must be removed so
-	// only the final assertion result remains (CLEANSTACK policy).
-	// NOTE: This must NOT be applied universally to all public methods,
-	// because the stackMap overestimates depth after if/else (branches
-	// consume items from cloned stackMaps, but the parent doesn't track
-	// this). Universal NIP would underflow the real stack on stateless
-	// contracts.
 	hasDeserializeState := false
 	for _, b := range method.Body {
 		if b.Value.Kind == "deserialize_state" {
@@ -2511,8 +2606,10 @@ func lowerMethod(method *ir.ANFMethod, properties []ir.ANFProperty) (*StackMetho
 	// its value on the stack (Bitcoin Script requires a truthy top-of-stack).
 	ctx.lowerBindings(method.Body, method.IsPublic)
 
-	// Clean up excess stack items left by deserialize_state (see comment
-	// in lowerMethodWithPrivateMethods for rationale on scoping).
+	// Clean up excess stack items left by deserialize_state.
+	// Stateful methods that deserialize state from the preimage leave the
+	// deserialized property values on the stack. These must be removed so
+	// only the final assertion result remains (CLEANSTACK policy).
 	hasDeserializeState := false
 	for _, b := range method.Body {
 		if b.Value.Kind == "deserialize_state" {

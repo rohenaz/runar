@@ -680,21 +680,31 @@ pub fn emit_ec_mul(emit: &mut dyn FnMut(StackOp)) {
     // Decompose to affine base point
     decompose_point(&mut t, "_pt", "ax", "ay");
 
-    // k' = k + n: guarantees bit 255 is set.
+    // k' = k + 3n: guarantees bit 257 is set.
+    // k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
+    // is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
     t.to_top("_k");
     t.push_bytes("_n", CURVE_N_SCRIPT_NUM.to_vec());
     t.raw_block(&["_k", "_n"], Some("_kn"), |e| {
         e(StackOp::Opcode("OP_ADD".into()));
     });
+    t.push_bytes("_n2", CURVE_N_SCRIPT_NUM.to_vec());
+    t.raw_block(&["_kn", "_n2"], Some("_kn2"), |e| {
+        e(StackOp::Opcode("OP_ADD".into()));
+    });
+    t.push_bytes("_n3", CURVE_N_SCRIPT_NUM.to_vec());
+    t.raw_block(&["_kn2", "_n3"], Some("_kn3"), |e| {
+        e(StackOp::Opcode("OP_ADD".into()));
+    });
     t.rename("_k");
 
-    // Init accumulator = P (bit 255 is always 1, serves as initializer)
+    // Init accumulator = P (bit 257 of k+3n is always 1)
     t.copy_to_top("ax", "jx");
     t.copy_to_top("ay", "jy");
     t.push_int("jz", 1);
 
-    // 255 iterations: bits 254 down to 0
-    for bit in (0..=254).rev() {
+    // 257 iterations: bits 256 down to 0
+    for bit in (0..=256).rev() {
         // Double accumulator
         jacobian_double(&mut t);
 

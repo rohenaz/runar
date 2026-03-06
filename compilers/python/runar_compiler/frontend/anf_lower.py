@@ -591,7 +591,8 @@ class _LowerCtx:
             arg_refs = self._lower_args(e.args)
             satoshis = arg_refs[0]
             state_values = arg_refs[1:]
-            ref = self.emit(ANFValue(kind="add_output", satoshis=satoshis, state_values=state_values))
+            preimage_ref = self.emit(ANFValue(kind="load_param", name="txPreimage"))
+            ref = self.emit(ANFValue(kind="add_output", satoshis=satoshis, state_values=state_values, preimage=preimage_ref))
             self.add_output_ref(ref)
             return ref
 
@@ -605,7 +606,8 @@ class _LowerCtx:
                 arg_refs = self._lower_args(e.args)
                 satoshis = arg_refs[0]
                 state_values = arg_refs[1:]
-                ref = self.emit(ANFValue(kind="add_output", satoshis=satoshis, state_values=state_values))
+                preimage_ref = self.emit(ANFValue(kind="load_param", name="txPreimage"))
+                ref = self.emit(ANFValue(kind="add_output", satoshis=satoshis, state_values=state_values, preimage=preimage_ref))
                 self.add_output_ref(ref)
                 return ref
 

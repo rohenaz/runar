@@ -153,25 +153,11 @@ func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interfac
 
 	program := frontend.LowerToANF(parseResult.Contract)
 
-	// Inject constructor args
-	for i := range program.Properties {
-		if val, ok := constructorArgs[program.Properties[i].Name]; ok {
-			switch v := val.(type) {
-			case string:
-				program.Properties[i].InitialValue = v
-			case float64:
-				program.Properties[i].InitialValue = v
-			case int64:
-				program.Properties[i].InitialValue = float64(v)
-			case int:
-				program.Properties[i].InitialValue = float64(v)
-			case *big.Int:
-				program.Properties[i].InitialValue = v
-			case []byte:
-				program.Properties[i].InitialValue = v
-			}
-		}
-	}
+	// NOTE: Do NOT inject constructor args into InitialValue here.
+	// The compiler must emit placeholder opcodes so ConstructorSlots are
+	// generated. The SDK's RunarContract.buildCodeScript then splices the
+	// actual values at deployment time. Setting InitialValue would bake values
+	// into the script AND the SDK would append them again (CLEANSTACK bug).
 
 	stackMethods, err := codegen.LowerToStack(program)
 	if err != nil {
@@ -251,6 +237,140 @@ func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interfac
 		ASM:              emitResult.ScriptAsm,
 		ConstructorSlots: cSlots,
 		StateFields:      stateFields,
+		ABI: runar.ABI{
+			Constructor: runar.ABIConstructor{Params: ctorParams},
+			Methods:     abiMethods,
+		},
+	}, nil
+}
+
+// CompileContract2 is like CompileContract but takes source as a string.
+func CompileContract2(source, fileName string, constructorArgs map[string]interface{}) (*Artifact, error) {
+	parseResult := frontend.ParseSource([]byte(source), fileName)
+	if len(parseResult.Errors) > 0 {
+		return nil, fmt.Errorf("parse errors: %v", parseResult.Errors)
+	}
+	if parseResult.Contract == nil {
+		return nil, fmt.Errorf("no contract found in %s", fileName)
+	}
+
+	validResult := frontend.Validate(parseResult.Contract)
+	if len(validResult.Errors) > 0 {
+		return nil, fmt.Errorf("validation errors: %v", validResult.Errors)
+	}
+
+	tcResult := frontend.TypeCheck(parseResult.Contract)
+	if len(tcResult.Errors) > 0 {
+		return nil, fmt.Errorf("type check errors: %v", tcResult.Errors)
+	}
+
+	program := frontend.LowerToANF(parseResult.Contract)
+
+	for i := range program.Properties {
+		if val, ok := constructorArgs[program.Properties[i].Name]; ok {
+			switch v := val.(type) {
+			case string:
+				program.Properties[i].InitialValue = v
+			case float64:
+				program.Properties[i].InitialValue = v
+			case int64:
+				program.Properties[i].InitialValue = float64(v)
+			case int:
+				program.Properties[i].InitialValue = float64(v)
+			case *big.Int:
+				program.Properties[i].InitialValue = v
+			case []byte:
+				program.Properties[i].InitialValue = v
+			default:
+				return nil, fmt.Errorf("unsupported constructor arg type for %s: %T", program.Properties[i].Name, val)
+			}
+		}
+	}
+
+	return compileFromProgram(program)
+}
+
+// CompileSourceStringToSDKArtifact compiles a source string to an SDK artifact.
+// Unlike CompileContract2, it does NOT inject InitialValue — the SDK's
+// RunarContract.buildCodeScript splices values via ConstructorSlots at deploy time.
+func CompileSourceStringToSDKArtifact(source, fileName string, constructorArgs map[string]interface{}) (*runar.RunarArtifact, error) {
+	parseResult := frontend.ParseSource([]byte(source), fileName)
+	if len(parseResult.Errors) > 0 {
+		return nil, fmt.Errorf("parse errors: %v", parseResult.Errors)
+	}
+	if parseResult.Contract == nil {
+		return nil, fmt.Errorf("no contract found in %s", fileName)
+	}
+
+	validResult := frontend.Validate(parseResult.Contract)
+	if len(validResult.Errors) > 0 {
+		return nil, fmt.Errorf("validation errors: %v", validResult.Errors)
+	}
+
+	tcResult := frontend.TypeCheck(parseResult.Contract)
+	if len(tcResult.Errors) > 0 {
+		return nil, fmt.Errorf("type check errors: %v", tcResult.Errors)
+	}
+
+	program := frontend.LowerToANF(parseResult.Contract)
+
+	stackMethods, err := codegen.LowerToStack(program)
+	if err != nil {
+		return nil, fmt.Errorf("stack lowering: %w", err)
+	}
+	for i := range stackMethods {
+		stackMethods[i].Ops = codegen.OptimizeStackOps(stackMethods[i].Ops)
+	}
+	emitResult, err := codegen.Emit(stackMethods)
+	if err != nil {
+		return nil, fmt.Errorf("emit: %w", err)
+	}
+
+	contract := parseResult.Contract
+	var abiMethods []runar.ABIMethod
+	for _, m := range contract.Methods {
+		if m.Name == "constructor" {
+			continue
+		}
+		var params []runar.ABIParam
+		for _, p := range m.Params {
+			typeName := "bigint"
+			if p.Type != nil {
+				typeName = astTypeName(p.Type)
+			}
+			params = append(params, runar.ABIParam{Name: p.Name, Type: typeName})
+		}
+		abiMethods = append(abiMethods, runar.ABIMethod{
+			Name:     m.Name,
+			Params:   params,
+			IsPublic: m.Visibility == "public",
+		})
+	}
+
+	var ctorParams []runar.ABIParam
+	for _, p := range contract.Constructor.Params {
+		typeName := "bigint"
+		if p.Type != nil {
+			typeName = astTypeName(p.Type)
+		}
+		ctorParams = append(ctorParams, runar.ABIParam{Name: p.Name, Type: typeName})
+	}
+
+	var cSlots []runar.ConstructorSlot
+	for _, s := range emitResult.ConstructorSlots {
+		cSlots = append(cSlots, runar.ConstructorSlot{
+			ParamIndex: s.ParamIndex,
+			ByteOffset: s.ByteOffset,
+		})
+	}
+
+	return &runar.RunarArtifact{
+		Version:          "runar-v0.1.0",
+		CompilerVersion:  "integration-test",
+		ContractName:     program.ContractName,
+		Script:           emitResult.ScriptHex,
+		ASM:              emitResult.ScriptAsm,
+		ConstructorSlots: cSlots,
 		ABI: runar.ABI{
 			Constructor: runar.ABIConstructor{Params: ctorParams},
 			Methods:     abiMethods,

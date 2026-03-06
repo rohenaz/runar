@@ -582,32 +582,41 @@ export function emitEcAdd(emit: (op: StackOp) => void): void {
  * Stack in: [point, scalar] (scalar on top)
  * Stack out: [result_point]
  *
- * Uses 255-iteration MSB-first double-and-add with Jacobian coordinates.
- * Adds curve order n to k to guarantee bit 255 is set (k+n always has
- * bit 255 set since n starts with 0xFFFF...). k+n may overflow to 257
- * bits for large k, but OP_DIV handles arbitrary-precision integers.
+ * Uses 257-iteration MSB-first double-and-add with Jacobian coordinates.
+ * Adds 3n to k so that bit 257 is always set: k+3n ∈ [3n, 4n-1], and
+ * since 3n > 2^257, bit 257 is guaranteed to be 1 for all valid k.
+ * This avoids the k+n overflow issue where bit 256 was only set for
+ * large k, causing incorrect results for ~half of all scalar values.
  */
 export function emitEcMul(emit: (op: StackOp) => void): void {
   const t = new ECTracker(['_pt', '_k'], emit);
   decomposePoint(t, '_pt', 'ax', 'ay');
 
-  // k' = k + n: guarantees bit 255 is set for the MSB-first double-and-add.
-  // Since k ∈ [1, n-1] and n starts with 0xFFFF..., k+n always has bit 255 set.
-  // k+n may be up to 257 bits for large k, but OP_DIV handles big numbers.
+  // k' = k + 3n: guarantees bit 257 is set for MSB-first double-and-add.
+  // k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
+  // is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
   t.toTop('_k');
   t.pushInt('_n', CURVE_N);
   t.rawBlock(['_k', '_n'], '_kn', (e) => {
     e({ op: 'opcode', code: 'OP_ADD' });
   });
+  t.pushInt('_n2', CURVE_N);
+  t.rawBlock(['_kn', '_n2'], '_kn2', (e) => {
+    e({ op: 'opcode', code: 'OP_ADD' });
+  });
+  t.pushInt('_n3', CURVE_N);
+  t.rawBlock(['_kn2', '_n3'], '_kn3', (e) => {
+    e({ op: 'opcode', code: 'OP_ADD' });
+  });
   t.rename('_k');
 
-  // Init accumulator = P (bit 255 of k+n is always 1)
+  // Init accumulator = P (bit 257 of k+3n is always 1)
   t.copyToTop('ax', 'jx');
   t.copyToTop('ay', 'jy');
   t.pushInt('jz', 1n);
 
-  // 255 iterations: bits 254 down to 0
-  for (let bit = 254; bit >= 0; bit--) {
+  // 257 iterations: bits 256 down to 0
+  for (let bit = 256; bit >= 0; bit--) {
     jacobianDouble(t);
 
     // Extract bit: (k >> bit) % 2

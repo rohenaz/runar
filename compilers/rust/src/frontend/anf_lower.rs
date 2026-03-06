@@ -766,7 +766,8 @@ fn lower_call_expr(
             let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
             let satoshis = arg_refs.first().cloned().unwrap_or_default();
             let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
-            let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values });
+            let preimage = ctx.emit(ANFValue::LoadParam { name: "txPreimage".to_string() });
+            let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values, preimage });
             ctx.add_output_refs.push(r.clone());
             return r;
         }
@@ -778,7 +779,8 @@ fn lower_call_expr(
                 let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
                 let satoshis = arg_refs.first().cloned().unwrap_or_default();
                 let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
-                let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values });
+                let preimage = ctx.emit(ANFValue::LoadParam { name: "txPreimage".to_string() });
+                let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values, preimage });
                 ctx.add_output_refs.push(r.clone());
                 return r;
             }

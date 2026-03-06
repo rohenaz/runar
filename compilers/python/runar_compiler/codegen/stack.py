@@ -250,6 +250,8 @@ def collect_refs(value: ANFValue) -> list[str]:
     elif kind == "add_output":
         refs.append(value.satoshis)
         refs.extend(value.state_values)
+        if value.preimage:
+            refs.append(value.preimage)
 
     return refs
 
@@ -429,7 +431,7 @@ class _LoweringContext:
         elif kind == "deserialize_state":
             self._lower_deserialize_state(value.preimage, binding_index, last_uses)
         elif kind == "add_output":
-            self._lower_add_output(name, value.satoshis, value.state_values, binding_index, last_uses)
+            self._lower_add_output(name, value.satoshis, value.state_values, value.preimage, binding_index, last_uses)
 
     # -----------------------------------------------------------------
     # Individual lowering methods
@@ -1208,19 +1210,108 @@ class _LoweringContext:
     # -----------------------------------------------------------------
 
     def _lower_add_output(self, binding_name: str, satoshis: str,
-                          state_values: list[str], binding_index: int,
+                          state_values: list[str], preimage: str,
+                          binding_index: int,
                           last_uses: dict[str, int]) -> None:
+        # Build a full BIP-143 output serialization:
+        #   amount(8LE) + varint(scriptLen) + codePart + OP_RETURN + stateBytes
         state_props = [p for p in self.properties if not p.readonly]
 
-        # Step 1: Serialize satoshis as 8-byte LE
-        is_last_sat = self._is_last_use(satoshis, binding_index, last_uses)
-        self.bring_to_top(satoshis, is_last_sat)
+        # Compute fixed state serialization length.
+        state_len = 0
+        for p in state_props:
+            if p.type == "bigint":
+                state_len += 8
+            elif p.type == "boolean":
+                state_len += 1
+            elif p.type == "PubKey":
+                state_len += 33
+            elif p.type == "Addr":
+                state_len += 20
+            elif p.type == "Sha256":
+                state_len += 32
+            elif p.type == "Point":
+                state_len += 64
+            else:
+                raise RuntimeError(f"addOutput: unsupported mutable property type: {p.type}")
+
+        # --- Extract varint + codePart from preimage ---
+        pre_is_last = self._is_last_use(preimage, binding_index, last_uses)
+        self.bring_to_top(preimage, pre_is_last)
+
+        # Step 1: Extract middle: varint + scriptCode + amount.
+        self.emit_op(StackOp(op="push", value=big_int_push(104)))
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")  # prefix
+        self.sm.push("")  # rest
+        self.emit_op(StackOp(op="nip"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")  # rest
+
+        # Drop last 44 bytes.
+        self.emit_op(StackOp(op="opcode", code="OP_SIZE"))
+        self.sm.push("")
+        self.emit_op(StackOp(op="push", value=big_int_push(44)))
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_SUB"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")  # middle
+        self.sm.push("")  # tail44
+        self.emit_op(StackOp(op="drop"))
+        self.sm.pop()
+
+        # Step 2: Split off amount (last 8 bytes) and drop it.
+        self.emit_op(StackOp(op="opcode", code="OP_SIZE"))
+        self.sm.push("")
         self.emit_op(StackOp(op="push", value=big_int_push(8)))
         self.sm.push("")
-        self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
-        self.sm.pop()  # pop the width
+        self.emit_op(StackOp(op="opcode", code="OP_SUB"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")  # varint+sc
+        self.sm.push("")  # amount
+        self.emit_op(StackOp(op="drop"))  # drop amount
+        self.sm.pop()
 
-        # Step 2: Serialize each state value and concatenate
+        # Step 3: Strip state + OP_RETURN from end.
+        self.emit_op(StackOp(op="opcode", code="OP_SIZE"))
+        self.sm.push("")
+        self.emit_op(StackOp(op="push", value=big_int_push(state_len + 1)))
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_SUB"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")  # varint+code
+        self.sm.push("")  # opReturn+state
+        self.emit_op(StackOp(op="drop"))
+        self.sm.pop()
+
+        # Step 4: Append OP_RETURN byte.
+        self.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=bytes([0x6A]))))
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_CAT"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")
+
+        # Step 5: Serialize each state value and concatenate.
         for i in range(min(len(state_values), len(state_props))):
             value_ref = state_values[i]
             prop = state_props[i]
@@ -1228,7 +1319,6 @@ class _LoweringContext:
             is_last = self._is_last_use(value_ref, binding_index, last_uses)
             self.bring_to_top(value_ref, is_last)
 
-            # Convert numeric/boolean values to fixed-width bytes
             if prop.type == "bigint":
                 self.emit_op(StackOp(op="push", value=big_int_push(8)))
                 self.sm.push("")
@@ -1240,11 +1330,24 @@ class _LoweringContext:
                 self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
                 self.sm.pop()
 
-            # Concatenate with accumulator
             self.sm.pop()
             self.sm.pop()
             self.emit_op(StackOp(op="opcode", code="OP_CAT"))
             self.sm.push("")
+
+        # Step 6: Prepend satoshis as 8-byte LE.
+        is_last_sat = self._is_last_use(satoshis, binding_index, last_uses)
+        self.bring_to_top(satoshis, is_last_sat)
+        self.emit_op(StackOp(op="push", value=big_int_push(8)))
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
+        self.sm.pop()
+        self.emit_op(StackOp(op="swap"))
+        self.sm.swap()
+        self.sm.pop()
+        self.sm.pop()
+        self.emit_op(StackOp(op="opcode", code="OP_CAT"))  # satoshis || varint+script
+        self.sm.push("")
 
         # Rename top to binding name
         self.sm.pop()
@@ -1893,7 +1996,7 @@ class _LoweringContext:
         for i in range(MAX_POW_ITERATIONS):
             self.emit_op(StackOp(op="push", value=big_int_push(2)))
             self.emit_op(StackOp(op="opcode", code="OP_PICK"))
-            self.emit_op(StackOp(op="push", value=big_int_push(i + 1)))
+            self.emit_op(StackOp(op="push", value=big_int_push(i)))
             self.emit_op(StackOp(op="opcode", code="OP_GREATERTHAN"))
             self.emit_op(StackOp(
                 op="if",
@@ -2419,7 +2522,7 @@ def _lower_method_with_private_methods(
     # Pass terminalAssert=true for public methods
     ctx.lower_bindings(method.body, method.is_public)
 
-    # Clean up excess stack items left by deserialize_state
+    # Clean up excess stack items left by deserialize_state.
     has_deserialize_state = any(b.value.kind == "deserialize_state" for b in method.body)
     if method.is_public and has_deserialize_state and ctx.sm.depth() > 1:
         excess = ctx.sm.depth() - 1
@@ -2449,7 +2552,7 @@ def _lower_method(
     ctx = _LoweringContext(param_names, properties)
     ctx.lower_bindings(method.body, method.is_public)
 
-    # Clean up excess stack items left by deserialize_state
+    # Clean up excess stack items left by deserialize_state.
     has_deserialize_state = any(b.value.kind == "deserialize_state" for b in method.body)
     if method.is_public and has_deserialize_state and ctx.sm.depth() > 1:
         excess = ctx.sm.depth() - 1

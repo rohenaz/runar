@@ -288,9 +288,12 @@ fn collect_refs(value: &ANFValue) -> Vec<String> {
         ANFValue::DeserializeState { preimage } => {
             refs.push(preimage.clone());
         }
-        ANFValue::AddOutput { satoshis, state_values } => {
+        ANFValue::AddOutput { satoshis, state_values, preimage } => {
             refs.push(satoshis.clone());
             refs.extend(state_values.iter().cloned());
+            if !preimage.is_empty() {
+                refs.push(preimage.clone());
+            }
         }
     }
     refs
@@ -514,8 +517,8 @@ impl LoweringContext {
             ANFValue::DeserializeState { preimage } => {
                 self.lower_deserialize_state(preimage, binding_index, last_uses);
             }
-            ANFValue::AddOutput { satoshis, state_values } => {
-                self.lower_add_output(name, satoshis, state_values, binding_index, last_uses);
+            ANFValue::AddOutput { satoshis, state_values, preimage } => {
+                self.lower_add_output(name, satoshis, state_values, preimage, binding_index, last_uses);
             }
         }
     }
@@ -1324,12 +1327,12 @@ impl LoweringContext {
         binding_name: &str,
         satoshis: &str,
         state_values: &[String],
+        preimage: &str,
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
-        // Serialize a transaction output: <8-byte LE satoshis> <serialized state values>
-        // This mirrors lower_get_state_script but uses the provided value refs instead
-        // of loading from the stack, and prepends the satoshis amount.
+        // Build a full BIP-143 output serialization:
+        //   amount(8LE) + varint(scriptLen) + codePart + OP_RETURN + stateBytes
 
         let state_props: Vec<ANFProperty> = self
             .properties
@@ -1338,15 +1341,97 @@ impl LoweringContext {
             .cloned()
             .collect();
 
-        // Step 1: Serialize satoshis as 8-byte LE
-        let is_last_satoshis = self.is_last_use(satoshis, binding_index, last_uses);
-        self.bring_to_top(satoshis, is_last_satoshis);
+        // Compute fixed state serialization length.
+        let mut state_len: usize = 0;
+        for p in &state_props {
+            state_len += match p.prop_type.as_str() {
+                "bigint" => 8,
+                "boolean" => 1,
+                "PubKey" => 33,
+                "Addr" => 20,
+                "Sha256" => 32,
+                "Point" => 64,
+                _ => panic!("addOutput: unsupported mutable property type '{}'", p.prop_type),
+            };
+        }
+
+        // --- Extract varint + codePart from preimage ---
+        let pre_is_last = self.is_last_use(preimage, binding_index, last_uses);
+        self.bring_to_top(preimage, pre_is_last);
+
+        // Step 1: Extract middle: varint + scriptCode + amount.
+        self.emit_op(StackOp::Push(PushValue::Int(104)));
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push(""); // prefix
+        self.sm.push(""); // rest
+        self.emit_op(StackOp::Nip);
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push(""); // rest
+
+        // Drop last 44 bytes.
+        self.emit_op(StackOp::Opcode("OP_SIZE".into()));
+        self.sm.push("");
+        self.emit_op(StackOp::Push(PushValue::Int(44)));
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_SUB".into()));
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push(""); // middle
+        self.sm.push(""); // tail44
+        self.emit_op(StackOp::Drop);
+        self.sm.pop();
+
+        // Step 2: Split off amount (last 8 bytes) and drop it.
+        self.emit_op(StackOp::Opcode("OP_SIZE".into()));
+        self.sm.push("");
         self.emit_op(StackOp::Push(PushValue::Int(8)));
         self.sm.push("");
-        self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
-        self.sm.pop(); // pop the width
+        self.emit_op(StackOp::Opcode("OP_SUB".into()));
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push(""); // varint+sc
+        self.sm.push(""); // amount
+        self.emit_op(StackOp::Drop); // drop amount
+        self.sm.pop();
 
-        // Step 2: Serialize each state value and concatenate
+        // Step 3: Strip state + OP_RETURN from end.
+        self.emit_op(StackOp::Opcode("OP_SIZE".into()));
+        self.sm.push("");
+        self.emit_op(StackOp::Push(PushValue::Int((state_len + 1) as i128)));
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_SUB".into()));
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push(""); // varint+code
+        self.sm.push(""); // opReturn+state
+        self.emit_op(StackOp::Drop);
+        self.sm.pop();
+
+        // Step 4: Append OP_RETURN byte.
+        self.emit_op(StackOp::Push(PushValue::Bytes(vec![0x6a])));
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_CAT".into()));
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push("");
+
+        // Step 5: Serialize each state value and concatenate.
         for (i, value_ref) in state_values.iter().enumerate() {
             if i >= state_props.len() {
                 break;
@@ -1356,26 +1441,37 @@ impl LoweringContext {
             let is_last = self.is_last_use(value_ref, binding_index, last_uses);
             self.bring_to_top(value_ref, is_last);
 
-            // Convert numeric/boolean values to fixed-width bytes via OP_NUM2BIN
             if prop.prop_type == "bigint" {
                 self.emit_op(StackOp::Push(PushValue::Int(8)));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
-                self.sm.pop(); // pop the width
+                self.sm.pop();
             } else if prop.prop_type == "boolean" {
                 self.emit_op(StackOp::Push(PushValue::Int(1)));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
-                self.sm.pop(); // pop the width
+                self.sm.pop();
             }
-            // Byte types used as-is
 
-            // Concatenate with accumulator
             self.sm.pop();
             self.sm.pop();
             self.emit_op(StackOp::Opcode("OP_CAT".to_string()));
             self.sm.push("");
         }
+
+        // Step 6: Prepend satoshis as 8-byte LE.
+        let is_last_satoshis = self.is_last_use(satoshis, binding_index, last_uses);
+        self.bring_to_top(satoshis, is_last_satoshis);
+        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
+        self.sm.pop();
+        self.emit_op(StackOp::Swap);
+        self.sm.swap();
+        self.sm.pop();
+        self.sm.pop();
+        self.emit_op(StackOp::Opcode("OP_CAT".to_string())); // satoshis || varint+script
+        self.sm.push("");
 
         // Rename top to binding name
         self.sm.pop();
@@ -2614,7 +2710,7 @@ impl LoweringContext {
             // Stack: exp base acc
             self.emit_op(StackOp::Push(PushValue::Int(2)));
             self.emit_op(StackOp::Opcode("OP_PICK".to_string()));     // exp base acc exp
-            self.emit_op(StackOp::Push(PushValue::Int(i + 1)));
+            self.emit_op(StackOp::Push(PushValue::Int(i)));
             self.emit_op(StackOp::Opcode("OP_GREATERTHAN".to_string())); // exp base acc (exp > i)
             self.emit_op(StackOp::If {
                 then_ops: vec![
@@ -2954,7 +3050,6 @@ fn lower_method_with_private_methods(
     ctx.lower_bindings(&method.body, method.is_public);
 
     // Clean up excess stack items left by deserialize_state.
-    // Only needed for stateful methods that deserialize state from the preimage.
     let has_deserialize_state = method.body.iter().any(|b| matches!(&b.value, ANFValue::DeserializeState { .. }));
     if method.is_public && has_deserialize_state && ctx.sm.depth() > 1 {
         let excess = ctx.sm.depth() - 1;

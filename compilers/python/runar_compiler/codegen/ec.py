@@ -660,20 +660,26 @@ def emit_ec_mul(emit: Callable) -> None:
     # Decompose to affine base point
     _ec_decompose_point(t, "_pt", "ax", "ay")
 
-    # k' = k + n: guarantees bit 255 is set.
+    # k' = k + 3n: guarantees bit 257 is set.
+    # k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
+    # is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
     curve_n = int("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
     t.to_top("_k")
     t.push_big_int("_n", curve_n)
     t.raw_block(["_k", "_n"], "_kn", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
+    t.push_big_int("_n2", curve_n)
+    t.raw_block(["_kn", "_n2"], "_kn2", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
+    t.push_big_int("_n3", curve_n)
+    t.raw_block(["_kn2", "_n3"], "_kn3", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
     t.rename("_k")
 
-    # Init accumulator = P (bit 255 is always 1, serves as initializer)
+    # Init accumulator = P (bit 257 of k+3n is always 1)
     t.copy_to_top("ax", "jx")
     t.copy_to_top("ay", "jy")
     t.push_int("jz", 1)
 
-    # 255 iterations: bits 254 down to 0
-    for bit in range(254, -1, -1):
+    # 257 iterations: bits 256 down to 0
+    for bit in range(256, -1, -1):
         # Double accumulator
         _ec_jacobian_double(t)
 

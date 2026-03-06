@@ -721,7 +721,8 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 		argRefs := ctx.lowerArgs(e.Args)
 		satoshis := argRefs[0]
 		stateValues := argRefs[1:]
-		ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues})
+		preimageRef := ctx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+		ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues, Preimage: preimageRef})
 		ctx.addOutputRef(ref)
 		return ref
 	}
@@ -730,7 +731,8 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 			argRefs := ctx.lowerArgs(e.Args)
 			satoshis := argRefs[0]
 			stateValues := argRefs[1:]
-			ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues})
+			preimageRef := ctx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+			ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues, Preimage: preimageRef})
 			ctx.addOutputRef(ref)
 			return ref
 		}

@@ -666,22 +666,32 @@ func EmitEcMul(emit func(StackOp)) {
 	// Decompose to affine base point
 	ecDecomposePoint(t, "_pt", "ax", "ay")
 
-	// k' = k + n: guarantees bit 255 is set.
+	// k' = k + 3n: guarantees bit 257 is set.
+	// k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
+	// is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
 	curveN, _ := new(big.Int).SetString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
 	t.toTop("_k")
 	t.pushBigInt("_n", curveN)
 	t.rawBlock([]string{"_k", "_n"}, "_kn", func(e func(StackOp)) {
 		e(StackOp{Op: "opcode", Code: "OP_ADD"})
 	})
+	t.pushBigInt("_n2", curveN)
+	t.rawBlock([]string{"_kn", "_n2"}, "_kn2", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})
+	})
+	t.pushBigInt("_n3", curveN)
+	t.rawBlock([]string{"_kn2", "_n3"}, "_kn3", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})
+	})
 	t.rename("_k")
 
-	// Init accumulator = P (bit 255 is always 1, serves as initializer)
+	// Init accumulator = P (bit 257 of k+3n is always 1)
 	t.copyToTop("ax", "jx")
 	t.copyToTop("ay", "jy")
 	t.pushInt("jz", 1)
 
-	// 255 iterations: bits 254 down to 0
-	for bit := 254; bit >= 0; bit-- {
+	// 257 iterations: bits 256 down to 0
+	for bit := 256; bit >= 0; bit-- {
 		// Double accumulator
 		ecJacobianDouble(t)
 

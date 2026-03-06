@@ -231,7 +231,7 @@ function collectRefs(value: ANFValue): string[] {
       }
       break;
     case 'add_output':
-      refs.push(value.satoshis, ...value.stateValues);
+      refs.push(value.satoshis, ...value.stateValues, value.preimage);
       break;
     case 'bin_op':
       refs.push(value.left, value.right);
@@ -485,7 +485,7 @@ class LoweringContext {
         this.lowerDeserializeState(value.preimage, bindingIndex, lastUses);
         break;
       case 'add_output':
-        this.lowerAddOutput(name, value.satoshis, value.stateValues, bindingIndex, lastUses);
+        this.lowerAddOutput(name, value.satoshis, value.stateValues, value.preimage, bindingIndex, lastUses);
         break;
     }
   }
@@ -1318,24 +1318,114 @@ class LoweringContext {
     bindingName: string,
     satoshis: string,
     stateValues: string[],
+    preimage: string,
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
-    // Serialize a transaction output: <8-byte LE satoshis> <serialized state values>
-    // This mirrors lowerGetStateScript but uses the provided value refs instead
-    // of loading from the stack, and prepends the satoshis amount.
+    // Build a full BIP-143 output serialization:
+    //   amount(8LE) + varint(scriptLen) + codePart + OP_RETURN + stateBytes
+    // This matches what extractOutputHash (SHA256d of concatenated outputs) expects.
 
     const stateProps = this._properties.filter(p => !p.readonly);
 
-    // Step 1: Serialize satoshis as 8-byte LE
-    const isLastSatoshis = this.isLastUse(satoshis, bindingIndex, lastUses);
-    this.bringToTop(satoshis, isLastSatoshis);
+    // Compute fixed state serialization length from non-readonly properties.
+    let stateLen = 0;
+    for (const prop of stateProps) {
+      switch (prop.type) {
+        case 'bigint': stateLen += 8; break;
+        case 'boolean': stateLen += 1; break;
+        case 'PubKey': stateLen += 33; break;
+        case 'Addr': stateLen += 20; break;
+        case 'Sha256': stateLen += 32; break;
+        case 'Point': stateLen += 64; break;
+        default:
+          throw new Error(`addOutput: unsupported mutable property type '${prop.type}'`);
+      }
+    }
+
+    // --- Extract varint + codePart from preimage ---
+    // PICK preimage (don't consume — it's used later by extractOutputHash)
+    const preIsLast = this.isLastUse(preimage, bindingIndex, lastUses);
+    this.bringToTop(preimage, preIsLast);
+
+    // Step 1: Extract middle of preimage: varint + scriptCode + amount.
+    // Split at 104 and drop prefix.
+    this.emitOp({ op: 'push', value: 104n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [prefix, rest]
+    this.stackMap.pop(); // pop 104
+    this.stackMap.pop(); // pop preimage
+    this.stackMap.push(null); // prefix
+    this.stackMap.push(null); // rest
+    this.emitOp({ op: 'nip' }); // drop prefix, keep rest
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null); // rest
+
+    // Drop last 44 bytes (nSeq+hashOutputs+nLocktime+sighashType).
+    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'push', value: 44n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [middle, tail44]
+    this.stackMap.pop(); // pop position
+    this.stackMap.pop(); // pop rest
+    this.stackMap.push(null); // middle
+    this.stackMap.push(null); // tail44
+    this.emitOp({ op: 'drop' }); // drop tail
+    this.stackMap.pop();
+    // --- Stack: [..., middle(varint+scriptCode+amount)] ---
+
+    // Step 2: Split off amount (last 8 bytes) and drop it.
+    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
+    this.stackMap.push(null);
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
-    this.stackMap.pop(); // pop the width
+    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [varint+scriptCode, amount]
+    this.stackMap.pop(); // pop position
+    this.stackMap.pop(); // pop middle
+    this.stackMap.push(null); // varint+scriptCode
+    this.stackMap.push(null); // amount
+    this.emitOp({ op: 'drop' }); // drop amount (we use our own satoshis)
+    this.stackMap.pop();
+    // --- Stack: [..., varint+scriptCode] ---
 
-    // Step 2: Serialize each state value and concatenate
+    // Step 3: Strip current state + OP_RETURN from end (stateLen + 1 bytes).
+    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'push', value: BigInt(stateLen + 1) });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [varint+codePart, opReturn+state]
+    this.stackMap.pop(); // pop position
+    this.stackMap.pop(); // pop varint+scriptCode
+    this.stackMap.push(null); // varint+codePart
+    this.stackMap.push(null); // opReturn+state
+    this.emitOp({ op: 'drop' }); // discard old state
+    this.stackMap.pop();
+    // --- Stack: [..., varint+codePart] ---
+
+    // Step 4: Append OP_RETURN byte (0x6a).
+    this.emitOp({ op: 'push', value: new Uint8Array([0x6a]) });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+    // --- Stack: [..., varint+codePart+OP_RETURN] ---
+
+    // Step 5: Serialize each state value and concatenate.
     for (let i = 0; i < stateValues.length && i < stateProps.length; i++) {
       const valueRef = stateValues[i]!;
       const prop = stateProps[i]!;
@@ -1363,6 +1453,23 @@ class LoweringContext {
       this.emitOp({ op: 'opcode', code: 'OP_CAT' });
       this.stackMap.push(null);
     }
+    // --- Stack: [..., varint+codePart+OP_RETURN+stateBytes] ---
+
+    // Step 6: Prepend satoshis as 8-byte LE.
+    const isLastSatoshis = this.isLastUse(satoshis, bindingIndex, lastUses);
+    this.bringToTop(satoshis, isLastSatoshis);
+    this.emitOp({ op: 'push', value: 8n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
+    this.stackMap.pop(); // pop the width
+    // Stack: [..., varint+script, satoshis(8LE)]
+    this.emitOp({ op: 'swap' });
+    this.stackMap.swap();
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' }); // satoshis || varint+script
+    this.stackMap.push(null);
+    // --- Stack: [..., amount(8LE)+varint+scriptPubKey] ---
 
     // Rename top to binding name
     this.stackMap.pop();
@@ -2078,7 +2185,7 @@ class LoweringContext {
     // OP_1         → <exp> <base> <1>  (accumulator)
     // Then 32x: <exp> <base> <acc>
     //   2 OP_PICK  → <exp> <base> <acc> <exp>
-    //   <i+1>      → <exp> <base> <acc> <exp> <i+1>
+    //   <i>        → <exp> <base> <acc> <exp> <i>
     //   OP_GREATERTHAN → <exp> <base> <acc> <exp > i>
     //   OP_IF
     //     OP_OVER   → <exp> <base> <acc> <base>
@@ -2099,7 +2206,7 @@ class LoweringContext {
       // Stack: exp base acc
       this.emitOp({ op: 'push', value: 2n });
       this.emitOp({ op: 'opcode', code: 'OP_PICK' }); // exp base acc exp
-      this.emitOp({ op: 'push', value: BigInt(i + 1) });
+      this.emitOp({ op: 'push', value: BigInt(i) });
       this.emitOp({ op: 'opcode', code: 'OP_GREATERTHAN' }); // exp base acc (exp > i)
       this.emitOp({
         op: 'if',

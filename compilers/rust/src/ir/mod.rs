@@ -141,6 +141,8 @@ pub enum ANFValue {
         satoshis: String,
         #[serde(rename = "stateValues")]
         state_values: Vec<String>,
+        #[serde(default)]
+        preimage: String,
     },
 }
 

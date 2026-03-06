@@ -2057,3 +2057,104 @@ func TestLocalSigner_DifferentKeysDifferentSigs(t *testing.T) {
 		t.Error("different keys should produce different signatures")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// BuildUnlockingScript
+// ---------------------------------------------------------------------------
+
+func TestBuildUnlockingScript_SingleMethod_NoSelector(t *testing.T) {
+	artifact := makeArtifact("009c", ABI{
+		Constructor: ABIConstructor{
+			Params: []ABIParam{{Name: "target", Type: "bigint"}},
+		},
+		Methods: []ABIMethod{
+			{Name: "check", Params: []ABIParam{{Name: "x", Type: "bigint"}}, IsPublic: true},
+		},
+	}, func(a *RunarArtifact) {
+		a.ConstructorSlots = []ConstructorSlot{{ParamIndex: 0, ByteOffset: 0}}
+	})
+
+	c := NewRunarContract(artifact, []interface{}{int64(42)})
+	unlock := c.BuildUnlockingScript("check", []interface{}{int64(7)})
+
+	// Single-method contract: no method selector, only the arg
+	// 7 → OP_7 = 0x57
+	expected := "57"
+	if unlock != expected {
+		t.Errorf("expected unlocking script %q, got %q", expected, unlock)
+	}
+}
+
+func TestBuildUnlockingScript_MultiMethod_HasSelector(t *testing.T) {
+	artifact := makeArtifact("009c", ABI{
+		Constructor: ABIConstructor{
+			Params: []ABIParam{{Name: "target", Type: "bigint"}},
+		},
+		Methods: []ABIMethod{
+			{Name: "methodA", Params: []ABIParam{{Name: "x", Type: "bigint"}}, IsPublic: true},
+			{Name: "methodB", Params: nil, IsPublic: true},
+		},
+	}, func(a *RunarArtifact) {
+		a.ConstructorSlots = []ConstructorSlot{{ParamIndex: 0, ByteOffset: 0}}
+	})
+
+	c := NewRunarContract(artifact, []interface{}{int64(42)})
+	unlock := c.BuildUnlockingScript("methodB", []interface{}{})
+
+	// Multi-method: method selector for index 1 (methodB) = OP_1 = 0x51
+	expected := "51"
+	if unlock != expected {
+		t.Errorf("expected unlocking script %q, got %q", expected, unlock)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildCodeScript must NOT duplicate constructor args
+// ---------------------------------------------------------------------------
+
+func TestBuildCodeScript_WithSlots_NoFallbackAppend(t *testing.T) {
+	// Script: OP_0 (placeholder at offset 0) + OP_NUMEQUAL
+	// After splicing target=42: should be "012a" + "9c"
+	artifact := makeArtifact("009c", ABI{
+		Constructor: ABIConstructor{
+			Params: []ABIParam{{Name: "target", Type: "bigint"}},
+		},
+		Methods: []ABIMethod{
+			{Name: "check", Params: []ABIParam{{Name: "x", Type: "bigint"}}, IsPublic: true},
+		},
+	}, func(a *RunarArtifact) {
+		a.ConstructorSlots = []ConstructorSlot{{ParamIndex: 0, ByteOffset: 0}}
+	})
+
+	c := NewRunarContract(artifact, []interface{}{int64(42)})
+	lockingScript := c.GetLockingScript()
+
+	// 42 = 0x2a → script number push: 01 2a
+	// Then OP_NUMEQUAL = 9c
+	expected := "012a9c"
+	if lockingScript != expected {
+		t.Errorf("expected locking script %q, got %q\nlength: expected %d, got %d",
+			expected, lockingScript, len(expected), len(lockingScript))
+	}
+}
+
+func TestBuildCodeScript_WithoutSlots_FallbackAppends(t *testing.T) {
+	// Old artifact format: no constructor slots, args appended to script
+	artifact := makeArtifact("009c", ABI{
+		Constructor: ABIConstructor{
+			Params: []ABIParam{{Name: "target", Type: "bigint"}},
+		},
+		Methods: []ABIMethod{
+			{Name: "check", Params: []ABIParam{{Name: "x", Type: "bigint"}}, IsPublic: true},
+		},
+	})
+
+	c := NewRunarContract(artifact, []interface{}{int64(42)})
+	lockingScript := c.GetLockingScript()
+
+	// Fallback: "009c" + encoded(42) = "009c" + "012a"
+	expected := "009c" + "012a"
+	if lockingScript != expected {
+		t.Errorf("expected locking script %q, got %q", expected, lockingScript)
+	}
+}

@@ -511,6 +511,7 @@ function collectRefsFromValue(value: ANFValue, refs: Set<string>): void {
     case 'add_output':
       refs.add(value.satoshis);
       for (const sv of value.stateValues) refs.add(sv);
+      refs.add(value.preimage);
       break;
   }
 }

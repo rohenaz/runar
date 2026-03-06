@@ -93,33 +93,28 @@ func TestSchnorr_ValidProof(t *testing.T) {
 		t.Skip("Schnorr EC math is slow, skipping in short mode")
 	}
 
-	// Generate keypair and proof parameters. The ecMul codegen uses k+n trick which
-	// requires k+n < 2^256 (i.e., k < 2^256-n ≈ 2^128). We retry until the scalar s
-	// satisfies this constraint. The probability is ~2^128/2^256 per attempt, but
-	// since e is small (12345), s is biased toward small values when r is small.
-	threshold := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), ecN) // 2^256 - n
-
-	var k, px, py, r2, rx, ry, s *big.Int
-	var e = big.NewInt(12345)
-	for {
-		k, _ = rand.Int(rand.Reader, threshold) // k < 2^128
-		k.Add(k, big.NewInt(1))
-		px, py = ecMul(ecGx, ecGy, k)
-
-		r2, _ = rand.Int(rand.Reader, threshold) // r < 2^128
-		r2.Add(r2, big.NewInt(1))
-		rx, ry = ecMul(ecGx, ecGy, r2)
-
-		// s = r + e*k mod n
-		s = new(big.Int).Mul(e, k)
-		s.Add(s, r2)
-		s.Mod(s, ecN)
-
-		// Check all scalars fit: s+n < 2^256 AND e+n < 2^256
-		if s.Cmp(threshold) < 0 {
-			break
-		}
+	// Generate keypair and proof parameters.
+	// The ecMul codegen uses k+3n trick so any scalar in [1, n-1] works.
+	k, _ := rand.Int(rand.Reader, ecN)
+	k.Add(k, big.NewInt(1)) // ensure k >= 1
+	if k.Cmp(ecN) >= 0 {
+		k.Sub(k, big.NewInt(1))
 	}
+	px, py := ecMul(ecGx, ecGy, k)
+
+	r2, _ := rand.Int(rand.Reader, ecN)
+	r2.Add(r2, big.NewInt(1))
+	if r2.Cmp(ecN) >= 0 {
+		r2.Sub(r2, big.NewInt(1))
+	}
+	rx, ry := ecMul(ecGx, ecGy, r2)
+
+	e := big.NewInt(12345)
+
+	// s = r + e*k mod n
+	s := new(big.Int).Mul(e, k)
+	s.Add(s, r2)
+	s.Mod(s, ecN)
 
 	// pubKey as 64-byte point (x[32]||y[32])
 	pubKeyHex := fmt.Sprintf("%064x%064x", px, py)

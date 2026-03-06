@@ -138,6 +138,7 @@ export interface AddOutput {
   kind: 'add_output';
   satoshis: string;       // reference to a temp holding satoshis bigint
   stateValues: string[];  // references to temps, one per mutable property in declaration order
+  preimage: string;       // reference to a temp holding the verified preimage (for codePart extraction)
 }
 
 export type ANFValue =

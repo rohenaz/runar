@@ -660,7 +660,8 @@ function lowerCallExpr(
     const argRefs = expr.args.map(arg => lowerExprToRef(arg, ctx));
     const satoshis = argRefs[0]!;
     const stateValues = argRefs.slice(1);
-    const ref = ctx.emit({ kind: 'add_output', satoshis, stateValues });
+    const preimageRef = ctx.emit({ kind: 'load_param', name: 'txPreimage' });
+    const ref = ctx.emit({ kind: 'add_output', satoshis, stateValues, preimage: preimageRef });
     ctx.addOutputRef(ref);
     return ref;
   }
