@@ -1,7 +1,9 @@
 package runar
 
 import (
+	"encoding/hex"
 	"fmt"
+	"math/big"
 	"sort"
 )
 
@@ -212,8 +214,6 @@ func (c *RunarContract) Call(
 		changeAddress = address
 	}
 
-	unlockingScript := c.BuildUnlockingScript(methodName, args)
-
 	// Determine if this is a stateful call
 	isStateful := len(c.Artifact.StateFields) > 0
 
@@ -246,6 +246,13 @@ func (c *RunarContract) Call(
 		return "", nil, fmt.Errorf("RunarContract.Call: getting UTXOs: %w", err)
 	}
 
+	// Build the unlocking script. For stateful contracts, OP_PUSH_TX data
+	// (opPushTxSig + txPreimage) is inserted around the user args:
+	//   <opPushTxSig> <user_args> <txPreimage> <methodSelector>
+	// This requires building the TX first with a placeholder, computing the
+	// preimage, then rebuilding the unlock.
+	unlockingScript := c.BuildUnlockingScript(methodName, args)
+
 	txHex, inputCount := BuildCallTransaction(
 		*c.currentUtxo,
 		unlockingScript,
@@ -256,6 +263,48 @@ func (c *RunarContract) Call(
 		additionalUtxos,
 		feeRate,
 	)
+
+	if isStateful {
+		// Compute OP_PUSH_TX signature and preimage from the unsigned TX
+		opPushTxSig, preimage, err := ComputeOpPushTx(txHex, 0,
+			c.currentUtxo.Script, c.currentUtxo.Satoshis)
+		if err != nil {
+			return "", nil, fmt.Errorf("RunarContract.Call: OP_PUSH_TX: %w", err)
+		}
+
+		// Rebuild unlocking script: <opPushTxSig> <user_args> <txPreimage> <methodSelector>
+		userArgsHex := ""
+		for _, arg := range args {
+			userArgsHex += encodeArg(arg)
+		}
+		methodSelectorHex := ""
+		publicMethods := c.getPublicMethods()
+		if len(publicMethods) > 1 {
+			for i, m := range publicMethods {
+				if m.Name == methodName {
+					methodSelectorHex = encodeScriptNumber(int64(i))
+					break
+				}
+			}
+		}
+
+		unlockingScript = EncodePushData(hex.EncodeToString(opPushTxSig)) +
+			userArgsHex +
+			EncodePushData(hex.EncodeToString(preimage)) +
+			methodSelectorHex
+
+		// Rebuild the transaction with the real unlocking script
+		txHex, inputCount = BuildCallTransaction(
+			*c.currentUtxo,
+			unlockingScript,
+			newLockingScript,
+			newSatoshis,
+			changeAddress,
+			changeScript,
+			additionalUtxos,
+			feeRate,
+		)
+	}
 
 	// Sign additional inputs (input 0 already has the unlocking script)
 	signedTx := txHex
@@ -505,6 +554,8 @@ func encodeArg(value interface{}) string {
 		return encodeScriptNumber(int64(v))
 	case int32:
 		return encodeScriptNumber(int64(v))
+	case *big.Int:
+		return encodeBigIntScriptNumber(v)
 	case bool:
 		if v {
 			return "51" // OP_TRUE
@@ -558,5 +609,39 @@ func encodeScriptNumber(n int64) string {
 
 	hex := bytesToHex(bytes)
 	return EncodePushData(hex)
+}
+
+// encodeBigIntScriptNumber encodes a *big.Int as a Bitcoin Script number push.
+// Uses LE sign-magnitude encoding, same as encodeScriptNumber but for arbitrary precision.
+func encodeBigIntScriptNumber(n *big.Int) string {
+	if n.Sign() == 0 {
+		return "00" // OP_0
+	}
+	if n.IsInt64() {
+		return encodeScriptNumber(n.Int64())
+	}
+
+	// Big value: convert to LE sign-magnitude
+	abs := new(big.Int).Abs(n)
+	absBytes := abs.Bytes() // big-endian
+
+	// Reverse to little-endian
+	le := make([]byte, len(absBytes))
+	for i, b := range absBytes {
+		le[len(absBytes)-1-i] = b
+	}
+
+	// Add sign byte if needed
+	if le[len(le)-1]&0x80 != 0 {
+		if n.Sign() < 0 {
+			le = append(le, 0x80)
+		} else {
+			le = append(le, 0x00)
+		}
+	} else if n.Sign() < 0 {
+		le[len(le)-1] |= 0x80
+	}
+
+	return EncodePushData(bytesToHex(le))
 }
 

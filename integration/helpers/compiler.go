@@ -11,6 +11,7 @@ import (
 	"github.com/icellan/runar/compilers/go/codegen"
 	"github.com/icellan/runar/compilers/go/frontend"
 	"github.com/icellan/runar/compilers/go/ir"
+	runar "github.com/icellan/runar/packages/runar-go"
 )
 
 // Artifact mirrors the compiler's Artifact type.
@@ -81,6 +82,8 @@ func CompileContract(sourcePath string, constructorArgs map[string]interface{}) 
 				program.Properties[i].InitialValue = float64(v)
 			case *big.Int:
 				program.Properties[i].InitialValue = v
+			case []byte:
+				program.Properties[i].InitialValue = v
 			default:
 				return nil, fmt.Errorf("unsupported constructor arg type for %s: %T", program.Properties[i].Name, val)
 			}
@@ -119,4 +122,152 @@ func compileFromProgram(program *ir.ANFProgram) (*Artifact, error) {
 		ConstructorSlots: emitResult.ConstructorSlots,
 		ABI:              ABI{Methods: methods},
 	}, nil
+}
+
+// CompileToSDKArtifact compiles a source file and returns a runar.RunarArtifact
+// suitable for use with RunarContract from the SDK.
+func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interface{}) (*runar.RunarArtifact, error) {
+	absPath := filepath.Join(projectRoot(), sourcePath)
+	source, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading source: %w", err)
+	}
+
+	parseResult := frontend.ParseSource(source, absPath)
+	if len(parseResult.Errors) > 0 {
+		return nil, fmt.Errorf("parse errors: %v", parseResult.Errors)
+	}
+	if parseResult.Contract == nil {
+		return nil, fmt.Errorf("no contract found in %s", sourcePath)
+	}
+
+	validResult := frontend.Validate(parseResult.Contract)
+	if len(validResult.Errors) > 0 {
+		return nil, fmt.Errorf("validation errors: %v", validResult.Errors)
+	}
+
+	tcResult := frontend.TypeCheck(parseResult.Contract)
+	if len(tcResult.Errors) > 0 {
+		return nil, fmt.Errorf("type check errors: %v", tcResult.Errors)
+	}
+
+	program := frontend.LowerToANF(parseResult.Contract)
+
+	// Inject constructor args
+	for i := range program.Properties {
+		if val, ok := constructorArgs[program.Properties[i].Name]; ok {
+			switch v := val.(type) {
+			case string:
+				program.Properties[i].InitialValue = v
+			case float64:
+				program.Properties[i].InitialValue = v
+			case int64:
+				program.Properties[i].InitialValue = float64(v)
+			case int:
+				program.Properties[i].InitialValue = float64(v)
+			case *big.Int:
+				program.Properties[i].InitialValue = v
+			case []byte:
+				program.Properties[i].InitialValue = v
+			}
+		}
+	}
+
+	stackMethods, err := codegen.LowerToStack(program)
+	if err != nil {
+		return nil, fmt.Errorf("stack lowering: %w", err)
+	}
+	for i := range stackMethods {
+		stackMethods[i].Ops = codegen.OptimizeStackOps(stackMethods[i].Ops)
+	}
+	emitResult, err := codegen.Emit(stackMethods)
+	if err != nil {
+		return nil, fmt.Errorf("emit: %w", err)
+	}
+
+	// Build ABI with full param info
+	contract := parseResult.Contract
+	var abiMethods []runar.ABIMethod
+	for _, m := range contract.Methods {
+		if m.Name == "constructor" {
+			continue
+		}
+		var params []runar.ABIParam
+		for _, p := range m.Params {
+			typeName := "bigint"
+			if p.Type != nil {
+				typeName = astTypeName(p.Type)
+			}
+			params = append(params, runar.ABIParam{Name: p.Name, Type: typeName})
+		}
+		abiMethods = append(abiMethods, runar.ABIMethod{
+			Name:     m.Name,
+			Params:   params,
+			IsPublic: m.Visibility == "public",
+		})
+	}
+
+	var ctorParams []runar.ABIParam
+	for _, p := range contract.Constructor.Params {
+		typeName := "bigint"
+		if p.Type != nil {
+			typeName = astTypeName(p.Type)
+		}
+		ctorParams = append(ctorParams, runar.ABIParam{Name: p.Name, Type: typeName})
+	}
+
+	// Build state fields for stateful contracts
+	var stateFields []runar.StateField
+	if contract.ParentClass == "StatefulSmartContract" {
+		for _, p := range contract.Properties {
+			if p.Readonly {
+				continue
+			}
+			typeName := "bigint"
+			if p.Type != nil {
+				typeName = astTypeName(p.Type)
+			}
+			stateFields = append(stateFields, runar.StateField{
+				Name: p.Name,
+				Type: typeName,
+			})
+		}
+	}
+
+	// Build constructor slots
+	var cSlots []runar.ConstructorSlot
+	for _, s := range emitResult.ConstructorSlots {
+		cSlots = append(cSlots, runar.ConstructorSlot{
+			ParamIndex: s.ParamIndex,
+			ByteOffset: s.ByteOffset,
+		})
+	}
+
+	return &runar.RunarArtifact{
+		Version:          "runar-v0.1.0",
+		CompilerVersion:  "integration-test",
+		ContractName:     program.ContractName,
+		Script:           emitResult.ScriptHex,
+		ASM:              emitResult.ScriptAsm,
+		ConstructorSlots: cSlots,
+		StateFields:      stateFields,
+		ABI: runar.ABI{
+			Constructor: runar.ABIConstructor{Params: ctorParams},
+			Methods:     abiMethods,
+		},
+	}, nil
+}
+
+// astTypeName extracts the type name string from a frontend.TypeNode.
+func astTypeName(t frontend.TypeNode) string {
+	switch v := t.(type) {
+	case frontend.PrimitiveType:
+		return v.Name
+	case frontend.FixedArrayType:
+		return fmt.Sprintf("FixedArray<%s,%d>", astTypeName(v.Element), v.Length)
+	case frontend.CustomType:
+		return v.Name
+	default:
+		return "bigint"
+	}
 }

@@ -4,50 +4,36 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	runar "github.com/icellan/runar/packages/runar-go"
 	"github.com/bsv-blockchain/go-sdk/transaction"
-	sighash "github.com/bsv-blockchain/go-sdk/transaction/sighash"
 )
 
-var (
-	opPushTxKey    *ec.PrivateKey
-	opPushTxPubKey *ec.PublicKey
-)
-
-func init() {
-	// OP_PUSH_TX uses private key = 1 (public key = generator point G).
-	keyBytes := make([]byte, 32)
-	keyBytes[31] = 1
-	opPushTxKey, opPushTxPubKey = ec.PrivateKeyFromBytes(keyBytes)
-}
-
-// SignOpPushTx signs the BIP-143 sighash with the OP_PUSH_TX key (k=1).
+// SignOpPushTx computes the OP_PUSH_TX DER signature and BIP-143 preimage
+// for a contract input. Delegates to the SDK's ComputeOpPushTx.
+//
 // Returns (sigWithFlagHex, preimageHex, error).
 func SignOpPushTx(tx *transaction.Transaction, inputIdx uint32) (string, string, error) {
-	// Get the raw preimage bytes (pushed onto the stack for checkPreimage)
-	preimage, err := tx.CalcInputPreimage(inputIdx, sighash.AllForkID)
-	if err != nil {
-		return "", "", fmt.Errorf("calc preimage: %w", err)
+	if int(inputIdx) >= len(tx.Inputs) {
+		return "", "", fmt.Errorf("input index %d out of range", inputIdx)
 	}
 
-	// Get the sighash (double-SHA256 of preimage) for signing
-	sigHash, err := tx.CalcInputSignatureHash(inputIdx, sighash.AllForkID)
-	if err != nil {
-		return "", "", fmt.Errorf("calc sighash: %w", err)
+	prevOutput := tx.Inputs[inputIdx].SourceTxOutput()
+	if prevOutput == nil {
+		return "", "", fmt.Errorf("input %d has no source output set", inputIdx)
 	}
 
-	sig, err := opPushTxKey.Sign(sigHash)
-	if err != nil {
-		return "", "", fmt.Errorf("sign: %w", err)
-	}
+	subscript := hex.EncodeToString(*prevOutput.LockingScript)
+	satoshis := int64(prevOutput.Satoshis)
 
-	sigBytes := sig.Serialize()
-	sigBytes = append(sigBytes, byte(sighash.AllForkID))
+	sigBytes, preimage, err := runar.ComputeOpPushTx(tx.Hex(), int(inputIdx), subscript, satoshis)
+	if err != nil {
+		return "", "", err
+	}
 
 	return hex.EncodeToString(sigBytes), hex.EncodeToString(preimage), nil
 }
 
-// OpPushTxPubKeyHex returns the compressed public key hex for OP_PUSH_TX (generator point G).
+// OpPushTxPubKeyHex returns the compressed public key hex for OP_PUSH_TX.
 func OpPushTxPubKeyHex() string {
-	return hex.EncodeToString(opPushTxPubKey.Compressed())
+	return runar.OpPushTxPubKeyHex()
 }
