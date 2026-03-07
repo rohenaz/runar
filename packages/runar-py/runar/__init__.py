@@ -24,6 +24,8 @@ from runar.builtins import (
     verify_slh_dsa_sha2_192s, verify_slh_dsa_sha2_192f,
     verify_slh_dsa_sha2_256s, verify_slh_dsa_sha2_256f,
 )
+from runar.wots import wots_keygen, wots_sign, WOTSKeyPair
+from runar.slhdsa_impl import slh_keygen, slh_verify, SLHKeyPair
 from runar.ec import (
     ec_add, ec_mul, ec_mul_gen, ec_negate, ec_on_curve,
     ec_mod_reduce, ec_encode_compressed, ec_make_point,
@@ -77,6 +79,10 @@ __all__ = [
     'ec_point_x', 'ec_point_y', 'EC_P', 'EC_N', 'EC_G',
     # Test helpers
     'mock_sig', 'mock_pub_key', 'mock_preimage',
+    # WOTS+ keygen/sign
+    'wots_keygen', 'wots_sign', 'WOTSKeyPair',
+    # SLH-DSA keygen/verify
+    'slh_keygen', 'slh_verify', 'SLHKeyPair',
     # Compile check
     'compile_check',
 ]

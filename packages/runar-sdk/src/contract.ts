@@ -37,6 +37,8 @@ export class RunarContract {
   private _state: Record<string, unknown> = {};
   private _codeScript: string | null = null;
   private currentUtxo: UTXO | null = null;
+  /** Returns the current UTXO tracked by this contract, if any. */
+  getUtxo(): UTXO | null { return this.currentUtxo; }
   private _provider: Provider | null = null;
   private _signer: Signer | null = null;
 

@@ -86,7 +86,6 @@ pub fn extract_state_from_script(
 ///
 /// Returns the hex-char offset of the last OP_RETURN, or None.
 pub fn find_last_op_return(script_hex: &str) -> Option<usize> {
-    let mut last_pos: Option<usize> = None;
     let mut offset = 0;
     let len = script_hex.len();
 
@@ -127,7 +126,7 @@ pub fn find_last_op_return(script_hex: &str) -> Option<usize> {
         }
     }
 
-    last_pos
+    None
 }
 
 // ---------------------------------------------------------------------------

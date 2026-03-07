@@ -44,6 +44,10 @@ class RunarContract:
                 if field.index < len(constructor_args):
                     self._state[field.name] = constructor_args[field.index]
 
+    def get_utxo(self):
+        """Returns the current UTXO tracked by this contract, if any."""
+        return self._current_utxo
+
     def connect(self, provider: Provider, signer: Signer) -> None:
         """Store provider and signer for later use."""
         self._provider = provider

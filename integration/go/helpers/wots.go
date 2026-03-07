@@ -3,6 +3,8 @@ package helpers
 import (
 	"crypto/sha256"
 	"encoding/hex"
+
+	crypto "github.com/bsv-blockchain/go-sdk/primitives/hash"
 )
 
 // WOTS+ constants (w=16, n=32)
@@ -119,4 +121,9 @@ func WOTSSign(msg []byte, sk [][]byte, pubSeed []byte) []byte {
 // WOTSPubKeyHex returns the public key as a hex string.
 func WOTSPubKeyHex(kp WOTSKeyPair) string {
 	return hex.EncodeToString(kp.PK)
+}
+
+// WOTSPubKeyHashHex returns the Hash160 of the WOTS+ public key as a hex string.
+func WOTSPubKeyHashHex(kp WOTSKeyPair) string {
+	return hex.EncodeToString(crypto.Hash160(kp.PK))
 }

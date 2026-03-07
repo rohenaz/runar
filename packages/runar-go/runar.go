@@ -34,35 +34,35 @@ type Bool = bool
 // Byte-string types — backed by string so == works for equality checks
 // ---------------------------------------------------------------------------
 
-// PubKey is a public key (compressed or uncompressed).
-type PubKey string
-
-// Sig is a DER-encoded signature.
-type Sig string
-
-// Addr is a 20-byte address (typically a hash160 of a public key).
-type Addr string
-
 // ByteString is an arbitrary byte sequence.
 type ByteString string
 
+// PubKey is a public key (compressed or uncompressed).
+type PubKey = ByteString
+
+// Sig is a DER-encoded signature.
+type Sig = ByteString
+
+// Addr is a 20-byte address (typically a hash160 of a public key).
+type Addr = ByteString
+
 // Sha256 is a 32-byte SHA-256 hash.
-type Sha256 string
+type Sha256 = ByteString
 
 // Ripemd160Hash is a 20-byte RIPEMD-160 hash.
-type Ripemd160Hash string
+type Ripemd160Hash = ByteString
 
 // SigHashPreimage is the sighash preimage for transaction validation.
-type SigHashPreimage string
+type SigHashPreimage = ByteString
 
 // RabinSig is a Rabin signature.
-type RabinSig string
+type RabinSig = ByteString
 
 // RabinPubKey is a Rabin public key.
-type RabinPubKey string
+type RabinPubKey = ByteString
 
 // Point is a 64-byte EC point (x[32] || y[32], big-endian, no prefix).
-type Point string
+type Point = ByteString
 
 // ---------------------------------------------------------------------------
 // Base contract structs

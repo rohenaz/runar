@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"encoding/hex"
 	"testing"
 
 	"runar-integration/helpers"
@@ -10,7 +11,9 @@ import (
 	runar "github.com/icellan/runar/packages/runar-go"
 )
 
-func deployWOTS(t *testing.T, kp helpers.WOTSKeyPair, funder *helpers.Wallet) *runar.RunarContract {
+// deployHybridWOTS deploys the hybrid ECDSA+WOTS+ contract with two hash commitments:
+// ecdsaPubKeyHash (from the ECDSA wallet) and wotsPubKeyHash (hash160 of the WOTS+ public key).
+func deployHybridWOTS(t *testing.T, ecdsaWallet *helpers.Wallet, kp helpers.WOTSKeyPair, funder *helpers.Wallet) *runar.RunarContract {
 	t.Helper()
 
 	artifact, err := helpers.CompileToSDKArtifact(
@@ -20,9 +23,13 @@ func deployWOTS(t *testing.T, kp helpers.WOTSKeyPair, funder *helpers.Wallet) *r
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	t.Logf("WOTS+ script: %d bytes", len(artifact.Script)/2)
+	t.Logf("Hybrid ECDSA+WOTS+ script: %d bytes", len(artifact.Script)/2)
 
-	contract := runar.NewRunarContract(artifact, []interface{}{helpers.WOTSPubKeyHex(kp)})
+	// Constructor args: (ecdsaPubKeyHash, wotsPubKeyHash)
+	contract := runar.NewRunarContract(artifact, []interface{}{
+		ecdsaWallet.PubKeyHashHex(),
+		helpers.WOTSPubKeyHashHex(kp),
+	})
 
 	helpers.RPCCall("importaddress", funder.Address, "", false)
 	_, err = helpers.FundWallet(funder, 1.0)
@@ -55,7 +62,7 @@ func TestWOTS_Compile(t *testing.T) {
 	if artifact.ContractName != "PostQuantumWallet" {
 		t.Fatalf("expected contract name PostQuantumWallet, got %s", artifact.ContractName)
 	}
-	t.Logf("WOTS+ compiled: %d bytes", len(artifact.Script)/2)
+	t.Logf("Hybrid ECDSA+WOTS+ compiled: %d bytes", len(artifact.Script)/2)
 }
 
 func TestWOTS_ScriptSize(t *testing.T) {
@@ -70,7 +77,7 @@ func TestWOTS_ScriptSize(t *testing.T) {
 	if scriptBytes < 5000 || scriptBytes > 50000 {
 		t.Fatalf("expected script size 5-50 KB, got %d bytes", scriptBytes)
 	}
-	t.Logf("WOTS+ script size: %d bytes", scriptBytes)
+	t.Logf("Hybrid ECDSA+WOTS+ script size: %d bytes", scriptBytes)
 }
 
 func TestWOTS_Deploy(t *testing.T) {
@@ -80,13 +87,14 @@ func TestWOTS_Deploy(t *testing.T) {
 	pubSeed[0] = 0x01
 	kp := helpers.WOTSKeygen(seed, pubSeed)
 
+	ecdsaWallet := helpers.NewWallet()
 	funder := helpers.NewWallet()
-	contract := deployWOTS(t, kp, funder)
+	contract := deployHybridWOTS(t, ecdsaWallet, kp, funder)
 	utxo := contract.GetCurrentUtxo()
 	if utxo == nil {
 		t.Fatalf("no UTXO after deploy")
 	}
-	t.Logf("deployed WOTS+ contract")
+	t.Logf("deployed hybrid ECDSA+WOTS+ contract")
 }
 
 func TestWOTS_DeployDifferentSeed(t *testing.T) {
@@ -114,8 +122,13 @@ func TestWOTS_DeployDifferentSeed(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 
+	ecdsaWallet := helpers.NewWallet()
+
 	// Deploy with kp1
-	contract1 := runar.NewRunarContract(artifact, []interface{}{helpers.WOTSPubKeyHex(kp1)})
+	contract1 := runar.NewRunarContract(artifact, []interface{}{
+		ecdsaWallet.PubKeyHashHex(),
+		helpers.WOTSPubKeyHashHex(kp1),
+	})
 	funder1 := helpers.NewWallet()
 	helpers.RPCCall("importaddress", funder1.Address, "", false)
 	_, err = helpers.FundWallet(funder1, 1.0)
@@ -130,7 +143,10 @@ func TestWOTS_DeployDifferentSeed(t *testing.T) {
 	}
 
 	// Deploy with kp2
-	contract2 := runar.NewRunarContract(artifact, []interface{}{helpers.WOTSPubKeyHex(kp2)})
+	contract2 := runar.NewRunarContract(artifact, []interface{}{
+		ecdsaWallet.PubKeyHashHex(),
+		helpers.WOTSPubKeyHashHex(kp2),
+	})
 	funder2 := helpers.NewWallet()
 	helpers.RPCCall("importaddress", funder2.Address, "", false)
 	_, err = helpers.FundWallet(funder2, 1.0)
@@ -161,18 +177,37 @@ func TestWOTS_ValidSpend(t *testing.T) {
 	pubSeed[0] = 0x01
 	kp := helpers.WOTSKeygen(seed, pubSeed)
 
+	// The ECDSA wallet signs the transaction; the WOTS key signs the ECDSA signature
+	ecdsaWallet := helpers.NewWallet()
 	funder := helpers.NewWallet()
-	contract := deployWOTS(t, kp, funder)
+	contract := deployHybridWOTS(t, ecdsaWallet, kp, funder)
 
-	// Sign a message
-	msg := []byte("spend this UTXO")
-	sig := helpers.WOTSSign(msg, kp.SK, kp.PubSeed)
-
-	// Unlocking script: <msg> <sig>
-	unlockHex := helpers.EncodePushBytes(msg) + helpers.EncodePushBytes(sig)
-
+	// Step 1: Build the spending transaction (unsigned)
 	utxo := helpers.SDKUtxoToHelper(contract.GetCurrentUtxo())
 	receiverScript := funder.P2PKHScript()
+	tx, err := helpers.BuildSpendTx(utxo, receiverScript, 9000)
+	if err != nil {
+		t.Fatalf("build spend tx: %v", err)
+	}
+
+	// Step 2: ECDSA-sign the transaction input
+	ecdsaSigHex, err := helpers.SignInput(tx, 0, ecdsaWallet.PrivKey)
+	if err != nil {
+		t.Fatalf("sign input: %v", err)
+	}
+	ecdsaSigBytes, _ := hex.DecodeString(ecdsaSigHex)
+
+	// Step 3: WOTS-sign the ECDSA signature bytes
+	wotsSig := helpers.WOTSSign(ecdsaSigBytes, kp.SK, kp.PubSeed)
+	wotsPK, _ := hex.DecodeString(helpers.WOTSPubKeyHex(kp))
+
+	// Step 4: Construct unlocking script: <wotsSig> <wotsPK> <ecdsaSig> <ecdsaPubKey>
+	unlockHex := helpers.EncodePushBytes(wotsSig) +
+		helpers.EncodePushBytes(wotsPK) +
+		helpers.EncodePushBytes(ecdsaSigBytes) +
+		helpers.EncodePushBytes(ecdsaWallet.PubKeyBytes)
+
+	// Apply unlocking script and broadcast
 	spendHex, err := helpers.SpendContract(utxo, unlockHex, receiverScript, 9000)
 	if err != nil {
 		t.Fatalf("spend contract: %v", err)
@@ -193,20 +228,37 @@ func TestWOTS_TamperedSig_Rejected(t *testing.T) {
 	pubSeed[0] = 0x01
 	kp := helpers.WOTSKeygen(seed, pubSeed)
 
+	ecdsaWallet := helpers.NewWallet()
 	funder := helpers.NewWallet()
-	contract := deployWOTS(t, kp, funder)
+	contract := deployHybridWOTS(t, ecdsaWallet, kp, funder)
 
-	msg := []byte("spend this UTXO")
-	sig := helpers.WOTSSign(msg, kp.SK, kp.PubSeed)
+	utxo := helpers.SDKUtxoToHelper(contract.GetCurrentUtxo())
+	receiverScript := funder.P2PKHScript()
+	tx, err := helpers.BuildSpendTx(utxo, receiverScript, 9000)
+	if err != nil {
+		t.Fatalf("build spend tx: %v", err)
+	}
 
-	// Tamper with signature
-	tampered := make([]byte, len(sig))
-	copy(tampered, sig)
+	ecdsaSigHex, err := helpers.SignInput(tx, 0, ecdsaWallet.PrivKey)
+	if err != nil {
+		t.Fatalf("sign input: %v", err)
+	}
+	ecdsaSigBytes, _ := hex.DecodeString(ecdsaSigHex)
+
+	wotsSig := helpers.WOTSSign(ecdsaSigBytes, kp.SK, kp.PubSeed)
+	wotsPK, _ := hex.DecodeString(helpers.WOTSPubKeyHex(kp))
+
+	// Tamper with WOTS signature
+	tampered := make([]byte, len(wotsSig))
+	copy(tampered, wotsSig)
 	tampered[100] ^= 0xff
 
-	unlockHex := helpers.EncodePushBytes(msg) + helpers.EncodePushBytes(tampered)
-	utxo := helpers.SDKUtxoToHelper(contract.GetCurrentUtxo())
-	spendHex, err := helpers.SpendContract(utxo, unlockHex, funder.P2PKHScript(), 9000)
+	unlockHex := helpers.EncodePushBytes(tampered) +
+		helpers.EncodePushBytes(wotsPK) +
+		helpers.EncodePushBytes(ecdsaSigBytes) +
+		helpers.EncodePushBytes(ecdsaWallet.PubKeyBytes)
+
+	spendHex, err := helpers.SpendContract(utxo, unlockHex, receiverScript, 9000)
 	if err != nil {
 		t.Fatalf("spend contract: %v", err)
 	}
@@ -214,7 +266,7 @@ func TestWOTS_TamperedSig_Rejected(t *testing.T) {
 	helpers.AssertTxRejected(t, spendHex)
 }
 
-func TestWOTS_WrongMessage_Rejected(t *testing.T) {
+func TestWOTS_WrongECDSASig_Rejected(t *testing.T) {
 	if testing.Short() {
 		t.Skip("WOTS+ is slow, skipping in short mode")
 	}
@@ -225,16 +277,36 @@ func TestWOTS_WrongMessage_Rejected(t *testing.T) {
 	pubSeed[0] = 0x01
 	kp := helpers.WOTSKeygen(seed, pubSeed)
 
+	ecdsaWallet := helpers.NewWallet()
 	funder := helpers.NewWallet()
-	contract := deployWOTS(t, kp, funder)
+	contract := deployHybridWOTS(t, ecdsaWallet, kp, funder)
 
-	originalMsg := []byte("original message")
-	sig := helpers.WOTSSign(originalMsg, kp.SK, kp.PubSeed)
-
-	wrongMsg := []byte("different message")
-	unlockHex := helpers.EncodePushBytes(wrongMsg) + helpers.EncodePushBytes(sig)
 	utxo := helpers.SDKUtxoToHelper(contract.GetCurrentUtxo())
-	spendHex, err := helpers.SpendContract(utxo, unlockHex, funder.P2PKHScript(), 9000)
+	receiverScript := funder.P2PKHScript()
+	tx, err := helpers.BuildSpendTx(utxo, receiverScript, 9000)
+	if err != nil {
+		t.Fatalf("build spend tx: %v", err)
+	}
+
+	ecdsaSigHex, err := helpers.SignInput(tx, 0, ecdsaWallet.PrivKey)
+	if err != nil {
+		t.Fatalf("sign input: %v", err)
+	}
+	ecdsaSigBytes, _ := hex.DecodeString(ecdsaSigHex)
+
+	// WOTS signs different bytes than the actual ECDSA signature
+	wrongMsg := make([]byte, len(ecdsaSigBytes))
+	copy(wrongMsg, ecdsaSigBytes)
+	wrongMsg[0] ^= 0xff
+	wotsSig := helpers.WOTSSign(wrongMsg, kp.SK, kp.PubSeed)
+	wotsPK, _ := hex.DecodeString(helpers.WOTSPubKeyHex(kp))
+
+	unlockHex := helpers.EncodePushBytes(wotsSig) +
+		helpers.EncodePushBytes(wotsPK) +
+		helpers.EncodePushBytes(ecdsaSigBytes) +
+		helpers.EncodePushBytes(ecdsaWallet.PubKeyBytes)
+
+	spendHex, err := helpers.SpendContract(utxo, unlockHex, receiverScript, 9000)
 	if err != nil {
 		t.Fatalf("spend contract: %v", err)
 	}

@@ -1,11 +1,15 @@
 """Runar built-in functions.
 
-Mock crypto functions always return True for business logic testing.
+Real crypto verification for WOTS+ and SLH-DSA (when packages available).
+Mock crypto for ECDSA (checkSig always True — matches Go/Rust/TS behavior).
 Real hash functions use Python's hashlib (stdlib, no dependencies).
 """
 
 import hashlib
 import math
+
+from runar.wots import wots_verify as _wots_verify_real
+from runar.slhdsa_impl import slh_verify as _slh_verify
 
 
 # -- Assertion ---------------------------------------------------------------
@@ -16,7 +20,7 @@ def assert_(condition: bool) -> None:
         raise AssertionError("runar: assertion failed")
 
 
-# -- Mock Crypto (always True for business logic testing) --------------------
+# -- Mock Crypto (ECDSA always True for business logic testing) --------------
 
 def check_sig(sig: bytes, pk: bytes) -> bool:
     return True
@@ -30,26 +34,32 @@ def check_preimage(preimage: bytes) -> bool:
 def verify_rabin_sig(msg: bytes, sig: bytes, padding: bytes, pk: bytes) -> bool:
     return True
 
+
+# -- Real WOTS+ Verification ------------------------------------------------
+
 def verify_wots(msg: bytes, sig: bytes, pubkey: bytes) -> bool:
-    return True
+    return _wots_verify_real(msg, sig, pubkey)
+
+
+# -- Real SLH-DSA Verification (falls back to mock if slhdsa not installed) -
 
 def verify_slh_dsa_sha2_128s(msg: bytes, sig: bytes, pubkey: bytes) -> bool:
-    return True
+    return _slh_verify(msg, sig, pubkey, 'sha2_128s')
 
 def verify_slh_dsa_sha2_128f(msg: bytes, sig: bytes, pubkey: bytes) -> bool:
-    return True
+    return _slh_verify(msg, sig, pubkey, 'sha2_128f')
 
 def verify_slh_dsa_sha2_192s(msg: bytes, sig: bytes, pubkey: bytes) -> bool:
-    return True
+    return _slh_verify(msg, sig, pubkey, 'sha2_192s')
 
 def verify_slh_dsa_sha2_192f(msg: bytes, sig: bytes, pubkey: bytes) -> bool:
-    return True
+    return _slh_verify(msg, sig, pubkey, 'sha2_192f')
 
 def verify_slh_dsa_sha2_256s(msg: bytes, sig: bytes, pubkey: bytes) -> bool:
-    return True
+    return _slh_verify(msg, sig, pubkey, 'sha2_256s')
 
 def verify_slh_dsa_sha2_256f(msg: bytes, sig: bytes, pubkey: bytes) -> bool:
-    return True
+    return _slh_verify(msg, sig, pubkey, 'sha2_256f')
 
 
 # -- Real Hash Functions -----------------------------------------------------
