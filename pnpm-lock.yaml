@@ -28,6 +28,28 @@ importers:
         specifier: ^2.1.0
         version: 2.1.9(@types/node@22.19.13)
 
+  integration/ts:
+    dependencies:
+      '@bsv/sdk':
+        specifier: ^2.0.5
+        version: 2.0.5
+      runar-compiler:
+        specifier: workspace:*
+        version: link:../../packages/runar-compiler
+      runar-ir-schema:
+        specifier: workspace:*
+        version: link:../../packages/runar-ir-schema
+      runar-lang:
+        specifier: workspace:*
+        version: link:../../packages/runar-lang
+      runar-sdk:
+        specifier: workspace:*
+        version: link:../../packages/runar-sdk
+    devDependencies:
+      vitest:
+        specifier: ^2.1.0
+        version: 2.1.9(@types/node@22.19.13)
+
   packages/runar-cli:
     dependencies:
       commander:

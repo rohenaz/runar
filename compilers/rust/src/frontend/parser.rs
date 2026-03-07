@@ -17,7 +17,7 @@ use swc_ecma_ast::{
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsSyntax};
 
 use super::ast::{
-    self, BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName,
+    BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName,
     PropertyNode, SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
 };
 

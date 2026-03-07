@@ -198,16 +198,15 @@ function paramToABI(param: ParamNode): ABIParam {
  */
 function extractStateFields(properties: PropertyNode[]): StateField[] {
   const stateFields: StateField[] = [];
-  let index = 0;
 
-  for (const prop of properties) {
+  for (let i = 0; i < properties.length; i++) {
+    const prop = properties[i]!;
     if (!prop.readonly) {
       stateFields.push({
         name: prop.name,
         type: typeToString(prop.type),
-        index,
+        index: i, // property position = constructor arg index
       });
-      index++;
     }
   }
 

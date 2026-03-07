@@ -104,20 +104,48 @@ def estimate_deploy_fee(
     return (_TX_OVERHEAD + inputs_size + contract_output_size + change_output_size) * rate
 
 
+_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _base58_decode(encoded: str) -> bytes:
+    """Decode a Base58-encoded string to bytes."""
+    num = 0
+    for char in encoded:
+        num = num * 58 + _BASE58_ALPHABET.index(char)
+    # Convert to bytes
+    result = []
+    while num > 0:
+        num, rem = divmod(num, 256)
+        result.append(rem)
+    result.reverse()
+    # Leading '1' chars map to zero bytes
+    pad = 0
+    for char in encoded:
+        if char == '1':
+            pad += 1
+        else:
+            break
+    return bytes(pad) + bytes(result)
+
+
+def _address_to_pubkey_hash(address: str) -> str:
+    """Extract the 20-byte pubkey hash from a Base58Check P2PKH address."""
+    decoded = _base58_decode(address)
+    # Format: version_byte(1) + pubkey_hash(20) + checksum(4)
+    if len(decoded) != 25:
+        raise ValueError(f"invalid address length: {len(decoded)}")
+    return decoded[1:21].hex()
+
+
 def build_p2pkh_script(address: str) -> str:
     """Build a standard P2PKH locking script.
 
-    If address is a 40-char hex string, it's treated as a raw pubkey hash.
-    Otherwise this is a simplified handler that assumes raw hex.
+    Accepts either a 40-char hex pubkey hash or a Base58Check P2PKH address.
     """
-    pub_key_hash = address
-    if len(address) != 40 or not _is_hex(address):
-        # For full Base58Check decoding, the user should provide the raw hash.
-        # In production, integrate a Base58Check decoder here.
-        raise ValueError(
-            f"build_p2pkh_script: expected 40-char hex pubkey hash, got {address!r}. "
-            "Base58Check decoding is not yet implemented in the Python SDK."
-        )
+    if len(address) == 40 and _is_hex(address):
+        pub_key_hash = address
+    else:
+        pub_key_hash = _address_to_pubkey_hash(address)
     return '76a914' + pub_key_hash + '88ac'
 
 

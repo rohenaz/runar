@@ -1,6 +1,8 @@
 # Integration Tests
 
-End-to-end integration tests that deploy and spend Runar contracts on a real Bitcoin node. Two node backends are supported:
+End-to-end integration tests that deploy and spend Runar contracts on a real Bitcoin node. Tests are organized by language — each suite uses its own compiler and SDK for deployment/calling.
+
+Two node backends are supported:
 
 - **SV Node** — Bitcoin SV node with built-in wallet (default)
 - **Teranode** — BSV's microservices-based node implementation
@@ -15,7 +17,8 @@ pnpm integration:svnode:run
 
 # Or step by step:
 pnpm integration:svnode:start
-pnpm integration:svnode
+pnpm integration:go          # Go tests
+pnpm integration:ts          # TypeScript tests
 pnpm integration:svnode:stop
 pnpm integration:svnode:clean    # remove all data
 ```
@@ -33,6 +36,73 @@ pnpm integration:teranode:stop
 pnpm integration:teranode:clean   # remove all data + volumes
 ```
 
+## Test Suites
+
+### Go (`integration/go/`)
+
+Full-featured tests using the Go compiler and SDK. Includes raw transaction construction for contracts that require ECDSA signatures in the unlocking script.
+
+```bash
+cd integration/go && go test -tags integration -v -timeout 600s
+```
+
+### TypeScript (`integration/ts/`)
+
+Tests using the TypeScript compiler and SDK. All contracts use the SDK's `Deploy` + `Call` path.
+
+```bash
+cd integration/ts && npx vitest run
+```
+
+### Rust (`integration/rust/`)
+
+Tests using the Rust compiler and SDK. All contracts use the SDK's Deploy + Call path.
+
+```bash
+cd integration/rust && cargo test --release -- --ignored
+```
+
+### Python (`integration/python/`)
+
+Tests using the Python compiler and SDK. Requires `bsv-sdk` pip package for real ECDSA signing.
+
+```bash
+cd integration/python
+python3.13 -m venv .venv                # Python 3.13 (3.14 has coincurve build issues)
+.venv/bin/pip install -r requirements.txt
+PYTHONPATH=../../compilers/python:../../packages/runar-py .venv/bin/pytest -v
+```
+
+### Run All Suites
+
+```bash
+# Run all suites (node must be running)
+pnpm integration:all
+
+# Start node, run all, stop node
+pnpm integration:all:run
+```
+
+## Contracts Tested
+
+| Contract | Type | Go | TS | Rust | Python | Key Feature |
+|----------|------|----|----|------|--------|-------------|
+| P2PKH | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | ECDSA checkSig |
+| Escrow | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Multi-method, multi-signer |
+| Counter | Stateful | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | OP_PUSH_TX, state transitions |
+| MathDemo | Stateful | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | Built-in math functions |
+| FungibleToken | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | PubKey + balance state |
+| SimpleNFT | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Token transfer + burn |
+| Auction | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Bidding + locktime |
+| CovenantVault | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Covenant rules (SigHashPreimage) |
+| OraclePriceFeed | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Rabin signatures |
+| FunctionPatterns | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Private methods, composition |
+| PostQuantumWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | WOTS+ (19KB script) |
+| SPHINCSWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | SLH-DSA (188KB script) |
+| SchnorrZKP | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC operations, ZKP (877KB) |
+| ConvergenceProof | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC point arithmetic |
+| EC Isolation | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | ecOnCurve, ecMulGen, ecAdd, ecNegate |
+
 ## Node Setup Details
 
 ### SV Node
@@ -43,7 +113,7 @@ Uses the `bitcoinsv/bitcoin-sv:latest` Docker image. A single container runs the
 - `maxscriptsizepolicy=0` / `maxscriptnumlengthpolicy=0` — unlimited script sizes
 - Built-in wallet for `sendtoaddress` funding
 
-RPC: `http://localhost:18332` (user: `bitcoin`, pass: `bitcoin`)
+RPC: `http://localhost:18332` (user: `regtest`, pass: `regtest`)
 
 ### Teranode
 
@@ -65,40 +135,14 @@ Key differences from SV Node:
 
 Because Teranode's Genesis activation is hardcoded at height 10000 for regtest, the `teranode.sh start` script pre-mines 10101 blocks (10000 for Genesis + 101 for coinbase maturity). This takes ~5 minutes on first start. Subsequent `start` commands (without `clean`) skip mining if blocks already exist.
 
-## Test Structure
-
-Tests are in `*_test.go` files with the `integration` build tag:
-
-| Test File | Contract | What's Tested |
-|-----------|----------|---------------|
-| `p2pkh_test.go` | P2PKH | Valid unlock, wrong key, wrong signature |
-| `escrow_test.go` | Escrow | Release/refund by seller/buyer/arbiter, wrong signer, invalid method |
-| `counter_test.go` | Counter (stateful) | Increment, chain increments, decrement, wrong state, underflow |
-| `oracle_price_test.go` | OraclePriceFeed | Valid settle with Rabin signature, below threshold, wrong receiver |
-| `schnorr_zkp_test.go` | SchnorrZKP (875KB) | Valid proof with EC math, invalid scalar |
-| `slhdsa_test.go` | SPHINCSWallet (188KB) | Valid SLH-DSA spend, tampered signature |
-| `wots_test.go` | PostQuantumWallet (19KB) | Valid WOTS+ spend, tampered sig, wrong message |
-
-## Helpers
-
-The `helpers/` package provides node-agnostic utilities:
-
-- **`rpc.go`** — RPC client, mining, `SendRawTransaction`, node type detection (`NODE_TYPE` env var)
-- **`wallet.go`** — Wallet generation, `FundWallet` (auto-selects SV Node wallet or coinbase funding), UTXO lookup
-- **`coinbase.go`** — Teranode coinbase wallet management, raw block parsing for UTXO extraction
-- **`tx.go`** — Transaction building, signing (ECDSA + BIP-143 sighash), OP_PUSH_TX
-- **`assert.go`** — `AssertTxAccepted`, `AssertTxRejected`, `AssertTxInBlock`
-- **`compile.go`** — Contract compilation via the TypeScript compiler
-- **`rabin.go`** — Rabin signature generation for oracle tests
-
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NODE_TYPE` | `svnode` | Node backend: `svnode` or `teranode` |
 | `RPC_URL` | auto | Override RPC endpoint URL |
-| `RPC_USER` | `bitcoin` | RPC username |
-| `RPC_PASS` | `bitcoin` | RPC password |
+| `RPC_USER` | `regtest` | RPC username |
+| `RPC_PASS` | `regtest` | RPC password |
 
 ## Troubleshooting
 

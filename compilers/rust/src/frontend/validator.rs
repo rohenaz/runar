@@ -20,7 +20,7 @@ pub struct ValidationResult {
 /// Validate a parsed Rúnar AST against the language subset constraints.
 pub fn validate(contract: &ContractNode) -> ValidationResult {
     let mut errors = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
 
     validate_properties(contract, &mut errors);
     validate_constructor(contract, &mut errors);

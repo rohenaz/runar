@@ -142,6 +142,10 @@ pub enum SdkValue {
     Bool(bool),
     /// Hex-encoded byte data.
     Bytes(String),
+    /// Placeholder for auto-computed Sig or PubKey params.
+    /// Pass this as an arg to `call()` for params of type `Sig` or `PubKey` —
+    /// the SDK will compute the real value from the signer.
+    Auto,
 }
 
 impl SdkValue {

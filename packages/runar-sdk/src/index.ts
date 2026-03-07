@@ -14,7 +14,8 @@ export type {
 
 // Providers
 export type { Provider } from './providers/index.js';
-export { WhatsOnChainProvider, MockProvider } from './providers/index.js';
+export { WhatsOnChainProvider, MockProvider, RPCProvider } from './providers/index.js';
+export type { RPCProviderOptions } from './providers/index.js';
 
 // Signers
 export type { Signer } from './signers/index.js';

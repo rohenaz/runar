@@ -1,11 +1,11 @@
-"""State serialization — encode/decode state values as Bitcoin Script push data."""
+"""State serialization — encode/decode state values as raw bytes matching NUM2BIN format."""
 
 from __future__ import annotations
 from runar.sdk.types import RunarArtifact, StateField
 
 
 def serialize_state(fields: list[StateField], values: dict) -> str:
-    """Encode state values into hex-encoded Bitcoin Script data section."""
+    """Encode state values into hex-encoded raw byte section (no push opcodes)."""
     sorted_fields = sorted(fields, key=lambda f: f.index)
     hex_str = ''
     for field in sorted_fields:
@@ -15,7 +15,7 @@ def serialize_state(fields: list[StateField], values: dict) -> str:
 
 
 def deserialize_state(fields: list[StateField], script_hex: str) -> dict:
-    """Decode state values from a hex-encoded Bitcoin Script data section."""
+    """Decode state values from a hex-encoded raw byte section."""
     sorted_fields = sorted(fields, key=lambda f: f.index)
     result = {}
     offset = 0
@@ -82,42 +82,39 @@ def find_last_op_return(script_hex: str) -> int:
 # Encoding helpers
 # ---------------------------------------------------------------------------
 
-def encode_script_int(n: int) -> str:
-    """Encode an integer as Bitcoin Script push data (for state serialization)."""
-    if n == 0:
-        return '00'  # OP_0
-
+def _encode_num2bin(n: int, width: int) -> str:
+    """Encode an integer as fixed-width LE sign-magnitude bytes (NUM2BIN format)."""
+    result_bytes = bytearray(width)
     negative = n < 0
     abs_val = abs(n)
 
-    result_bytes = []
-    while abs_val > 0:
-        result_bytes.append(abs_val & 0xFF)
+    for i in range(width):
+        if abs_val == 0:
+            break
+        result_bytes[i] = abs_val & 0xFF
         abs_val >>= 8
 
-    if result_bytes[-1] & 0x80:
-        result_bytes.append(0x80 if negative else 0x00)
-    elif negative:
-        result_bytes[-1] |= 0x80
+    if negative:
+        result_bytes[width - 1] |= 0x80
 
-    data_hex = bytes(result_bytes).hex()
-    return encode_push_data(data_hex)
+    return result_bytes.hex()
 
 
-def decode_script_int(hex_str: str) -> int:
-    """Decode a minimally-encoded Bitcoin Script integer from hex."""
-    if not hex_str or hex_str == '00':
+def _decode_num2bin(hex_str: str) -> int:
+    """Decode a fixed-width LE sign-magnitude number from hex."""
+    if not hex_str:
         return 0
 
-    b = bytes.fromhex(hex_str)
+    b = bytearray.fromhex(hex_str)
     negative = (b[-1] & 0x80) != 0
-    data = bytearray(b)
-    data[-1] &= 0x7F
+    b[-1] &= 0x7F
 
     result = 0
-    for i in range(len(data) - 1, -1, -1):
-        result = (result << 8) | data[i]
+    for i in range(len(b) - 1, -1, -1):
+        result = (result << 8) | b[i]
 
+    if result == 0:
+        return 0
     return -result if negative else result
 
 
@@ -168,29 +165,49 @@ def decode_push_data(hex_str: str, offset: int) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Internal
+# Internal encode/decode for state values
 # ---------------------------------------------------------------------------
+
+# Type width map (bytes) for known fixed-width types
+_TYPE_WIDTHS = {
+    'PubKey': 33,
+    'Addr': 20,
+    'Ripemd160': 20,
+    'Sha256': 32,
+    'Point': 64,
+}
+
 
 def _encode_state_value(value, field_type: str) -> str:
     if field_type in ('int', 'bigint'):
         n = int(value) if value is not None else 0
-        return encode_script_int(n)
+        return _encode_num2bin(n, 8)
     elif field_type == 'bool':
-        return '51' if value else '00'
+        return '01' if value else '00'
     else:
-        hex_str = value if isinstance(value, str) else ''
-        return encode_push_data(hex_str)
+        # Raw hex, no push opcode
+        return value if isinstance(value, str) else ''
 
 
 def _decode_state_value(hex_str: str, offset: int, field_type: str) -> tuple:
     if field_type == 'bool':
+        # 1 raw byte
         if offset + 2 > len(hex_str):
             return False, 2
-        opcode = hex_str[offset:offset + 2]
-        return opcode == '51', 2
+        byte = hex_str[offset:offset + 2]
+        return byte != '00', 2
     elif field_type in ('int', 'bigint'):
-        data, bytes_read = decode_push_data(hex_str, offset)
-        return decode_script_int(data), bytes_read
+        # 8 raw bytes LE sign-magnitude
+        hex_width = 16  # 8 bytes * 2
+        if offset + hex_width > len(hex_str):
+            return 0, hex_width
+        data = hex_str[offset:offset + hex_width]
+        return _decode_num2bin(data), hex_width
+    elif field_type in _TYPE_WIDTHS:
+        w = _TYPE_WIDTHS[field_type] * 2  # hex chars
+        data = hex_str[offset:offset + w] if offset + w <= len(hex_str) else ''
+        return data, w
     else:
+        # Unknown type: fall back to push-data decoding
         data, bytes_read = decode_push_data(hex_str, offset)
         return data, bytes_read

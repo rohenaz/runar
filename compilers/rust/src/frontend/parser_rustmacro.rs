@@ -4,7 +4,7 @@
 //! and recursive descent parser. Produces the same AST as the TypeScript parser.
 
 use super::ast::{
-    self, BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName,
+    BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName,
     PropertyNode, SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
 };
 use super::parser::ParseResult;

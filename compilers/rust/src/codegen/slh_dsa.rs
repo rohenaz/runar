@@ -115,6 +115,7 @@ const SLH_TREE: u8 = 2;
 const SLH_FORS_TREE: u8 = 3;
 const SLH_FORS_ROOTS: u8 = 4;
 
+#[cfg(test)]
 #[derive(Default)]
 struct SLHADRSOpts {
     layer: usize,
@@ -125,6 +126,7 @@ struct SLHADRSOpts {
     hash: i32,
 }
 
+#[cfg(test)]
 fn slh_adrs(opts: &SLHADRSOpts) -> Vec<u8> {
     let mut c = vec![0u8; 22];
     c[0] = (opts.layer & 0xff) as u8;
@@ -152,6 +154,7 @@ fn slh_adrs(opts: &SLHADRSOpts) -> Vec<u8> {
 }
 
 /// Returns the 18-byte prefix (bytes 0..17): everything before hashAddress.
+#[cfg(test)]
 fn slh_adrs18(opts: &SLHADRSOpts) -> Vec<u8> {
     let full = slh_adrs(&SLHADRSOpts {
         layer: opts.layer,

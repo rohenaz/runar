@@ -9,6 +9,7 @@ import type { Transaction, UTXO, DeployOptions, CallOptions } from './types.js';
 import { buildDeployTransaction, selectUtxos } from './deployment.js';
 import { buildCallTransaction } from './calling.js';
 import { serializeState, extractStateFromScript, findLastOpReturn } from './state.js';
+import { computeOpPushTx } from './oppushtx.js';
 import { Utils } from '@bsv/sdk';
 
 /**
@@ -267,9 +268,19 @@ export class RunarContract {
         `RunarContract.call: method '${methodName}' not found in ${this.artifact.contractName}`,
       );
     }
-    if (method.params.length !== args.length) {
+    // For stateful contracts, the compiler injects SigHashPreimage into every
+    // public method's ABI, but the SDK auto-computes it. Filter it out so
+    // users only pass their own args. For stateless contracts, SigHashPreimage
+    // is an explicit param that the user passes as null for auto-compute.
+    const isStateful =
+      this.artifact.stateFields !== undefined &&
+      this.artifact.stateFields.length > 0;
+    const userParams = isStateful
+      ? method.params.filter((p) => p.type !== 'SigHashPreimage')
+      : method.params;
+    if (userParams.length !== args.length) {
       throw new Error(
-        `RunarContract.call: method '${methodName}' expects ${method.params.length} args, got ${args.length}`,
+        `RunarContract.call: method '${methodName}' expects ${userParams.length} args, got ${args.length}`,
       );
     }
 
@@ -281,12 +292,46 @@ export class RunarContract {
 
     const address = await signer.getAddress();
     const changeAddress = options?.changeAddress ?? address;
-    const unlockingScript = this.buildUnlockingScript(methodName, args);
 
-    // Determine if this is a stateful call
-    const isStateful =
-      this.artifact.stateFields !== undefined &&
-      this.artifact.stateFields.length > 0;
+    // Detect params that need auto-compute (user passed null):
+    // - Sig: ECDSA signature (two-pass: placeholder first, then real sig)
+    // - PubKey: resolved from signer.getPublicKey()
+    // - SigHashPreimage: BIP-143 preimage (computed from the spending transaction)
+    //
+    // userParams excludes SigHashPreimage (auto-computed for stateful contracts).
+    // For stateless contracts with explicit SigHashPreimage, the user passes null.
+    const sigIndices: number[] = [];
+    let preimageIndex = -1;
+    const resolvedArgs = [...args];
+    for (let i = 0; i < userParams.length; i++) {
+      if (userParams[i]!.type === 'Sig' && args[i] === null) {
+        sigIndices.push(i);
+        // 72-byte placeholder (will be replaced after signing)
+        resolvedArgs[i] = '00'.repeat(72);
+      }
+      if (userParams[i]!.type === 'PubKey' && args[i] === null) {
+        resolvedArgs[i] = await signer.getPublicKey();
+      }
+      if (userParams[i]!.type === 'SigHashPreimage' && args[i] === null) {
+        preimageIndex = i;
+        // Placeholder preimage (will be replaced after tx construction)
+        resolvedArgs[i] = '00'.repeat(181);
+      }
+    }
+
+    // For stateful contracts, preimage is always needed (auto-computed by the
+    // stateful path below), even though it's not in userParams.
+    const needsOpPushTx = preimageIndex >= 0 || isStateful;
+
+    // Build the initial unlocking script (with placeholders)
+    let unlockingScript: string;
+    if (needsOpPushTx) {
+      // Prepend placeholder _opPushTxSig before user args
+      unlockingScript = encodePushData('00'.repeat(72)) +
+        this.buildUnlockingScript(methodName, resolvedArgs);
+    } else {
+      unlockingScript = this.buildUnlockingScript(methodName, resolvedArgs);
+    }
 
     let newLockingScript: string | undefined;
     let newSatoshis: number | undefined;
@@ -300,13 +345,26 @@ export class RunarContract {
       newLockingScript = this.getLockingScript();
     }
 
-    const changeScript = buildP2PKHScriptFromAddress(changeAddress);
+    // For stateful single-output continuation, the TX must have exactly one
+    // output (the continuation UTXO). The compiler's computeStateOutputHash
+    // hashes only that output and compares with BIP-143 hashOutputs.
+    let changeScript = '';
+    let additionalUtxos: UTXO[] = [];
+    let feeRate = 1;
 
-    // Fetch fee rate and additional funding UTXOs if needed
-    const feeRate = await provider.getFeeRate();
-    const additionalUtxos = await provider.getUtxos(address);
+    if (!isStateful) {
+      changeScript = buildP2PKHScriptFromAddress(changeAddress);
+      feeRate = await provider.getFeeRate();
+      const allFundingUtxos = await provider.getUtxos(address);
+      // Exclude the contract UTXO from funding inputs (it's already input 0).
+      // This matters when the contract script is identical to a standard P2PKH
+      // (e.g., the P2PKH contract), so getUtxos returns it alongside change.
+      additionalUtxos = allFundingUtxos.filter(
+        (u) => !(u.txid === this.currentUtxo!.txid && u.outputIndex === this.currentUtxo!.outputIndex),
+      );
+    }
 
-    const { txHex, inputCount } = buildCallTransaction(
+    let { txHex, inputCount } = buildCallTransaction(
       this.currentUtxo,
       unlockingScript,
       newLockingScript,
@@ -327,6 +385,109 @@ export class RunarContract {
         const unlockScript = encodePushData(sig) + encodePushData(pubKey);
         signedTx = insertUnlockingScript(signedTx, i, unlockScript);
       }
+    }
+
+    // For stateful contracts, build the OP_PUSH_TX unlocking script:
+    //   <opPushTxSig> <user_args> <txPreimage> <methodSelector>
+    if (isStateful) {
+      const { sigHex: opSig, preimageHex: preimage } = computeOpPushTx(
+        signedTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+      );
+
+      // Re-sign any Sig params against the current tx
+      for (const idx of sigIndices) {
+        resolvedArgs[idx] = await signer.sign(
+          signedTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+        );
+      }
+
+      // Build: <opPushTxSig> <user_args> <txPreimage> <methodSelector>
+      let userArgsHex = '';
+      for (const arg of resolvedArgs) {
+        userArgsHex += encodeArg(arg);
+      }
+      let methodSelectorHex = '';
+      const publicMethods = this.artifact.abi.methods.filter((m) => m.isPublic);
+      if (publicMethods.length > 1) {
+        const idx = publicMethods.findIndex((m) => m.name === methodName);
+        if (idx >= 0) methodSelectorHex = encodeScriptNumber(BigInt(idx));
+      }
+
+      const statefulUnlock = encodePushData(opSig) +
+        userArgsHex +
+        encodePushData(preimage) +
+        methodSelectorHex;
+
+      // Rebuild TX with the real unlocking script
+      ({ txHex, inputCount } = buildCallTransaction(
+        this.currentUtxo,
+        statefulUnlock,
+        newLockingScript,
+        newSatoshis,
+        changeAddress,
+        changeScript,
+        undefined,
+        feeRate,
+      ));
+      signedTx = txHex;
+
+      // Recompute OP_PUSH_TX from the final TX (preimage changes with unlock size)
+      const { sigHex: finalSig, preimageHex: finalPreimage } = computeOpPushTx(
+        signedTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+      );
+
+      // Re-sign Sig params against the final tx if needed
+      for (const idx of sigIndices) {
+        resolvedArgs[idx] = await signer.sign(
+          signedTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+        );
+      }
+
+      userArgsHex = '';
+      for (const arg of resolvedArgs) {
+        userArgsHex += encodeArg(arg);
+      }
+
+      const finalUnlock = encodePushData(finalSig) +
+        userArgsHex +
+        encodePushData(finalPreimage) +
+        methodSelectorHex;
+      signedTx = insertUnlockingScript(signedTx, 0, finalUnlock);
+    } else if (needsOpPushTx || sigIndices.length > 0) {
+      // Stateless with SigHashPreimage or Sig params: auto-compute
+      let opPushTxSigHex: string | undefined;
+      if (needsOpPushTx) {
+        const { sigHex, preimageHex } = computeOpPushTx(
+          signedTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+        );
+        opPushTxSigHex = sigHex;
+        resolvedArgs[preimageIndex] = preimageHex;
+      }
+
+      for (const idx of sigIndices) {
+        resolvedArgs[idx] = await signer.sign(
+          signedTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+        );
+      }
+
+      let realUnlockingScript = this.buildUnlockingScript(methodName, resolvedArgs);
+      if (needsOpPushTx && opPushTxSigHex) {
+        realUnlockingScript = encodePushData(opPushTxSigHex) + realUnlockingScript;
+
+        const tmpTx = insertUnlockingScript(signedTx, 0, realUnlockingScript);
+        const { sigHex: finalSig, preimageHex: finalPreimage } = computeOpPushTx(
+          tmpTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+        );
+        resolvedArgs[preimageIndex] = finalPreimage;
+        for (const idx of sigIndices) {
+          resolvedArgs[idx] = await signer.sign(
+            tmpTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+          );
+        }
+        realUnlockingScript = encodePushData(finalSig) +
+          this.buildUnlockingScript(methodName, resolvedArgs);
+      }
+      signedTx = insertUnlockingScript(signedTx, 0, realUnlockingScript);
     }
 
     // Broadcast
@@ -417,8 +578,10 @@ export class RunarContract {
         // Replace the 1-byte OP_0 placeholder (2 hex chars) with the encoded arg
         script = script.slice(0, hexOffset) + encoded + script.slice(hexOffset + 2);
       }
-    } else {
-      // Backward compatibility: old artifacts without constructorSlots
+    } else if (!this.artifact.stateFields || this.artifact.stateFields.length === 0) {
+      // Backward compatibility: old stateless artifacts without constructorSlots.
+      // For stateful contracts, constructor args initialize the state section
+      // (after OP_RETURN), not the code portion.
       for (const arg of this.constructorArgs) {
         script += encodeArg(arg);
       }

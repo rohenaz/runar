@@ -136,17 +136,16 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 		}
 	}
 
-	// Build state fields for stateful contracts
+	// Build state fields for stateful contracts.
+	// Index = property position (matching constructor arg order), not sequential mutable index.
 	var stateFields []StateField
-	index := 0
-	for _, prop := range program.Properties {
+	for i, prop := range program.Properties {
 		if !prop.Readonly {
 			stateFields = append(stateFields, StateField{
 				Name:  prop.Name,
 				Type:  prop.Type,
-				Index: index,
+				Index: i,
 			})
-			index++
 		}
 	}
 

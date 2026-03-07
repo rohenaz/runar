@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use super::types::*;
 use super::state::{serialize_state, extract_state_from_script, encode_push_data, find_last_op_return};
+use super::oppushtx::compute_op_push_tx;
 use super::deployment::{
     build_deploy_transaction, select_utxos,
     build_p2pkh_script_from_address, encode_varint,
@@ -255,11 +256,27 @@ impl RunarContract {
                 method_name, self.artifact.contract_name
             )
         })?;
-        if method.params.len() != args.len() {
+
+        // Determine if this is a stateful contract
+        let is_stateful = self
+            .artifact
+            .state_fields
+            .as_ref()
+            .map_or(false, |f| !f.is_empty());
+
+        // For stateful contracts, the compiler injects a SigHashPreimage param
+        // into the ABI that users don't pass — filter it from validation.
+        let user_params: Vec<&AbiParam> = if is_stateful {
+            method.params.iter().filter(|p| p.param_type != "SigHashPreimage").collect()
+        } else {
+            method.params.iter().collect()
+        };
+
+        if user_params.len() != args.len() {
             return Err(format!(
                 "RunarContract.call: method '{}' expects {} args, got {}",
                 method_name,
-                method.params.len(),
+                user_params.len(),
                 args.len()
             ));
         }
@@ -274,14 +291,42 @@ impl RunarContract {
         let change_address = options
             .and_then(|o| o.change_address.as_deref())
             .unwrap_or(&address);
-        let unlocking_script = self.build_unlocking_script(method_name, args)?;
 
-        // Determine if this is a stateful call
-        let is_stateful = self
-            .artifact
-            .state_fields
-            .as_ref()
-            .map_or(false, |f| !f.is_empty());
+        // Detect Sig/PubKey/SigHashPreimage params that need auto-compute (user passed Auto)
+        let mut resolved_args: Vec<SdkValue> = args.to_vec();
+        let mut sig_indices: Vec<usize> = Vec::new();
+        let mut preimage_index: Option<usize> = None;
+        for (i, param) in user_params.iter().enumerate() {
+            if matches!(args[i], SdkValue::Auto) {
+                if param.param_type == "Sig" {
+                    sig_indices.push(i);
+                    // 72-byte placeholder
+                    resolved_args[i] = SdkValue::Bytes("00".repeat(72));
+                } else if param.param_type == "PubKey" {
+                    resolved_args[i] = SdkValue::Bytes(signer.get_public_key()?);
+                } else if param.param_type == "SigHashPreimage" {
+                    preimage_index = Some(i);
+                    // Placeholder preimage (will be replaced after tx construction)
+                    resolved_args[i] = SdkValue::Bytes("00".repeat(181));
+                }
+            }
+        }
+
+        // If any param uses SigHashPreimage, or this is a stateful contract,
+        // the compiler injects an implicit _opPushTxSig at the beginning of
+        // the unlocking script.
+        let needs_op_push_tx = preimage_index.is_some() || is_stateful;
+
+        let unlocking_script = if needs_op_push_tx {
+            // Prepend placeholder _opPushTxSig before user args
+            format!(
+                "{}{}",
+                encode_push_data(&"00".repeat(72)),
+                self.build_unlocking_script(method_name, &resolved_args)?
+            )
+        } else {
+            self.build_unlocking_script(method_name, &resolved_args)?
+        };
 
         let mut new_locking_script: Option<String> = None;
         let mut new_satoshis: Option<i64> = None;
@@ -301,19 +346,35 @@ impl RunarContract {
             new_locking_script = Some(self.get_locking_script());
         }
 
-        let change_script = build_p2pkh_script_from_address(change_address);
+        // For stateful single-output continuation, the TX must have exactly one
+        // output (the continuation UTXO). No change output or additional UTXOs.
+        let mut change_script = String::new();
+        let mut additional_utxos: Vec<Utxo> = Vec::new();
+        let mut fee_rate = 1;
 
-        // Fetch fee rate and additional funding UTXOs if needed
-        let fee_rate = provider.get_fee_rate()?;
-        let additional_utxos = provider.get_utxos(&address).unwrap_or_default();
+        if !is_stateful {
+            change_script = build_p2pkh_script_from_address(change_address);
+            fee_rate = provider.get_fee_rate()?;
+            let all_funding_utxos = provider.get_utxos(&address).unwrap_or_default();
+            // Filter out the contract UTXO from funding UTXOs to avoid duplicate inputs
+            additional_utxos = all_funding_utxos
+                .into_iter()
+                .filter(|u| !(u.txid == current_utxo.txid && u.output_index == current_utxo.output_index))
+                .collect();
+        }
 
+        let (change_addr_opt, change_script_opt): (Option<&str>, Option<&str>) = if is_stateful {
+            (None, None)
+        } else {
+            (Some(change_address), Some(&change_script))
+        };
         let (tx_hex, input_count) = build_call_transaction(
             &current_utxo,
             &unlocking_script,
             new_locking_script.as_deref(),
             new_satoshis,
-            Some(change_address),
-            Some(&change_script),
+            change_addr_opt,
+            change_script_opt,
             if additional_utxos.is_empty() {
                 None
             } else {
@@ -331,6 +392,127 @@ impl RunarContract {
                 let unlock_script = format!("{}{}", encode_push_data(&sig), encode_push_data(&pub_key));
                 signed_tx = insert_unlocking_script(&signed_tx, i, &unlock_script)?;
             }
+        }
+
+        // For stateful contracts, build the unlock as:
+        //   <opPushTxSig> <user_args> <txPreimage> <methodSelector>
+        if is_stateful {
+            let (op_sig, preimage) = compute_op_push_tx(
+                &signed_tx, 0, &current_utxo.script, current_utxo.satoshis,
+            )?;
+
+            // Re-sign any Sig params against the current tx
+            for &idx in &sig_indices {
+                let real_sig = signer.sign(&signed_tx, 0, &current_utxo.script, current_utxo.satoshis, None)?;
+                resolved_args[idx] = SdkValue::Bytes(real_sig);
+            }
+
+            // Build: <opPushTxSig> <user_args> <txPreimage> <methodSelector>
+            let mut user_args_hex = String::new();
+            for arg in &resolved_args {
+                user_args_hex.push_str(&encode_arg(arg));
+            }
+            let mut method_selector_hex = String::new();
+            let public_methods: Vec<&AbiMethod> = self
+                .artifact
+                .abi
+                .methods
+                .iter()
+                .filter(|m| m.is_public)
+                .collect();
+            if public_methods.len() > 1 {
+                if let Some(idx) = public_methods.iter().position(|m| m.name == method_name) {
+                    method_selector_hex = encode_script_number(idx as i64);
+                }
+            }
+
+            let stateful_unlock = format!(
+                "{}{}{}{}",
+                encode_push_data(&op_sig),
+                user_args_hex,
+                encode_push_data(&preimage),
+                method_selector_hex,
+            );
+
+            // Rebuild TX with the real unlocking script (stateful: no change output)
+            let (rebuilt_tx, _) = build_call_transaction(
+                &current_utxo,
+                &stateful_unlock,
+                new_locking_script.as_deref(),
+                new_satoshis,
+                None,
+                None,
+                None,
+                Some(fee_rate),
+            );
+            signed_tx = rebuilt_tx;
+
+            // Recompute OP_PUSH_TX from the final TX (preimage changes with unlock size)
+            let (final_sig, final_preimage) = compute_op_push_tx(
+                &signed_tx, 0, &current_utxo.script, current_utxo.satoshis,
+            )?;
+
+            // Re-sign Sig params against the final tx if needed
+            for &idx in &sig_indices {
+                let real_sig = signer.sign(&signed_tx, 0, &current_utxo.script, current_utxo.satoshis, None)?;
+                resolved_args[idx] = SdkValue::Bytes(real_sig);
+            }
+
+            user_args_hex = String::new();
+            for arg in &resolved_args {
+                user_args_hex.push_str(&encode_arg(arg));
+            }
+
+            let final_unlock = format!(
+                "{}{}{}{}",
+                encode_push_data(&final_sig),
+                user_args_hex,
+                encode_push_data(&final_preimage),
+                method_selector_hex,
+            );
+            signed_tx = insert_unlocking_script(&signed_tx, 0, &final_unlock)?;
+        } else if needs_op_push_tx || !sig_indices.is_empty() {
+            // Stateless with SigHashPreimage or Sig params: auto-compute
+            let mut op_push_tx_sig_hex: Option<String> = None;
+            if needs_op_push_tx {
+                let (sig_hex, preimage_hex) = compute_op_push_tx(
+                    &signed_tx, 0, &current_utxo.script, current_utxo.satoshis,
+                )?;
+                op_push_tx_sig_hex = Some(sig_hex);
+                if let Some(idx) = preimage_index {
+                    resolved_args[idx] = SdkValue::Bytes(preimage_hex);
+                }
+            }
+
+            for &idx in &sig_indices {
+                let real_sig = signer.sign(&signed_tx, 0, &current_utxo.script, current_utxo.satoshis, None)?;
+                resolved_args[idx] = SdkValue::Bytes(real_sig);
+            }
+
+            let mut real_unlocking_script = self.build_unlocking_script(method_name, &resolved_args)?;
+            if let Some(ref sig_hex) = op_push_tx_sig_hex {
+                real_unlocking_script = format!("{}{}", encode_push_data(sig_hex), real_unlocking_script);
+
+                let tmp_tx = insert_unlocking_script(&signed_tx, 0, &real_unlocking_script)?;
+                let (final_sig, final_preimage) = compute_op_push_tx(
+                    &tmp_tx, 0, &current_utxo.script, current_utxo.satoshis,
+                )?;
+                if let Some(idx) = preimage_index {
+                    resolved_args[idx] = SdkValue::Bytes(final_preimage);
+                }
+                if !sig_indices.is_empty() {
+                    for &idx in &sig_indices {
+                        let real_sig = signer.sign(&tmp_tx, 0, &current_utxo.script, current_utxo.satoshis, None)?;
+                        resolved_args[idx] = SdkValue::Bytes(real_sig);
+                    }
+                }
+                real_unlocking_script = format!(
+                    "{}{}",
+                    encode_push_data(&final_sig),
+                    self.build_unlocking_script(method_name, &resolved_args)?
+                );
+            }
+            signed_tx = insert_unlocking_script(&signed_tx, 0, &real_unlocking_script)?;
         }
 
         // Broadcast
@@ -433,9 +615,18 @@ impl RunarContract {
             }
         }
 
-        // Backward compatibility: old artifacts without constructorSlots
-        for arg in &self.constructor_args {
-            script.push_str(&encode_arg(arg));
+        // Backward compatibility: old stateless artifacts without constructorSlots.
+        // For stateful contracts, constructor args initialize the state section
+        // (after OP_RETURN), not the code portion.
+        let is_stateful = self
+            .artifact
+            .state_fields
+            .as_ref()
+            .map_or(false, |f| !f.is_empty());
+        if !is_stateful {
+            for arg in &self.constructor_args {
+                script.push_str(&encode_arg(arg));
+            }
         }
 
         script
@@ -594,6 +785,9 @@ fn encode_arg(value: &SdkValue) -> String {
             } else {
                 encode_push_data(hex)
             }
+        }
+        SdkValue::Auto => {
+            panic!("encode_arg: SdkValue::Auto should be resolved before encoding")
         }
     }
 }

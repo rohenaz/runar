@@ -182,7 +182,7 @@ pub(crate) fn wots_verify_impl(msg: &[u8], sig: &[u8], pk: &[u8]) -> bool {
     }
 
     let computed_root = Sha256::digest(&concat);
-    computed_root.as_slice() == pk_root
+    &computed_root[..] == pk_root
 }
 
 #[cfg(test)]

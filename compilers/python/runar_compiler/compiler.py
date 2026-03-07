@@ -296,12 +296,11 @@ def _assemble_artifact(
     ]
 
     # Build state fields for stateful contracts
+    # index = position in constructor args (not sequential among state fields)
     state_fields: list[StateField] = []
-    index = 0
-    for prop in program.properties:
+    for i, prop in enumerate(program.properties):
         if not prop.readonly:
-            state_fields.append(StateField(name=prop.name, type=prop.type, index=index))
-            index += 1
+            state_fields.append(StateField(name=prop.name, type=prop.type, index=i))
 
     return Artifact(
         version=SCHEMA_VERSION,
