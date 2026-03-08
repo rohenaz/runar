@@ -29,9 +29,10 @@ type ABIConstructor struct {
 
 // ABIMethod describes a method in the ABI.
 type ABIMethod struct {
-	Name     string     `json:"name"`
-	Params   []ABIParam `json:"params"`
-	IsPublic bool       `json:"isPublic"`
+	Name       string     `json:"name"`
+	Params     []ABIParam `json:"params"`
+	IsPublic   bool       `json:"isPublic"`
+	IsTerminal *bool      `json:"isTerminal,omitempty"`
 }
 
 // ABI describes the contract's public interface.
@@ -126,19 +127,6 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 		constructorParams[i] = ABIParam{Name: prop.Name, Type: prop.Type}
 	}
 
-	methods := make([]ABIMethod, len(program.Methods))
-	for i, method := range program.Methods {
-		params := make([]ABIParam, len(method.Params))
-		for j, p := range method.Params {
-			params[j] = ABIParam{Name: p.Name, Type: p.Type}
-		}
-		methods[i] = ABIMethod{
-			Name:     method.Name,
-			Params:   params,
-			IsPublic: method.IsPublic,
-		}
-	}
-
 	// Build state fields for stateful contracts.
 	// Index = property position (matching constructor arg order), not sequential mutable index.
 	var stateFields []StateField
@@ -150,6 +138,35 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 				Index: i,
 			})
 		}
+	}
+
+	isStateful := len(stateFields) > 0
+	methods := make([]ABIMethod, len(program.Methods))
+	for i, method := range program.Methods {
+		params := make([]ABIParam, len(method.Params))
+		for j, p := range method.Params {
+			params[j] = ABIParam{Name: p.Name, Type: p.Type}
+		}
+		m := ABIMethod{
+			Name:     method.Name,
+			Params:   params,
+			IsPublic: method.IsPublic,
+		}
+		// For stateful contracts, mark public methods without _changePKH as terminal
+		if isStateful && method.IsPublic {
+			hasChange := false
+			for _, p := range method.Params {
+				if p.Name == "_changePKH" {
+					hasChange = true
+					break
+				}
+			}
+			if !hasChange {
+				t := true
+				m.IsTerminal = &t
+			}
+		}
+		methods[i] = m
 	}
 
 	return &Artifact{

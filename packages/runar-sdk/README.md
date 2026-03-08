@@ -483,6 +483,48 @@ interface CallOptions {
 
 ---
 
+## Code Generation
+
+Generate typed wrapper classes from compiled artifacts instead of using stringly-typed `contract.call()`:
+
+```bash
+# CLI
+runar codegen artifacts/*.json -o src/generated/
+```
+
+```typescript
+// Programmatic
+import { generateTypescript } from 'runar-sdk';
+const code = generateTypescript(artifact);
+```
+
+The generated wrapper provides typed methods, hides auto-computed params (`Sig`, `SigHashPreimage`), and distinguishes terminal from state-mutating methods:
+
+```typescript
+import { AuctionContract } from './generated/AuctionContract.js';
+
+const auction = new AuctionContract(artifact, {
+  auctioneer: myPubKey,
+  highestBidder: myPubKey,
+  highestBid: 0n,
+  deadline: 1000n,
+});
+auction.connect(provider, signer);
+await auction.deploy({ satoshis: 10000 });
+
+// State-mutating — Sig auto-computed, options optional
+await auction.bid(bidderPubKey, 5000n, { satoshis: 10000 });
+
+// Terminal — outputs use address (converted to P2PKH) or raw scriptHex
+await auction.close([{ address: winnerAddr, satoshis: 9000 }]);
+```
+
+The underlying `RunarContract` is accessible via `.contract` for advanced use cases.
+
+See the [API Reference](../../docs/api-reference.md#code-generation) for full details on parameter handling and generated class structure.
+
+---
+
 ## Design Decision: Provider/Signer Abstraction
 
 The provider and signer are separate abstractions because they serve different trust boundaries:

@@ -41,6 +41,7 @@ class ABIMethod:
     name: str = ""
     params: list[ABIParam] = field(default_factory=list)
     is_public: bool = False
+    is_terminal: bool | None = None
 
 
 @dataclass
@@ -303,21 +304,30 @@ def _assemble_artifact(
         for prop in program.properties
     ]
 
-    methods = [
-        ABIMethod(
-            name=method.name,
-            params=[ABIParam(name=p.name, type=p.type) for p in method.params],
-            is_public=method.is_public,
-        )
-        for method in program.methods
-    ]
-
     # Build state fields for stateful contracts
     # index = position in constructor args (not sequential among state fields)
     state_fields: list[StateField] = []
     for i, prop in enumerate(program.properties):
         if not prop.readonly:
             state_fields.append(StateField(name=prop.name, type=prop.type, index=i))
+
+    is_stateful = len(state_fields) > 0
+
+    methods: list[ABIMethod] = []
+    for method in program.methods:
+        params = [ABIParam(name=p.name, type=p.type) for p in method.params]
+        # For stateful contracts, mark public methods without _changePKH as terminal
+        is_terminal: bool | None = None
+        if is_stateful and method.is_public:
+            has_change = any(p.name == "_changePKH" for p in method.params)
+            if not has_change:
+                is_terminal = True
+        methods.append(ABIMethod(
+            name=method.name,
+            params=params,
+            is_public=method.is_public,
+            is_terminal=is_terminal,
+        ))
 
     return Artifact(
         version=SCHEMA_VERSION,
@@ -357,6 +367,7 @@ def artifact_to_json(artifact: Artifact) -> str:
                     "name": m.name,
                     "params": [{"name": p.name, "type": p.type} for p in m.params],
                     "isPublic": m.is_public,
+                    **({"isTerminal": m.is_terminal} if m.is_terminal is not None else {}),
                 }
                 for m in artifact.abi.methods
             ],

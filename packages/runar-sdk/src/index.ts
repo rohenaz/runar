@@ -44,6 +44,9 @@ export { buildP2PKHScript } from './script-utils.js';
 // Token management
 export { TokenWallet } from './tokens.js';
 
+// Code generation
+export { generateTypescript } from './codegen/index.js';
+
 // Re-export artifact types from runar-ir-schema for convenience
 export type {
   RunarArtifact,

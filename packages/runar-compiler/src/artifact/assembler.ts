@@ -35,6 +35,8 @@ export interface ABIMethod {
   name: string;
   params: ABIParam[];
   isPublic: boolean;
+  /** True for stateful contract methods that don't mutate state (no continuation output). */
+  isTerminal?: boolean;
 }
 
 export interface ABI {
@@ -166,11 +168,13 @@ function extractABI(contract: ContractNode): ABI {
   // Methods
   const methods: ABIMethod[] = contract.methods.map(method => {
     const params = method.params.map(paramToABI);
+    const isPublic = method.visibility === 'public';
+    let needsChange = false;
 
-    if (isStateful && method.visibility === 'public') {
+    if (isStateful && isPublic) {
       // Methods that mutate state or call addOutput need change output params
-      const needsChange = methodMutatesState(method.body, mutablePropNames) ||
-                          methodHasAddOutput(method.body);
+      needsChange = methodMutatesState(method.body, mutablePropNames) ||
+                    methodHasAddOutput(method.body);
       if (needsChange) {
         params.push({ name: '_changePKH', type: 'Ripemd160' });
         params.push({ name: '_changeAmount', type: 'bigint' });
@@ -178,11 +182,14 @@ function extractABI(contract: ContractNode): ABI {
       params.push({ name: 'txPreimage', type: 'SigHashPreimage' });
     }
 
-    return {
-      name: method.name,
-      params,
-      isPublic: method.visibility === 'public',
-    };
+    const result: ABIMethod = { name: method.name, params, isPublic };
+
+    // For stateful contracts, mark terminal methods (no state mutation, no addOutput)
+    if (isStateful && isPublic && !needsChange) {
+      result.isTerminal = true;
+    }
+
+    return result;
   });
 
   return {
