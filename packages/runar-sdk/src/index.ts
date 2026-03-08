@@ -20,7 +20,8 @@ export type { RPCProviderOptions } from './providers/index.js';
 // Signers
 export type { Signer } from './signers/index.js';
 export type { SignCallback } from './signers/index.js';
-export { LocalSigner, ExternalSigner } from './signers/index.js';
+export type { WalletSignerOptions } from './signers/index.js';
+export { LocalSigner, ExternalSigner, WalletSigner } from './signers/index.js';
 
 // Contract
 export { RunarContract } from './contract.js';
