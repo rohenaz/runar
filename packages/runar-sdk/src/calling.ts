@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import type { UTXO } from './types.js';
-import { Utils } from '@bsv/sdk';
+import { buildP2PKHScript } from './script-utils.js';
 
 /**
  * Build a raw transaction that spends a contract UTXO (method call).
@@ -138,7 +138,7 @@ export function buildCallTransaction(
 // Bitcoin wire format helpers
 // ---------------------------------------------------------------------------
 
-function toLittleEndian32(n: number): string {
+export function toLittleEndian32(n: number): string {
   const buf = new ArrayBuffer(4);
   new DataView(buf).setUint32(0, n, true);
   return Array.from(new Uint8Array(buf))
@@ -146,13 +146,13 @@ function toLittleEndian32(n: number): string {
     .join('');
 }
 
-function toLittleEndian64(n: number): string {
+export function toLittleEndian64(n: number): string {
   const lo = n & 0xffffffff;
   const hi = Math.floor(n / 0x100000000) & 0xffffffff;
   return toLittleEndian32(lo) + toLittleEndian32(hi);
 }
 
-function encodeVarInt(n: number): string {
+export function encodeVarInt(n: number): string {
   if (n < 0xfd) {
     return n.toString(16).padStart(2, '0');
   } else if (n <= 0xffff) {
@@ -169,7 +169,7 @@ function encodeVarInt(n: number): string {
   }
 }
 
-function reverseHex(hex: string): string {
+export function reverseHex(hex: string): string {
   const pairs: string[] = [];
   for (let i = 0; i < hex.length; i += 2) {
     pairs.push(hex.slice(i, i + 2));
@@ -184,19 +184,3 @@ function varIntByteSize(n: number): number {
   return 9;
 }
 
-function buildP2PKHScript(address: string): string {
-  let pubKeyHash: string;
-
-  if (/^[0-9a-fA-F]{40}$/.test(address)) {
-    // Already a raw 20-byte pubkey hash in hex
-    pubKeyHash = address;
-  } else {
-    // Decode Base58Check address to extract the 20-byte pubkey hash
-    const decoded = Utils.fromBase58Check(address);
-    pubKeyHash = typeof decoded.data === 'string'
-      ? decoded.data
-      : Utils.toHex(decoded.data);
-  }
-
-  return '76a914' + pubKeyHash + '88ac';
-}

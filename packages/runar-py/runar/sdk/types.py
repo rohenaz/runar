@@ -147,6 +147,13 @@ class OutputSpec:
 
 
 @dataclass
+class TerminalOutput:
+    """Specification for an exact output in a terminal method call."""
+    script_hex: str
+    satoshis: int
+
+
+@dataclass
 class CallOptions:
     """Options for calling a contract method."""
     satoshis: int = 0
@@ -156,6 +163,7 @@ class CallOptions:
     outputs: list[OutputSpec | dict] | None = None
     additional_contract_inputs: list[Utxo | dict] | None = None
     additional_contract_input_args: list[list] | None = None
+    terminal_outputs: list[TerminalOutput | dict] | None = None
 
 
 # SdkValue is the union of types that can be passed as contract arguments

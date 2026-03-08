@@ -28,4 +28,7 @@ export interface Provider {
    * Defaults to 1 sat/byte for BSV (the standard minimum relay fee).
    */
   getFeeRate(): Promise<number>;
+
+  /** Fetch the raw transaction hex by its txid. */
+  getRawTransaction(txid: string): Promise<string>;
 }

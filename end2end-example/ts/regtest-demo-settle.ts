@@ -30,8 +30,8 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { randomBytes, createHash, generatePrimeSync } from 'node:crypto';
 import { execSync } from 'node:child_process';
-import { compile } from '../../packages/runar-compiler/src/index.js';
-import { LocalSigner } from '../../packages/runar-sdk/src/signers/local.js';
+import { compile } from 'runar-compiler';
+import { LocalSigner } from 'runar-sdk';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Configuration

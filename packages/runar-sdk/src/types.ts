@@ -70,4 +70,15 @@ export interface CallOptions {
    * primary call.
    */
   additionalContractInputArgs?: unknown[][];
+
+  /**
+   * Terminal outputs for methods that verify exact output structure via
+   * extractOutputHash(). When set, the transaction is built with ONLY
+   * the contract UTXO as input (no funding inputs, no change output).
+   * The fee comes from the contract balance. The contract is considered
+   * fully spent after this call (currentUtxo becomes null).
+   *
+   * Each output specifies the exact locking script hex and satoshis.
+   */
+  terminalOutputs?: Array<{ scriptHex: string; satoshis: number }>;
 }

@@ -53,6 +53,9 @@ export const INPUT_FORMATS = [
   { ext: '.runar.rs',   compilers: ['rust', 'python'] as const },
 ] as const;
 
+type CompilerId = (typeof INPUT_FORMATS)[number]['compilers'][number];
+const EMPTY_COMPILERS: readonly CompilerId[] = [];
+
 export interface CompilerOutput {
   irJson: string;        // canonical JSON of ANF IR
   scriptHex: string;     // compiled Bitcoin Script
@@ -723,7 +726,7 @@ export async function runConformanceTestForFormat(
 
   // Determine which compilers support this format
   const formatDef = INPUT_FORMATS.find(f => f.ext === format.ext);
-  const supportedCompilers = formatDef?.compilers ?? [];
+  const supportedCompilers = formatDef?.compilers ?? EMPTY_COMPILERS;
 
   // Run compilers that support this format
   const tsResult = supportedCompilers.includes('ts')

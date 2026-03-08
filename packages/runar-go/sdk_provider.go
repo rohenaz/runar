@@ -30,6 +30,9 @@ type Provider interface {
 	// GetFeeRate returns the current fee rate in satoshis per byte.
 	// BSV standard is 1 sat/byte.
 	GetFeeRate() (int64, error)
+
+	// GetRawTransaction fetches the raw transaction hex by its txid.
+	GetRawTransaction(txid string) (string, error)
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +120,18 @@ func (m *MockProvider) GetContractUtxo(scriptHash string) (*UTXO, error) {
 // GetNetwork returns the mock network name.
 func (m *MockProvider) GetNetwork() string {
 	return m.network
+}
+
+// GetRawTransaction returns the raw hex of a stored transaction.
+func (m *MockProvider) GetRawTransaction(txid string) (string, error) {
+	tx, ok := m.transactions[txid]
+	if !ok {
+		return "", fmt.Errorf("MockProvider: transaction %s not found", txid)
+	}
+	if tx.Raw == "" {
+		return "", fmt.Errorf("MockProvider: transaction %s has no raw hex", txid)
+	}
+	return tx.Raw, nil
 }
 
 // GetFeeRate returns the configured fee rate (default 1 sat/byte).

@@ -4,11 +4,14 @@ from __future__ import annotations
 import hashlib
 from runar.sdk.types import (
     RunarArtifact, Utxo, Transaction, TxOutput,
-    DeployOptions, CallOptions, OutputSpec,
+    DeployOptions, CallOptions, OutputSpec, TerminalOutput,
 )
 from runar.sdk.provider import Provider
 from runar.sdk.signer import Signer
-from runar.sdk.deployment import build_deploy_transaction, select_utxos, build_p2pkh_script
+from runar.sdk.deployment import (
+    build_deploy_transaction, select_utxos, build_p2pkh_script,
+    _to_le32, _to_le64, _encode_varint, _reverse_hex,
+)
 from runar.sdk.calling import build_call_transaction, insert_unlocking_script
 from runar.sdk.state import (
     serialize_state, extract_state_from_script, find_last_op_return,
@@ -190,6 +193,16 @@ class RunarContract:
         # If any param uses SigHashPreimage, or this is stateful,
         # the compiler injects an implicit _opPushTxSig.
         needs_op_push_tx = preimage_index >= 0 or is_stateful
+
+        # -------------------------------------------------------------------
+        # Terminal method path: exact outputs, no funding, no change
+        # -------------------------------------------------------------------
+        if opts.terminal_outputs:
+            return self._call_terminal(
+                method_name, resolved_args, provider, signer, opts,
+                is_stateful, needs_op_push_tx, method_needs_change,
+                sig_indices, prevouts_indices, preimage_index, user_params,
+            )
 
         if needs_op_push_tx:
             # Prepend placeholder _opPushTxSig before user args
@@ -558,6 +571,155 @@ class RunarContract:
     def set_state(self, new_state: dict) -> None:
         """Update state values directly."""
         self._state.update(new_state)
+
+    # -- Terminal method --
+
+    def _call_terminal(
+        self,
+        method_name: str,
+        resolved_args: list,
+        provider: Provider,
+        signer: Signer,
+        opts: CallOptions,
+        is_stateful: bool,
+        needs_op_push_tx: bool,
+        method_needs_change: bool,
+        sig_indices: list[int],
+        prevouts_indices: list[int],
+        preimage_index: int,
+        user_params: list,
+    ) -> tuple[str, Transaction]:
+        """Handle the terminal method code path."""
+        # Normalize terminal outputs
+        term_outputs = []
+        for item in opts.terminal_outputs:
+            if isinstance(item, TerminalOutput):
+                term_outputs.append(item)
+            elif isinstance(item, dict):
+                term_outputs.append(TerminalOutput(
+                    script_hex=item['scriptHex'] if 'scriptHex' in item else item['script_hex'],
+                    satoshis=item['satoshis'],
+                ))
+            else:
+                term_outputs.append(item)
+
+        # Build placeholder unlocking script
+        if needs_op_push_tx:
+            term_unlock_script = encode_push_data('00' * 72) + \
+                self.build_unlocking_script(method_name, resolved_args)
+        else:
+            term_unlock_script = self.build_unlocking_script(method_name, resolved_args)
+
+        # Build raw terminal transaction: single input, exact outputs
+        def build_terminal_tx(unlock: str) -> str:
+            tx = ''
+            tx += _to_le32(1)  # version
+            tx += _encode_varint(1)  # 1 input
+            tx += _reverse_hex(self._current_utxo.txid)
+            tx += _to_le32(self._current_utxo.output_index)
+            tx += _encode_varint(len(unlock) // 2)
+            tx += unlock
+            tx += 'ffffffff'
+            tx += _encode_varint(len(term_outputs))
+            for out in term_outputs:
+                tx += _to_le64(out.satoshis)
+                tx += _encode_varint(len(out.script_hex) // 2)
+                tx += out.script_hex
+            tx += _to_le32(0)  # locktime
+            return tx
+
+        term_tx = build_terminal_tx(term_unlock_script)
+
+        if is_stateful:
+            method_selector_hex = ''
+            public_methods = self._get_public_methods()
+            if len(public_methods) > 1:
+                for mi, m in enumerate(public_methods):
+                    if m.name == method_name:
+                        method_selector_hex = _encode_script_number(mi)
+                        break
+
+            # Compute change PKH
+            change_pkh_hex = ''
+            if method_needs_change:
+                change_pub_key_hex = opts.change_pub_key or signer.get_public_key()
+                pub_key_bytes = bytes.fromhex(change_pub_key_hex)
+                hash160_bytes = hashlib.new(
+                    'ripemd160', hashlib.sha256(pub_key_bytes).digest()
+                ).digest()
+                change_pkh_hex = hash160_bytes.hex()
+
+            def build_stateful_terminal_unlock(tx: str) -> str:
+                op_sig, preimage = compute_op_push_tx(tx, 0, self._current_utxo.script, self._current_utxo.satoshis)
+                input_args = list(resolved_args)
+                for idx in sig_indices:
+                    input_args[idx] = signer.sign(tx, 0, self._current_utxo.script, self._current_utxo.satoshis)
+                args_hex = ''
+                for arg in input_args:
+                    args_hex += _encode_arg(arg)
+                # Terminal: 0 change
+                change_hex = ''
+                if method_needs_change and change_pkh_hex:
+                    change_hex = encode_push_data(change_pkh_hex) + _encode_script_number(0)
+                return (
+                    encode_push_data(op_sig) +
+                    args_hex +
+                    change_hex +
+                    encode_push_data(preimage) +
+                    method_selector_hex
+                )
+
+            # First pass
+            first_unlock = build_stateful_terminal_unlock(term_tx)
+            term_tx = build_terminal_tx(first_unlock)
+
+            # Second pass
+            final_unlock = build_stateful_terminal_unlock(term_tx)
+            term_tx = insert_unlocking_script(term_tx, 0, final_unlock)
+
+        elif needs_op_push_tx or sig_indices:
+            # Stateless terminal with OP_PUSH_TX or Sig params
+            op_push_tx_sig_hex = None
+            if needs_op_push_tx:
+                sig_hex, preimage_hex = compute_op_push_tx(
+                    term_tx, 0, self._current_utxo.script, self._current_utxo.satoshis,
+                )
+                op_push_tx_sig_hex = sig_hex
+                resolved_args[preimage_index] = preimage_hex
+
+            for idx in sig_indices:
+                resolved_args[idx] = signer.sign(
+                    term_tx, 0, self._current_utxo.script, self._current_utxo.satoshis,
+                )
+
+            real_unlock = self.build_unlocking_script(method_name, resolved_args)
+            if op_push_tx_sig_hex is not None:
+                real_unlock = encode_push_data(op_push_tx_sig_hex) + real_unlock
+                tmp_tx = insert_unlocking_script(term_tx, 0, real_unlock)
+                final_sig, final_preimage = compute_op_push_tx(
+                    tmp_tx, 0, self._current_utxo.script, self._current_utxo.satoshis,
+                )
+                resolved_args[preimage_index] = final_preimage
+                for idx in sig_indices:
+                    resolved_args[idx] = signer.sign(
+                        tmp_tx, 0, self._current_utxo.script, self._current_utxo.satoshis,
+                    )
+                real_unlock = encode_push_data(final_sig) + \
+                    self.build_unlocking_script(method_name, resolved_args)
+            term_tx = insert_unlocking_script(term_tx, 0, real_unlock)
+
+        # Broadcast
+        txid = provider.broadcast(term_tx)
+
+        # Terminal: contract is fully spent
+        self._current_utxo = None
+
+        try:
+            tx = provider.get_transaction(txid)
+        except Exception:
+            tx = Transaction(txid=txid, version=1, raw=term_tx)
+
+        return txid, tx
 
     # -- Private helpers --
 

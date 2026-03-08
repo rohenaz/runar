@@ -143,6 +143,7 @@ Implement the `Provider` interface for other network APIs:
 ```go
 type Provider interface {
     GetTransaction(txid string) (*Transaction, error)
+    GetRawTransaction(txid string) (string, error)
     Broadcast(rawTx string) (string, error)
     GetUtxos(address string) ([]UTXO, error)
     GetContractUtxo(scriptHash string) (*UTXO, error)

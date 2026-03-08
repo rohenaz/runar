@@ -31,6 +31,9 @@ pub trait Provider {
     /// Get the current fee rate in satoshis per byte.
     /// BSV standard is 1 sat/byte.
     fn get_fee_rate(&self) -> Result<i64, String>;
+
+    /// Fetch the raw transaction hex by its txid.
+    fn get_raw_transaction(&self, txid: &str) -> Result<String, String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +140,14 @@ impl Provider for MockProvider {
 
     fn get_fee_rate(&self) -> Result<i64, String> {
         Ok(self.fee_rate)
+    }
+
+    fn get_raw_transaction(&self, txid: &str) -> Result<String, String> {
+        let tx = self.transactions
+            .get(txid)
+            .ok_or_else(|| format!("MockProvider: transaction {} not found", txid))?;
+        tx.raw.clone()
+            .ok_or_else(|| format!("MockProvider: transaction {} has no raw hex", txid))
     }
 }
 

@@ -38,6 +38,11 @@ class Provider(ABC):
         """Return the current fee rate in satoshis per byte."""
         ...
 
+    @abstractmethod
+    def get_raw_transaction(self, txid: str) -> str:
+        """Fetch the raw transaction hex by its txid."""
+        ...
+
 
 class MockProvider(Provider):
     """In-memory provider for unit tests and local development."""
@@ -95,6 +100,14 @@ class MockProvider(Provider):
 
     def get_fee_rate(self) -> int:
         return self._fee_rate
+
+    def get_raw_transaction(self, txid: str) -> str:
+        tx = self._transactions.get(txid)
+        if tx is None:
+            raise RuntimeError(f"MockProvider: transaction {txid} not found")
+        if not tx.raw:
+            raise RuntimeError(f"MockProvider: transaction {txid} has no raw hex")
+        return tx.raw
 
 
 def _mock_hash64(input_str: str) -> str:

@@ -125,6 +125,11 @@ export class RPCProvider implements Provider {
     return this.network;
   }
 
+  async getRawTransaction(txid: string): Promise<string> {
+    const rawHex = (await this.rpcCall('getrawtransaction', txid, false)) as string;
+    return rawHex;
+  }
+
   async getFeeRate(): Promise<number> {
     return 1;
   }

@@ -2160,3 +2160,194 @@ func TestBuildCodeScript_WithoutSlots_FallbackAppends(t *testing.T) {
 		t.Errorf("expected locking script %q, got %q", expected, lockingScript)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Terminal method call tests
+// ---------------------------------------------------------------------------
+
+func TestTerminalCall_SetsUtxoToNil(t *testing.T) {
+	artifact := makeArtifact("51", ABI{
+		Constructor: ABIConstructor{Params: nil},
+		Methods: []ABIMethod{
+			{Name: "cancel", Params: nil, IsPublic: true},
+		},
+	})
+
+	contract := NewRunarContract(artifact, nil)
+
+	provider := NewMockProvider("testnet")
+	mockAddr := strings.Repeat("00", 20)
+	signer := NewMockSigner("", mockAddr)
+
+	provider.AddUtxo(mockAddr, UTXO{
+		Txid:        strings.Repeat("aa", 32),
+		OutputIndex: 0,
+		Satoshis:    100000,
+		Script:      "76a914" + strings.Repeat("00", 20) + "88ac",
+	})
+
+	_, _, err := contract.Deploy(provider, signer, DeployOptions{Satoshis: 50000})
+	if err != nil {
+		t.Fatalf("Deploy error: %v", err)
+	}
+
+	payoutScript := "76a914" + strings.Repeat("bb", 20) + "88ac"
+	txid, _, err := contract.Call("cancel", nil, provider, signer, &CallOptions{
+		TerminalOutputs: []TerminalOutput{
+			{ScriptHex: payoutScript, Satoshis: 49000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Terminal call error: %v", err)
+	}
+	if len(txid) != 64 {
+		t.Errorf("expected 64-char txid, got %d", len(txid))
+	}
+	if contract.GetCurrentUtxo() != nil {
+		t.Error("expected currentUtxo to be nil after terminal call")
+	}
+}
+
+func TestTerminalCall_SubsequentCallFails(t *testing.T) {
+	artifact := makeArtifact("51", ABI{
+		Constructor: ABIConstructor{Params: nil},
+		Methods: []ABIMethod{
+			{Name: "spend", Params: nil, IsPublic: true},
+		},
+	})
+
+	contract := NewRunarContract(artifact, nil)
+
+	provider := NewMockProvider("testnet")
+	mockAddr := strings.Repeat("00", 20)
+	signer := NewMockSigner("", mockAddr)
+
+	provider.AddUtxo(mockAddr, UTXO{
+		Txid:        strings.Repeat("aa", 32),
+		OutputIndex: 0,
+		Satoshis:    100000,
+		Script:      "76a914" + strings.Repeat("00", 20) + "88ac",
+	})
+
+	_, _, err := contract.Deploy(provider, signer, DeployOptions{Satoshis: 10000})
+	if err != nil {
+		t.Fatalf("Deploy error: %v", err)
+	}
+
+	_, _, err = contract.Call("spend", nil, provider, signer, &CallOptions{
+		TerminalOutputs: []TerminalOutput{
+			{ScriptHex: "76a914" + strings.Repeat("cc", 20) + "88ac", Satoshis: 9000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Terminal call error: %v", err)
+	}
+
+	// Subsequent call should fail with "not deployed"
+	_, _, err = contract.Call("spend", nil, provider, signer, nil)
+	if err == nil {
+		t.Fatal("expected error after terminal call")
+	}
+	if !strings.Contains(err.Error(), "not deployed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTerminalCall_MultipleOutputs(t *testing.T) {
+	artifact := makeArtifact("51", ABI{
+		Constructor: ABIConstructor{Params: nil},
+		Methods: []ABIMethod{
+			{Name: "settle", Params: nil, IsPublic: true},
+		},
+	})
+
+	contract := NewRunarContract(artifact, nil)
+
+	provider := NewMockProvider("testnet")
+	mockAddr := strings.Repeat("00", 20)
+	signer := NewMockSigner("", mockAddr)
+
+	provider.AddUtxo(mockAddr, UTXO{
+		Txid:        strings.Repeat("aa", 32),
+		OutputIndex: 0,
+		Satoshis:    100000,
+		Script:      "76a914" + strings.Repeat("00", 20) + "88ac",
+	})
+
+	_, _, err := contract.Deploy(provider, signer, DeployOptions{Satoshis: 20000})
+	if err != nil {
+		t.Fatalf("Deploy error: %v", err)
+	}
+
+	txid, _, err := contract.Call("settle", nil, provider, signer, &CallOptions{
+		TerminalOutputs: []TerminalOutput{
+			{ScriptHex: "76a914" + strings.Repeat("aa", 20) + "88ac", Satoshis: 10000},
+			{ScriptHex: "76a914" + strings.Repeat("bb", 20) + "88ac", Satoshis: 9000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Terminal call error: %v", err)
+	}
+	if len(txid) != 64 {
+		t.Errorf("expected 64-char txid, got %d", len(txid))
+	}
+	if contract.GetCurrentUtxo() != nil {
+		t.Error("expected currentUtxo to be nil after terminal call")
+	}
+}
+
+func TestTerminalCall_TxStructure(t *testing.T) {
+	artifact := makeArtifact("51", ABI{
+		Constructor: ABIConstructor{Params: nil},
+		Methods: []ABIMethod{
+			{Name: "cancel", Params: nil, IsPublic: true},
+		},
+	})
+
+	contract := NewRunarContract(artifact, nil)
+
+	provider := NewMockProvider("testnet")
+	mockAddr := strings.Repeat("00", 20)
+	signer := NewMockSigner("", mockAddr)
+
+	provider.AddUtxo(mockAddr, UTXO{
+		Txid:        strings.Repeat("aa", 32),
+		OutputIndex: 0,
+		Satoshis:    100000,
+		Script:      "76a914" + strings.Repeat("00", 20) + "88ac",
+	})
+
+	_, _, err := contract.Deploy(provider, signer, DeployOptions{Satoshis: 50000})
+	if err != nil {
+		t.Fatalf("Deploy error: %v", err)
+	}
+
+	payoutScript := "76a914" + strings.Repeat("dd", 20) + "88ac"
+	_, _, err = contract.Call("cancel", nil, provider, signer, &CallOptions{
+		TerminalOutputs: []TerminalOutput{
+			{ScriptHex: payoutScript, Satoshis: 49000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Terminal call error: %v", err)
+	}
+
+	broadcastedTxs := provider.GetBroadcastedTxs()
+	// Deploy is first broadcast, terminal call is second
+	if len(broadcastedTxs) != 2 {
+		t.Fatalf("expected 2 broadcasts, got %d", len(broadcastedTxs))
+	}
+
+	termTxHex := broadcastedTxs[1]
+	parsed := parseTxHex(termTxHex)
+
+	// Should have version 1
+	if parsed.version != 1 {
+		t.Errorf("expected version 1, got %d", parsed.version)
+	}
+
+	// Should have 1 input (no funding inputs)
+	if parsed.inputCount != 1 {
+		t.Errorf("expected 1 input, got %d", parsed.inputCount)
+	}
+}

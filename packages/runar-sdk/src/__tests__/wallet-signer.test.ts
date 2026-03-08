@@ -9,16 +9,17 @@ import { Hash, Utils, type SecurityLevel } from '@bsv/sdk';
 const MOCK_PUB_KEY =
   '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
 
-// A valid DER-encoded signature hex string (wallet returns this directly)
-const MOCK_DER_HEX =
-  '3044' +
-  '0220' + 'ab'.repeat(32) +
-  '0220' + 'cd'.repeat(32);
+// A valid DER-encoded signature as a byte array (wallet returns number[])
+const MOCK_DER_BYTES: number[] = [
+  0x30, 0x44,
+  0x02, 0x20, ...Array(32).fill(0xab),
+  0x02, 0x20, ...Array(32).fill(0xcd),
+];
 
 function createMockWallet() {
   return {
     getPublicKey: vi.fn().mockResolvedValue({ publicKey: MOCK_PUB_KEY }),
-    createSignature: vi.fn().mockResolvedValue({ signature: MOCK_DER_HEX }),
+    createSignature: vi.fn().mockResolvedValue({ signature: MOCK_DER_BYTES }),
   };
 }
 

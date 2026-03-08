@@ -23,6 +23,9 @@
   "include": [
     "**/*.runar.ts",
     "**/*.test.ts",
-    "sdk-usage/sdk-usage-typescript.ts"
+    "sdk-usage/sdk-usage-typescript.ts",
+    "ts/dump-compiled.ts",
+    "ts/regtest-demo.ts",
+    "ts/regtest-demo-settle.ts"
   ]
 }

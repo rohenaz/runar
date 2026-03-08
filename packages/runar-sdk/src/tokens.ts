@@ -8,7 +8,7 @@ import type { Signer } from './signers/signer.js';
 import type { UTXO } from './types.js';
 import { RunarContract } from './contract.js';
 import { buildCallTransaction } from './calling.js';
-import { Utils } from '@bsv/sdk';
+import { buildP2PKHScript } from './script-utils.js';
 
 /**
  * Manages token UTXOs for a fungible token contract.
@@ -89,7 +89,7 @@ export class TokenWallet {
         const changeAddress = await this.signer.getAddress();
         const feeRate = await this.provider.getFeeRate();
         const additionalUtxos = await this.provider.getUtxos(changeAddress);
-        const changeScript = buildP2PKHScriptFromAddress(changeAddress);
+        const changeScript = buildP2PKHScript(changeAddress);
 
         const { txHex: prelimTxHex } = buildCallTransaction(
           utxo,
@@ -165,7 +165,7 @@ export class TokenWallet {
     const changeAddress = await this.signer.getAddress();
     const feeRate = await this.provider.getFeeRate();
     const additionalUtxos = await this.provider.getUtxos(changeAddress);
-    const changeScript = buildP2PKHScriptFromAddress(changeAddress);
+    const changeScript = buildP2PKHScript(changeAddress);
 
     const { txHex: prelimTxHex } = buildCallTransaction(
       firstUtxo,
@@ -214,24 +214,3 @@ export class TokenWallet {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Build a P2PKH locking script from an address string.
- */
-function buildP2PKHScriptFromAddress(address: string): string {
-  let pubKeyHash: string;
-
-  if (/^[0-9a-fA-F]{40}$/.test(address)) {
-    pubKeyHash = address;
-  } else {
-    const decoded = Utils.fromBase58Check(address);
-    pubKeyHash = typeof decoded.data === 'string'
-      ? decoded.data
-      : Utils.toHex(decoded.data);
-  }
-
-  return '76a914' + pubKeyHash + '88ac';
-}

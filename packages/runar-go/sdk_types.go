@@ -64,6 +64,19 @@ type CallOptions struct {
 	// AdditionalContractInputArgs[i] overrides args for AdditionalContractInputs[i].
 	// Sig params (nil) are still auto-computed per input.
 	AdditionalContractInputArgs [][]interface{} `json:"additionalContractInputArgs,omitempty"`
+
+	// Terminal outputs for methods that verify exact output structure via
+	// extractOutputHash(). When set, the transaction is built with ONLY
+	// the contract UTXO as input (no funding inputs, no change output).
+	// The fee comes from the contract balance. The contract is considered
+	// fully spent after this call (currentUtxo becomes nil).
+	TerminalOutputs []TerminalOutput `json:"terminalOutputs,omitempty"`
+}
+
+// TerminalOutput specifies an exact output for a terminal method call.
+type TerminalOutput struct {
+	ScriptHex string `json:"scriptHex"`
+	Satoshis  int64  `json:"satoshis"`
 }
 
 // OutputSpec specifies a single continuation output for multi-output calls.

@@ -76,6 +76,19 @@ pub struct CallOptions {
     /// Override the public key used for the change output (hex-encoded).
     /// Defaults to the signer's public key.
     pub change_pub_key: Option<String>,
+    /// Terminal outputs for methods that verify exact output structure via
+    /// extractOutputHash(). When set, the transaction is built with ONLY
+    /// the contract UTXO as input (no funding inputs, no change output).
+    /// The fee comes from the contract balance. The contract is considered
+    /// fully spent after this call (currentUtxo becomes None).
+    pub terminal_outputs: Option<Vec<TerminalOutput>>,
+}
+
+/// Specification for an exact output in a terminal method call.
+#[derive(Debug, Clone)]
+pub struct TerminalOutput {
+    pub script_hex: String,
+    pub satoshis: i64,
 }
 
 /// Specification for a single continuation output in multi-output calls.

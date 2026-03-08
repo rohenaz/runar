@@ -7,9 +7,10 @@ import type { Provider } from './providers/provider.js';
 import type { Signer } from './signers/signer.js';
 import type { Transaction, UTXO, DeployOptions, CallOptions } from './types.js';
 import { buildDeployTransaction, selectUtxos } from './deployment.js';
-import { buildCallTransaction } from './calling.js';
+import { buildCallTransaction, toLittleEndian32, toLittleEndian64, encodeVarInt, reverseHex } from './calling.js';
 import { serializeState, extractStateFromScript, findLastOpReturn } from './state.js';
 import { computeOpPushTx } from './oppushtx.js';
+import { buildP2PKHScript } from './script-utils.js';
 import { Utils, Hash, Transaction as BsvTransaction } from '@bsv/sdk';
 
 /**
@@ -158,7 +159,7 @@ export class RunarContract {
     const utxos = selectUtxos(allUtxos, deploySatoshis, lockingScript.length / 2, feeRate);
 
     // Build the deploy transaction
-    const changeScript = buildP2PKHScriptFromAddress(changeAddress);
+    const changeScript = buildP2PKHScript(changeAddress);
     const { txHex, inputCount } = buildDeployTransaction(
       lockingScript,
       utxos,
@@ -339,6 +340,135 @@ export class RunarContract {
     // stateful path below), even though it's not in userParams.
     const needsOpPushTx = preimageIndex >= 0 || isStateful;
 
+    // -----------------------------------------------------------------------
+    // Terminal method path: exact outputs, no funding, no change
+    // -----------------------------------------------------------------------
+    if (options?.terminalOutputs) {
+      const terminalOutputs = options.terminalOutputs;
+
+      // Build placeholder unlocking script
+      let termUnlockScript: string;
+      if (needsOpPushTx) {
+        termUnlockScript = encodePushData('00'.repeat(72)) +
+          this.buildUnlockingScript(methodName, resolvedArgs);
+      } else {
+        termUnlockScript = this.buildUnlockingScript(methodName, resolvedArgs);
+      }
+
+      // Build raw transaction: single input (contract UTXO), exact outputs
+      const buildTerminalTx = (unlock: string): string => {
+        let tx = '';
+        tx += toLittleEndian32(1); // version
+        tx += encodeVarInt(1); // input count: just the contract UTXO
+        tx += reverseHex(this.currentUtxo!.txid);
+        tx += toLittleEndian32(this.currentUtxo!.outputIndex);
+        tx += encodeVarInt(unlock.length / 2);
+        tx += unlock;
+        tx += 'ffffffff'; // sequence
+        tx += encodeVarInt(terminalOutputs.length); // output count
+        for (const out of terminalOutputs) {
+          tx += toLittleEndian64(out.satoshis);
+          tx += encodeVarInt(out.scriptHex.length / 2);
+          tx += out.scriptHex;
+        }
+        tx += toLittleEndian32(0); // locktime
+        return tx;
+      };
+
+      let termTx = buildTerminalTx(termUnlockScript);
+
+      if (isStateful) {
+        // Stateful terminal: build full unlock with OP_PUSH_TX + args + change + preimage + selector
+        let methodSelectorHex = '';
+        const publicMethods = this.artifact.abi.methods.filter((m) => m.isPublic);
+        if (publicMethods.length > 1) {
+          const idx = publicMethods.findIndex((m) => m.name === methodName);
+          if (idx >= 0) methodSelectorHex = encodeScriptNumber(BigInt(idx));
+        }
+
+        // Compute change PKH for methods that need it
+        let changePKHHex = '';
+        if (methodNeedsChange) {
+          const changePubKeyHex = options?.changePubKey ?? await signer.getPublicKey();
+          const pubKeyBytes = Utils.toArray(changePubKeyHex, 'hex');
+          const hash160Bytes = Hash.hash160(pubKeyBytes);
+          changePKHHex = Utils.toHex(hash160Bytes);
+        }
+
+        const buildStatefulTerminalUnlock = async (tx: string): Promise<string> => {
+          const { sigHex: opSig, preimageHex: preimage } = computeOpPushTx(
+            tx, 0, this.currentUtxo!.script, this.currentUtxo!.satoshis,
+          );
+          const inputArgs = [...resolvedArgs];
+          for (const idx of sigIndices) {
+            inputArgs[idx] = await signer.sign(tx, 0, this.currentUtxo!.script, this.currentUtxo!.satoshis);
+          }
+          let argsHex = '';
+          for (const arg of inputArgs) argsHex += encodeArg(arg);
+          let changeHex = '';
+          if (methodNeedsChange && changePKHHex) {
+            changeHex = encodePushData(changePKHHex) + encodeArg(0n); // terminal: 0 change
+          }
+          return encodePushData(opSig) + argsHex + changeHex + encodePushData(preimage) + methodSelectorHex;
+        };
+
+        // First pass
+        const firstUnlock = await buildStatefulTerminalUnlock(termTx);
+        termTx = buildTerminalTx(firstUnlock);
+
+        // Second pass: recompute with final tx
+        const finalUnlock = await buildStatefulTerminalUnlock(termTx);
+        termTx = insertUnlockingScript(termTx, 0, finalUnlock);
+      } else if (needsOpPushTx || sigIndices.length > 0) {
+        // Stateless terminal with OP_PUSH_TX or Sig params
+        let opPushTxSigHex: string | undefined;
+        if (needsOpPushTx) {
+          const { sigHex, preimageHex } = computeOpPushTx(
+            termTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+          );
+          opPushTxSigHex = sigHex;
+          resolvedArgs[preimageIndex] = preimageHex;
+        }
+        for (const idx of sigIndices) {
+          resolvedArgs[idx] = await signer.sign(
+            termTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+          );
+        }
+        let realUnlock = this.buildUnlockingScript(methodName, resolvedArgs);
+        if (needsOpPushTx && opPushTxSigHex) {
+          realUnlock = encodePushData(opPushTxSigHex) + realUnlock;
+          const tmpTx = insertUnlockingScript(termTx, 0, realUnlock);
+          const { sigHex: finalSig, preimageHex: finalPreimage } = computeOpPushTx(
+            tmpTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+          );
+          resolvedArgs[preimageIndex] = finalPreimage;
+          for (const idx of sigIndices) {
+            resolvedArgs[idx] = await signer.sign(
+              tmpTx, 0, this.currentUtxo.script, this.currentUtxo.satoshis,
+            );
+          }
+          realUnlock = encodePushData(finalSig) +
+            this.buildUnlockingScript(methodName, resolvedArgs);
+        }
+        termTx = insertUnlockingScript(termTx, 0, realUnlock);
+      }
+
+      // Broadcast
+      const txid = await provider.broadcast(termTx);
+      this.currentUtxo = null; // terminal: contract is fully spent
+
+      const tx = await provider.getTransaction(txid).catch(() => ({
+        txid,
+        version: 1,
+        inputs: [],
+        outputs: [],
+        locktime: 0,
+        raw: termTx,
+      }));
+
+      return { txid, tx };
+    }
+
     // Build the initial unlocking script (with placeholders)
     let unlockingScript: string;
     if (needsOpPushTx) {
@@ -381,7 +511,7 @@ export class RunarContract {
     // For stateful contracts with change output support, the change output
     // is verified by the on-chain script (hashOutputs check).
     const feeRate = await provider.getFeeRate();
-    const changeScript = buildP2PKHScriptFromAddress(changeAddress);
+    const changeScript = buildP2PKHScript(changeAddress);
     const allFundingUtxos = await provider.getUtxos(address);
     const additionalUtxos = allFundingUtxos.filter(
       (u) => !(u.txid === this.currentUtxo!.txid && u.outputIndex === this.currentUtxo!.outputIndex),
@@ -896,27 +1026,6 @@ function encodePushData(dataHex: string): string {
   }
 }
 
-/**
- * Build a P2PKH locking script from an address string.
- * If the address is 40-char hex, treat as raw pubkey hash.
- * Otherwise, decode the Base58Check address to extract the 20-byte pubkey hash.
- */
-function buildP2PKHScriptFromAddress(address: string): string {
-  let pubKeyHash: string;
-
-  if (/^[0-9a-fA-F]{40}$/.test(address)) {
-    // Already a raw 20-byte pubkey hash in hex
-    pubKeyHash = address;
-  } else {
-    // Decode Base58Check address to extract the 20-byte pubkey hash
-    const decoded = Utils.fromBase58Check(address);
-    pubKeyHash = typeof decoded.data === 'string'
-      ? decoded.data
-      : Utils.toHex(decoded.data);
-  }
-
-  return '76a914' + pubKeyHash + '88ac';
-}
 
 /**
  * Insert an unlocking script into a raw transaction at a specific input index.

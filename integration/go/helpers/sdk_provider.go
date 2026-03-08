@@ -93,6 +93,15 @@ func (p *RPCProvider) GetNetwork() string {
 	return p.network
 }
 
+func (p *RPCProvider) GetRawTransaction(txid string) (string, error) {
+	raw, err := GetRawTransaction(txid)
+	if err != nil {
+		return "", err
+	}
+	rawHex, _ := raw["hex"].(string)
+	return rawHex, nil
+}
+
 func (p *RPCProvider) GetFeeRate() (int64, error) {
 	return 1, nil
 }

@@ -83,6 +83,17 @@ export class MockProvider implements Provider {
     return this.feeRate;
   }
 
+  async getRawTransaction(txid: string): Promise<string> {
+    const tx = this.transactions.get(txid);
+    if (!tx) {
+      throw new Error(`MockProvider: transaction ${txid} not found`);
+    }
+    if (!tx.raw) {
+      throw new Error(`MockProvider: transaction ${txid} has no raw hex`);
+    }
+    return tx.raw;
+  }
+
   /** Set the fee rate returned by getFeeRate() (for testing). */
   setFeeRate(rate: number): void {
     this.feeRate = rate;

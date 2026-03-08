@@ -126,5 +126,10 @@ class RPCProvider(Provider):
     def get_network(self) -> str:
         return self._network
 
+    def get_raw_transaction(self, txid: str) -> str:
+        raw_hex = self._rpc_call('getrawtransaction', txid, False)
+        assert isinstance(raw_hex, str)
+        return raw_hex
+
     def get_fee_rate(self) -> int:
         return 1

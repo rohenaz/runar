@@ -182,6 +182,13 @@ impl Provider for RPCProvider {
         &self.network
     }
 
+    fn get_raw_transaction(&self, txid: &str) -> Result<String, String> {
+        let result = self.rpc_call("getrawtransaction", &[Value::from(txid), Value::from(false)])?;
+        result.as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| "getrawtransaction: expected string".to_string())
+    }
+
     fn get_fee_rate(&self) -> Result<i64, String> {
         Ok(1)
     }

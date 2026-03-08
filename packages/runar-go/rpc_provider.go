@@ -230,6 +230,19 @@ func (p *RPCProvider) GetNetwork() string {
 	return p.network
 }
 
+// GetRawTransaction fetches the raw transaction hex using getrawtransaction (non-verbose).
+func (p *RPCProvider) GetRawTransaction(txid string) (string, error) {
+	result, err := p.rpcCall("getrawtransaction", txid, 0)
+	if err != nil {
+		return "", fmt.Errorf("getrawtransaction: %w", err)
+	}
+	var rawHex string
+	if err := json.Unmarshal(result, &rawHex); err != nil {
+		return "", fmt.Errorf("getrawtransaction parse: %w", err)
+	}
+	return rawHex, nil
+}
+
 // GetFeeRate returns 1 sat/byte (standard BSV fee rate).
 func (p *RPCProvider) GetFeeRate() (int64, error) {
 	return 1, nil

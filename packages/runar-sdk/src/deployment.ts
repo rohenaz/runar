@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import type { UTXO } from './types.js';
-import { Utils } from '@bsv/sdk';
+import { buildP2PKHScript } from './script-utils.js';
 
 /**
  * Build a raw transaction that creates an output with the given locking
@@ -197,29 +197,3 @@ export function selectUtxos(
   return selected;
 }
 
-/**
- * Build a standard P2PKH locking script from an address.
- *
- *   OP_DUP OP_HASH160 OP_PUSH20 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG
- *   76      a9         14        <20 bytes>    88              ac
- *
- * Accepts either a 40-char hex string (raw pubkey hash) or a Base58Check-
- * encoded BSV address which is decoded via @bsv/sdk.
- */
-function buildP2PKHScript(address: string): string {
-  let pubKeyHash: string;
-
-  if (/^[0-9a-fA-F]{40}$/.test(address)) {
-    // Already a raw 20-byte pubkey hash in hex
-    pubKeyHash = address;
-  } else {
-    // Decode Base58Check address to extract the 20-byte pubkey hash
-    const decoded = Utils.fromBase58Check(address);
-    pubKeyHash = typeof decoded.data === 'string'
-      ? decoded.data
-      : Utils.toHex(decoded.data);
-  }
-
-  // OP_DUP OP_HASH160 OP_PUSH20 <hash> OP_EQUALVERIFY OP_CHECKSIG
-  return '76a914' + pubKeyHash + '88ac';
-}
