@@ -99,6 +99,7 @@ export class WalletSigner implements Signer {
       hashToDirectlySign: sighash,
       protocolID: this.protocolID,
       keyID: this.keyID,
+      counterparty: 'self',
     });
 
     // 4. Convert to checksig format (DER + sighash flag byte)
