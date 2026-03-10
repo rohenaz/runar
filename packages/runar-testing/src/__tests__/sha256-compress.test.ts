@@ -10,16 +10,9 @@
  *   - Two-block message (55-byte input requiring 2 compression rounds)
  *   - Non-initial state (chaining compression calls)
  *
- * BLOCKED: These tests are disabled because the BSV SDK interpreter (v2.0.5)
- * has a bug where OP_LSHIFT throws "byte array longer than desired length"
- * when the shifted result exceeds the input byte length. The SHA-256 codegen
- * uses native OP_LSHIFT/OP_RSHIFT for efficiency (~6.5KB smaller scripts).
- * The scripts work correctly on real BSV nodes.
- * Fix tracked at: https://github.com/bsv-blockchain/ts-sdk/pull/494
  */
 
 import { describe, it, expect } from 'vitest';
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 import { ScriptExecutionContract } from '../script-execution.js';
 import { createHash } from 'crypto';
 
@@ -123,8 +116,7 @@ function nodeSha256(msgHex: string): string {
 
 // ---- Tests ----
 
-// Skipped: BSV SDK OP_LSHIFT bug — https://github.com/bsv-blockchain/ts-sdk/pull/494
-describe.skip('sha256Compress — script execution', () => {
+describe('sha256Compress — script execution', () => {
   describe('hardcoded known hashes', () => {
     it('SHA-256("abc")', () => {
       const block =

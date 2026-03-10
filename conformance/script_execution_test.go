@@ -1307,8 +1307,6 @@ func hexToBytes(h string) []byte {
 // ---------------------------------------------------------------------------
 // These tests verify sha256Compress codegen correctness using the Go BSV SDK
 // interpreter, which correctly handles OP_LSHIFT/OP_RSHIFT on byte arrays.
-// The equivalent TS SDK tests are skipped due to a bug in @bsv/sdk v2.0.5:
-// https://github.com/bsv-blockchain/ts-sdk/pull/494
 
 // compileRúnarInline compiles an inline Rúnar source string with constructor args.
 func compileRúnarInline(source, argsJSON, fileName string) (string, error) {

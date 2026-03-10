@@ -242,10 +242,6 @@ impl Emitter {
     }
 
     // --- ROTR/SHR using OP_LSHIFT/OP_RSHIFT (native BE byte-array shifts) ---
-    // These work correctly on real BSV nodes. The BSV SDK interpreter (v2.0.5)
-    // has a bug where OP_LSHIFT throws if the shifted value exceeds the input
-    // byte length (it should truncate). Fix tracked at:
-    // https://github.com/bsv-blockchain/ts-sdk/pull/494
 
     /// ROTR(x, n) on BE 4-byte value. [x_BE] -> [rotated_BE]. Net: 0. 7 ops.
     fn rotr_be(&mut self, n: usize) {
