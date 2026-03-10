@@ -57,6 +57,7 @@ export type {
   GetStateScript,
   CheckPreimage,
   AddOutput,
+  AddRawOutput,
 } from './anf-ir.js';
 
 // Stack IR types

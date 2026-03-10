@@ -284,11 +284,26 @@ export class RunarContract {
 
     const prepared = await this.prepareCall(methodName, args, options);
     const signer = this._signer!;
+
+    // In stateful contracts, user checkSig executes AFTER OP_CODESEPARATOR
+    // (checkPreimage is auto-injected at method entry), so use trimmed script.
+    // In stateless contracts, user checkSig is BEFORE OP_CODESEPARATOR, so use full script.
+    let mIdx = 0;
+    if (prepared._isStateful) {
+      const pubMethods = this.artifact.abi.methods.filter((m) => m.isPublic);
+      if (pubMethods.length > 1) {
+        const idx = pubMethods.findIndex((m) => m.name === methodName);
+        if (idx >= 0) mIdx = idx;
+      }
+    }
+    const sigSubscript = prepared._isStateful
+      ? this.getSubscriptForSigning(prepared._contractUtxo.script, mIdx)
+      : prepared._contractUtxo.script;
+
     const signatures: Record<number, string> = {};
     for (const idx of prepared.sigIndices) {
       signatures[idx] = await signer.sign(
-        prepared.txHex, 0,
-        prepared._contractUtxo.script,
+        prepared.txHex, 0, sigSubscript,
         prepared._contractUtxo.satoshis,
       );
     }
@@ -380,13 +395,17 @@ export class RunarContract {
 
     const needsOpPushTx = preimageIndex >= 0 || isStateful;
 
-    // Compute method selector (needed for both terminal and non-terminal)
+    // Compute method selector and method index (needed for both terminal and non-terminal)
     let methodSelectorHex = '';
+    let methodIndex = 0;
     if (isStateful) {
       const publicMethods = this.artifact.abi.methods.filter((m) => m.isPublic);
       if (publicMethods.length > 1) {
         const idx = publicMethods.findIndex((m) => m.name === methodName);
-        if (idx >= 0) methodSelectorHex = encodeScriptNumber(BigInt(idx));
+        if (idx >= 0) {
+          methodSelectorHex = encodeScriptNumber(BigInt(idx));
+          methodIndex = idx;
+        }
       }
     }
 
@@ -439,8 +458,8 @@ export class RunarContract {
       if (isStateful) {
         // Build stateful terminal unlock with PLACEHOLDER user sigs
         const buildUnlock = (tx: string): { unlock: string; opSig: string; preimage: string } => {
-          const { sigHex: opSig, preimageHex: preimage } = computeOpPushTx(
-            tx, 0, contractUtxo.script, contractUtxo.satoshis,
+          const { sigHex: opSig, preimageHex: preimage } = this.computeOpPushTxWithCodeSep(
+            tx, 0, contractUtxo.script, contractUtxo.satoshis, methodIndex,
           );
           let argsHex = '';
           for (const arg of resolvedArgs) argsHex += encodeArg(arg);
@@ -448,7 +467,7 @@ export class RunarContract {
           if (methodNeedsChange && changePKHHex) {
             changeHex = encodePushData(changePKHHex) + encodeArg(0n);
           }
-          const unlock = encodePushData(opSig) + argsHex + changeHex + encodePushData(preimage) + methodSelectorHex;
+          const unlock = this.buildStatefulPrefix(opSig) + argsHex + changeHex + encodePushData(preimage) + methodSelectorHex;
           return { unlock, opSig, preimage };
         };
 
@@ -464,8 +483,8 @@ export class RunarContract {
       } else if (needsOpPushTx || sigIndices.length > 0) {
         // Stateless terminal — keep placeholder sigs
         if (needsOpPushTx) {
-          const { sigHex, preimageHex } = computeOpPushTx(
-            termTx, 0, contractUtxo.script, contractUtxo.satoshis,
+          const { sigHex, preimageHex } = this.computeOpPushTxWithCodeSep(
+            termTx, 0, contractUtxo.script, contractUtxo.satoshis, methodIndex,
           );
           finalOpPushTxSig = sigHex;
           resolvedArgs[preimageIndex] = preimageHex;
@@ -473,15 +492,15 @@ export class RunarContract {
         // Don't sign Sig params — keep 72-byte placeholders
         let realUnlock = this.buildUnlockingScript(methodName, resolvedArgs);
         if (needsOpPushTx && finalOpPushTxSig) {
-          realUnlock = encodePushData(finalOpPushTxSig) + realUnlock;
+          realUnlock = this.buildStatefulPrefix(finalOpPushTxSig) + realUnlock;
           const tmpTx = insertUnlockingScript(termTx, 0, realUnlock);
-          const { sigHex: finalSig, preimageHex: finalPre } = computeOpPushTx(
-            tmpTx, 0, contractUtxo.script, contractUtxo.satoshis,
+          const { sigHex: finalSig, preimageHex: finalPre } = this.computeOpPushTxWithCodeSep(
+            tmpTx, 0, contractUtxo.script, contractUtxo.satoshis, methodIndex,
           );
           resolvedArgs[preimageIndex] = finalPre;
           finalOpPushTxSig = finalSig;
           finalPreimage = finalPre;
-          realUnlock = encodePushData(finalSig) +
+          realUnlock = this.buildStatefulPrefix(finalSig) +
             this.buildUnlockingScript(methodName, resolvedArgs);
         }
         termTx = insertUnlockingScript(termTx, 0, realUnlock);
@@ -632,15 +651,17 @@ export class RunarContract {
         tx: string, inputIdx: number, subscript: string, sats: number,
         argsOverride?: unknown[], txChangeAmount?: number,
       ): Promise<{ unlock: string; opSig: string; preimage: string }> => {
-        const { sigHex: opSig, preimageHex: preimage } = computeOpPushTx(
-          tx, inputIdx, subscript, sats,
+        const { sigHex: opSig, preimageHex: preimage } = this.computeOpPushTxWithCodeSep(
+          tx, inputIdx, subscript, sats, methodIndex,
         );
         const baseArgs = argsOverride ?? resolvedArgs;
         const inputArgs = [...baseArgs];
         // Only sign Sig params for extra inputs, not the primary
         if (inputIdx > 0) {
+          // Stateful: user checkSig is AFTER OP_CODESEPARATOR — use trimmed script.
+          const trimmedSubscript = this.getSubscriptForSigning(subscript, methodIndex);
           for (const idx of sigIndices) {
-            inputArgs[idx] = await signer.sign(tx, inputIdx, subscript, sats);
+            inputArgs[idx] = await signer.sign(tx, inputIdx, trimmedSubscript, sats);
           }
         }
         if (prevoutsIndices.length > 0) {
@@ -666,7 +687,7 @@ export class RunarContract {
         if (methodNeedsNewAmount) {
           newAmountHex = encodeArg(BigInt(newSatoshis ?? this.currentUtxo!.satoshis));
         }
-        const unlock = encodePushData(opSig) + argsHex + changeHex + newAmountHex + encodePushData(preimage) + methodSelectorHex;
+        const unlock = this.buildStatefulPrefix(opSig, methodNeedsChange) + argsHex + changeHex + newAmountHex + encodePushData(preimage) + methodSelectorHex;
         return { unlock, opSig, preimage };
       };
 
@@ -747,8 +768,8 @@ export class RunarContract {
     } else if (needsOpPushTx || sigIndices.length > 0) {
       // Stateless: keep placeholder sigs, compute OP_PUSH_TX
       if (needsOpPushTx) {
-        const { sigHex, preimageHex } = computeOpPushTx(
-          signedTx, 0, contractUtxo.script, contractUtxo.satoshis,
+        const { sigHex, preimageHex } = this.computeOpPushTxWithCodeSep(
+          signedTx, 0, contractUtxo.script, contractUtxo.satoshis, methodIndex,
         );
         finalOpPushTxSig = sigHex;
         resolvedArgs[preimageIndex] = preimageHex;
@@ -756,15 +777,15 @@ export class RunarContract {
       // Don't sign Sig params — keep placeholders
       let realUnlockingScript = this.buildUnlockingScript(methodName, resolvedArgs);
       if (needsOpPushTx && finalOpPushTxSig) {
-        realUnlockingScript = encodePushData(finalOpPushTxSig) + realUnlockingScript;
+        realUnlockingScript = this.buildStatefulPrefix(finalOpPushTxSig) + realUnlockingScript;
         const tmpTx = insertUnlockingScript(signedTx, 0, realUnlockingScript);
-        const { sigHex: finalSig, preimageHex: finalPre } = computeOpPushTx(
-          tmpTx, 0, contractUtxo.script, contractUtxo.satoshis,
+        const { sigHex: finalSig, preimageHex: finalPre } = this.computeOpPushTxWithCodeSep(
+          tmpTx, 0, contractUtxo.script, contractUtxo.satoshis, methodIndex,
         );
         resolvedArgs[preimageIndex] = finalPre;
         finalOpPushTxSig = finalSig;
         finalPreimage = finalPre;
-        realUnlockingScript = encodePushData(finalSig) +
+        realUnlockingScript = this.buildStatefulPrefix(finalSig) +
           this.buildUnlockingScript(methodName, resolvedArgs);
       }
       signedTx = insertUnlockingScript(signedTx, 0, realUnlockingScript);
@@ -843,7 +864,7 @@ export class RunarContract {
         newAmountHex = encodeArg(BigInt(prepared._newAmount));
       }
       primaryUnlock =
-        encodePushData(prepared.opPushTxSig) +
+        this.buildStatefulPrefix(prepared.opPushTxSig, prepared._methodNeedsChange) +
         argsHex +
         changeHex +
         newAmountHex +
@@ -854,7 +875,7 @@ export class RunarContract {
       if (prepared._preimageIndex >= 0) {
         resolvedArgs[prepared._preimageIndex] = prepared.preimage;
       }
-      primaryUnlock = encodePushData(prepared.opPushTxSig) +
+      primaryUnlock = this.buildStatefulPrefix(prepared.opPushTxSig) +
         this.buildUnlockingScript(prepared._methodName, resolvedArgs);
     } else {
       primaryUnlock = this.buildUnlockingScript(prepared._methodName, resolvedArgs);
@@ -1000,6 +1021,95 @@ export class RunarContract {
     }
 
     return script;
+  }
+
+  /**
+   * Get the code script hex (locking script without state) for use as _codePart.
+   * Returns the code portion that the on-chain contract uses for output reconstruction.
+   */
+  private getCodePartHex(): string {
+    return this._codeScript ?? this.buildCodeScript();
+  }
+
+  /**
+   * Adjust a code separator byte offset from the base (template) script to
+   * the constructor-arg-substituted script. Constructor slots replace OP_0
+   * (1 byte) with the encoded push data, shifting all subsequent byte offsets.
+   */
+  private adjustCodeSepOffset(baseOffset: number): number {
+    if (!this.artifact.constructorSlots || this.artifact.constructorSlots.length === 0) {
+      return baseOffset;
+    }
+    let shift = 0;
+    for (const slot of this.artifact.constructorSlots) {
+      if (slot.byteOffset < baseOffset) {
+        const encoded = encodeArg(this.constructorArgs[slot.paramIndex]);
+        shift += encoded.length / 2 - 1; // encoded bytes minus the 1-byte OP_0 placeholder
+      }
+    }
+    return baseOffset + shift;
+  }
+
+  /**
+   * Get the subscript trimmed at the OP_CODESEPARATOR for a given method.
+   * Used for BIP-143 sighash computation for user CHECKSIG in stateful contracts
+   * (where checkSig executes AFTER OP_CODESEPARATOR).
+   */
+  private getSubscriptForSigning(fullScript: string, methodIndex?: number): string {
+    const indices = this.artifact.codeSeparatorIndices;
+    let codeSepIdx: number | undefined;
+    if (indices && methodIndex !== undefined && methodIndex < indices.length) {
+      codeSepIdx = indices[methodIndex];
+    } else {
+      codeSepIdx = this.artifact.codeSeparatorIndex;
+    }
+    if (codeSepIdx !== undefined) {
+      codeSepIdx = this.adjustCodeSepOffset(codeSepIdx);
+      // Skip past the separator byte (+1 byte = +2 hex chars)
+      return fullScript.slice((codeSepIdx + 1) * 2);
+    }
+    return fullScript;
+  }
+
+  /**
+   * Wrap computeOpPushTx to automatically pass the correct codeSeparatorIndex.
+   * For multi-method contracts, each method has its own separator at a different
+   * byte offset. Uses codeSeparatorIndices[methodIndex] if available, otherwise
+   * falls back to the single codeSeparatorIndex.
+   */
+  private computeOpPushTxWithCodeSep(
+    txHex: string,
+    inputIndex: number,
+    subscript: string,
+    satoshis: number,
+    methodIndex?: number,
+  ): { sigHex: string; preimageHex: string } {
+    let codeSepIdx = this.artifact.codeSeparatorIndex;
+    const indices = this.artifact.codeSeparatorIndices;
+    if (indices && methodIndex !== undefined && methodIndex < indices.length) {
+      codeSepIdx = indices[methodIndex];
+    }
+    if (codeSepIdx !== undefined) {
+      codeSepIdx = this.adjustCodeSepOffset(codeSepIdx);
+    }
+    return computeOpPushTx(
+      txHex, inputIndex, subscript, satoshis,
+      codeSepIdx,
+    );
+  }
+
+  /**
+   * Build the prefix for an unlocking script: optionally _codePart + _opPushTxSig.
+   * needsCodePart should be true only when the method constructs continuation outputs
+   * (non-terminal stateful calls). Terminal and stateless methods don't use _codePart.
+   */
+  private buildStatefulPrefix(opSig: string, needsCodePart: boolean = false): string {
+    let prefix = '';
+    if (needsCodePart && this.artifact.codeSeparatorIndex !== undefined) {
+      prefix += encodePushData(this.getCodePartHex());
+    }
+    prefix += encodePushData(opSig);
+    return prefix;
   }
 
   // -------------------------------------------------------------------------

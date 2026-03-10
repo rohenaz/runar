@@ -90,7 +90,12 @@ pub enum ANFValue {
     },
 
     #[serde(rename = "unary_op")]
-    UnaryOp { op: String, operand: String },
+    UnaryOp {
+        op: String,
+        operand: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result_type: Option<String>,
+    },
 
     #[serde(rename = "call")]
     Call {
@@ -143,6 +148,13 @@ pub enum ANFValue {
         state_values: Vec<String>,
         #[serde(default)]
         preimage: String,
+    },
+
+    #[serde(rename = "add_raw_output")]
+    AddRawOutput {
+        satoshis: String,
+        #[serde(rename = "scriptBytes")]
+        script_bytes: String,
     },
 }
 

@@ -113,6 +113,9 @@ type ANFValue struct {
 	// add_output
 	Satoshis    string   `json:"satoshis,omitempty"`
 	StateValues []string `json:"stateValues,omitempty"`
+
+	// add_raw_output
+	ScriptBytes string `json:"scriptBytes,omitempty"`
 }
 
 // DecodeConstants walks the program and decodes the RawValue fields in

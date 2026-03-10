@@ -138,6 +138,8 @@ class EmitResult:
     script_hex: str = ""
     script_asm: str = ""
     constructor_slots: list[ConstructorSlot] = field(default_factory=list)
+    code_separator_index: int = -1
+    code_separator_indices: list[int] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +152,8 @@ class _EmitContext:
         self.asm_parts: list[str] = []
         self.byte_length: int = 0
         self.constructor_slots: list[ConstructorSlot] = []
+        self.code_separator_index: int = -1
+        self.code_separator_indices: list[int] = []
 
     def append_hex(self, h: str) -> None:
         self.hex_parts.append(h)
@@ -162,6 +166,9 @@ class _EmitContext:
         b = OPCODES.get(name)
         if b is None:
             raise ValueError(f"unknown opcode: {name}")
+        if name == "OP_CODESEPARATOR":
+            self.code_separator_index = self.byte_length
+            self.code_separator_indices.append(self.byte_length)
         self.append_hex(f"{b:02x}")
         self.append_asm(name)
 
@@ -414,6 +421,8 @@ def emit(methods: list[StackMethod]) -> EmitResult:
         script_hex=ctx.get_hex(),
         script_asm=ctx.get_asm(),
         constructor_slots=ctx.constructor_slots,
+        code_separator_index=ctx.code_separator_index,
+        code_separator_indices=ctx.code_separator_indices,
     )
 
 
@@ -426,4 +435,6 @@ def emit_method(method: StackMethod) -> EmitResult:
         script_hex=ctx.get_hex(),
         script_asm=ctx.get_asm(),
         constructor_slots=ctx.constructor_slots,
+        code_separator_index=ctx.code_separator_index,
+        code_separator_indices=ctx.code_separator_indices,
     )

@@ -547,6 +547,16 @@ class _LowerCtx:
                 _is_byte_typed_expr(expr.left, self) or _is_byte_typed_expr(expr.right, self)
             ):
                 result_type = "bytes"
+            # For +, annotate byte-typed operands so stack lowering can emit OP_CAT.
+            if expr.op == "+" and (
+                _is_byte_typed_expr(expr.left, self) or _is_byte_typed_expr(expr.right, self)
+            ):
+                result_type = "bytes"
+            # For bitwise &, |, ^, annotate byte-typed operands.
+            if expr.op in ("&", "|", "^") and (
+                _is_byte_typed_expr(expr.left, self) or _is_byte_typed_expr(expr.right, self)
+            ):
+                result_type = "bytes"
 
             return self.emit(ANFValue(
                 kind="bin_op", op=expr.op,
@@ -556,7 +566,11 @@ class _LowerCtx:
 
         if isinstance(expr, UnaryExpr):
             operand_ref = self.lower_expr_to_ref(expr.operand)
-            return self.emit(ANFValue(kind="unary_op", op=expr.op, operand=operand_ref))
+            unary_val = ANFValue(kind="unary_op", op=expr.op, operand=operand_ref)
+            # For ~, annotate byte-typed operands so downstream passes know the result is bytes.
+            if expr.op == "~" and _is_byte_typed_expr(expr.operand, self):
+                unary_val.result_type = "bytes"
+            return self.emit(unary_val)
 
         if isinstance(expr, CallExpr):
             return self._lower_call_expr(expr)
@@ -656,8 +670,16 @@ class _LowerCtx:
             arg_refs = self._lower_args(e.args)
             satoshis = arg_refs[0]
             state_values = arg_refs[1:]
-            preimage_ref = self.emit(ANFValue(kind="load_param", name="txPreimage"))
-            ref = self.emit(ANFValue(kind="add_output", satoshis=satoshis, state_values=state_values, preimage=preimage_ref))
+            ref = self.emit(ANFValue(kind="add_output", satoshis=satoshis, state_values=state_values, preimage=""))
+            self.add_output_ref(ref)
+            return ref
+
+        # this.addRawOutput(satoshis, scriptBytes) via PropertyAccessExpr
+        if isinstance(callee, PropertyAccessExpr) and callee.property == "addRawOutput":
+            arg_refs = self._lower_args(e.args)
+            satoshis = arg_refs[0]
+            script_bytes_ref = arg_refs[1]
+            ref = self.emit(ANFValue(kind="add_raw_output", satoshis=satoshis, script_bytes=script_bytes_ref))
             self.add_output_ref(ref)
             return ref
 
@@ -671,8 +693,21 @@ class _LowerCtx:
                 arg_refs = self._lower_args(e.args)
                 satoshis = arg_refs[0]
                 state_values = arg_refs[1:]
-                preimage_ref = self.emit(ANFValue(kind="load_param", name="txPreimage"))
-                ref = self.emit(ANFValue(kind="add_output", satoshis=satoshis, state_values=state_values, preimage=preimage_ref))
+                ref = self.emit(ANFValue(kind="add_output", satoshis=satoshis, state_values=state_values, preimage=""))
+                self.add_output_ref(ref)
+                return ref
+
+        # this.addRawOutput(satoshis, scriptBytes) via MemberExpr
+        if isinstance(callee, MemberExpr):
+            if (
+                isinstance(callee.object, Identifier)
+                and callee.object.name == "this"
+                and callee.property == "addRawOutput"
+            ):
+                arg_refs = self._lower_args(e.args)
+                satoshis = arg_refs[0]
+                script_bytes_ref = arg_refs[1]
+                ref = self.emit(ANFValue(kind="add_raw_output", satoshis=satoshis, script_bytes=script_bytes_ref))
                 self.add_output_ref(ref)
                 return ref
 
@@ -921,10 +956,10 @@ def _expr_has_add_output(expr: Expression | None) -> bool:
         return False
     if isinstance(expr, CallExpr):
         callee = expr.callee
-        if isinstance(callee, PropertyAccessExpr) and callee.property == "addOutput":
+        if isinstance(callee, PropertyAccessExpr) and callee.property in ("addOutput", "addRawOutput"):
             return True
         if isinstance(callee, MemberExpr):
-            if isinstance(callee.object, Identifier) and callee.object.name == "this" and callee.property == "addOutput":
+            if isinstance(callee.object, Identifier) and callee.object.name == "this" and callee.property in ("addOutput", "addRawOutput"):
                 return True
     return False
 

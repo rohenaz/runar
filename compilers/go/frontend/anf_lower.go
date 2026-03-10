@@ -58,6 +58,8 @@ var byteReturningFunctions = map[string]bool{
 	"ecNegate":           true,
 	"ecMakePoint":        true,
 	"ecEncodeCompressed": true,
+	"sha256Compress":     true,
+	"sha256Finalize":     true,
 }
 
 func isByteTypedExpr(expr Expression, ctx *lowerCtx) bool {
@@ -683,12 +685,25 @@ func (ctx *lowerCtx) lowerExprToRef(expr Expression) string {
 		if (e.Op == "===" || e.Op == "!==") && (isByteTypedExpr(e.Left, ctx) || isByteTypedExpr(e.Right, ctx)) {
 			resultType = "bytes"
 		}
+		// For +, annotate byte-typed operands so stack lowering can emit OP_CAT.
+		if e.Op == "+" && (isByteTypedExpr(e.Left, ctx) || isByteTypedExpr(e.Right, ctx)) {
+			resultType = "bytes"
+		}
+		// For bitwise &, |, ^, annotate byte-typed operands.
+		if (e.Op == "&" || e.Op == "|" || e.Op == "^") && (isByteTypedExpr(e.Left, ctx) || isByteTypedExpr(e.Right, ctx)) {
+			resultType = "bytes"
+		}
 
 		return ctx.emit(ir.ANFValue{Kind: "bin_op", Op: e.Op, Left: leftRef, Right: rightRef, ResultType: resultType})
 
 	case UnaryExpr:
 		operandRef := ctx.lowerExprToRef(e.Operand)
-		return ctx.emit(ir.ANFValue{Kind: "unary_op", Op: e.Op, Operand: operandRef})
+		unaryValue := ir.ANFValue{Kind: "unary_op", Op: e.Op, Operand: operandRef}
+		// For ~, annotate byte-typed operands so downstream passes know the result is bytes.
+		if e.Op == "~" && isByteTypedExpr(e.Operand, ctx) {
+			unaryValue.ResultType = "bytes"
+		}
+		return ctx.emit(unaryValue)
 
 	case CallExpr:
 		return ctx.lowerCallExpr(e)
@@ -805,8 +820,7 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 		argRefs := ctx.lowerArgs(e.Args)
 		satoshis := argRefs[0]
 		stateValues := argRefs[1:]
-		preimageRef := ctx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
-		ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues, Preimage: preimageRef})
+		ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues, Preimage: ""})
 		ctx.addOutputRef(ref)
 		return ref
 	}
@@ -815,8 +829,27 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 			argRefs := ctx.lowerArgs(e.Args)
 			satoshis := argRefs[0]
 			stateValues := argRefs[1:]
-			preimageRef := ctx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
-			ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues, Preimage: preimageRef})
+			ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues, Preimage: ""})
+			ctx.addOutputRef(ref)
+			return ref
+		}
+	}
+
+	// this.addRawOutput(satoshis, scriptBytes) -> special node
+	if pa, ok := callee.(PropertyAccessExpr); ok && pa.Property == "addRawOutput" {
+		argRefs := ctx.lowerArgs(e.Args)
+		satoshis := argRefs[0]
+		scriptBytes := argRefs[1]
+		ref := ctx.emit(ir.ANFValue{Kind: "add_raw_output", Satoshis: satoshis, ScriptBytes: scriptBytes})
+		ctx.addOutputRef(ref)
+		return ref
+	}
+	if me, ok := callee.(MemberExpr); ok {
+		if id, ok := me.Object.(Identifier); ok && id.Name == "this" && me.Property == "addRawOutput" {
+			argRefs := ctx.lowerArgs(e.Args)
+			satoshis := argRefs[0]
+			scriptBytes := argRefs[1]
+			ref := ctx.emit(ir.ANFValue{Kind: "add_raw_output", Satoshis: satoshis, ScriptBytes: scriptBytes})
 			ctx.addOutputRef(ref)
 			return ref
 		}
@@ -1101,11 +1134,11 @@ func stmtHasAddOutput(stmt Statement) bool {
 
 func exprHasAddOutput(expr Expression) bool {
 	if ce, ok := expr.(CallExpr); ok {
-		if pa, ok := ce.Callee.(PropertyAccessExpr); ok && pa.Property == "addOutput" {
+		if pa, ok := ce.Callee.(PropertyAccessExpr); ok && (pa.Property == "addOutput" || pa.Property == "addRawOutput") {
 			return true
 		}
 		if me, ok := ce.Callee.(MemberExpr); ok {
-			if id, ok := me.Object.(Identifier); ok && id.Name == "this" && me.Property == "addOutput" {
+			if id, ok := me.Object.(Identifier); ok && id.Name == "this" && (me.Property == "addOutput" || me.Property == "addRawOutput") {
 				return true
 			}
 		}

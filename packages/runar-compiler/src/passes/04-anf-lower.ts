@@ -29,6 +29,7 @@ import type {
   ANFValue,
   ANFProperty,
   BinOp,
+  ANFUnaryOp,
 } from '../ir/index.js';
 
 // ---------------------------------------------------------------------------
@@ -701,6 +702,12 @@ function lowerBinaryExpr(
       binOp.result_type = 'bytes';
     }
   }
+  // For bitwise &, |, ^, annotate byte-typed operands.
+  if (expr.op === '&' || expr.op === '|' || expr.op === '^') {
+    if (isByteTypedExpr(expr.left, ctx) || isByteTypedExpr(expr.right, ctx)) {
+      binOp.result_type = 'bytes';
+    }
+  }
   return ctx.emit(binOp);
 }
 
@@ -709,7 +716,12 @@ function lowerUnaryExpr(
   ctx: LoweringContext,
 ): string {
   const operandRef = lowerExprToRef(expr.operand, ctx);
-  return ctx.emit({ kind: 'unary_op', op: expr.op, operand: operandRef });
+  const unaryOp: ANFUnaryOp = { kind: 'unary_op', op: expr.op, operand: operandRef };
+  // For ~, annotate byte-typed operands so downstream passes know the result is bytes.
+  if (expr.op === '~' && isByteTypedExpr(expr.operand, ctx)) {
+    unaryOp.result_type = 'bytes';
+  }
+  return ctx.emit(unaryOp);
 }
 
 function lowerCallExpr(
@@ -747,8 +759,17 @@ function lowerCallExpr(
     const argRefs = expr.args.map(arg => lowerExprToRef(arg, ctx));
     const satoshis = argRefs[0]!;
     const stateValues = argRefs.slice(1);
-    const preimageRef = ctx.emit({ kind: 'load_param', name: 'txPreimage' });
-    const ref = ctx.emit({ kind: 'add_output', satoshis, stateValues, preimage: preimageRef });
+    const ref = ctx.emit({ kind: 'add_output', satoshis, stateValues, preimage: '' });
+    ctx.addOutputRef(ref);
+    return ref;
+  }
+
+  // this.addRawOutput(satoshis, scriptBytes) -> special node
+  if (callee.kind === 'property_access' && callee.property === 'addRawOutput') {
+    const argRefs = expr.args.map(arg => lowerExprToRef(arg, ctx));
+    const satoshis = argRefs[0]!;
+    const scriptBytes = argRefs[1]!;
+    const ref = ctx.emit({ kind: 'add_raw_output', satoshis, scriptBytes });
     ctx.addOutputRef(ref);
     return ref;
   }
@@ -1036,7 +1057,8 @@ function stmtHasAddOutput(stmt: Statement): boolean {
 }
 
 function exprHasAddOutput(expr: Expression): boolean {
-  if (expr.kind === 'call_expr' && expr.callee.kind === 'property_access' && expr.callee.property === 'addOutput') {
+  if (expr.kind === 'call_expr' && expr.callee.kind === 'property_access' &&
+      (expr.callee.property === 'addOutput' || expr.callee.property === 'addRawOutput')) {
     return true;
   }
   return false;

@@ -25,6 +25,7 @@ import {
   emitEcOnCurve, emitEcModReduce, emitEcEncodeCompressed,
   emitEcMakePoint, emitEcPointX, emitEcPointY,
 } from './ec-codegen.js';
+import { emitSha256Compress, emitSha256Finalize } from './sha256-codegen.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -241,7 +242,11 @@ function collectRefs(value: ANFValue): string[] {
       }
       break;
     case 'add_output':
-      refs.push(value.satoshis, ...value.stateValues, value.preimage);
+      refs.push(value.satoshis, ...value.stateValues);
+      if (value.preimage) refs.push(value.preimage);
+      break;
+    case 'add_raw_output':
+      refs.push(value.satoshis, value.scriptBytes);
       break;
     case 'bin_op':
       refs.push(value.left, value.right);
@@ -342,6 +347,91 @@ class LoweringContext {
   private emitOp(stackOp: StackOp): void {
     this.ops.push(stackOp);
     this.trackDepth();
+  }
+
+  /**
+   * Emit a Bitcoin varint encoding of the length on top of the stack.
+   *
+   * Expects stack: [..., script, len]
+   * Leaves stack:  [..., script, varint_bytes]
+   *
+   * Bitcoin varint format:
+   *   - len < 253:    1 byte (unsigned)
+   *   - len >= 253:   0xfd + 2 bytes unsigned LE
+   *
+   * OP_NUM2BIN uses sign-magnitude encoding, so values 128-255 need 2 bytes
+   * to avoid the sign bit ambiguity. To produce a correct 1-byte unsigned
+   * varint, we use OP_NUM2BIN 2 to get a 2-byte sign-magnitude result and
+   * then SPLIT to extract only the low byte.
+   *
+   * Similarly, for 2-byte unsigned LE varints, values >= 32768 would need
+   * 3 bytes in sign-magnitude. We use OP_NUM2BIN 4 and SPLIT to extract
+   * the low 2 bytes.
+   */
+  private emitVarintEncoding(): void {
+    // Stack: [..., script, len]
+    this.emitOp({ op: 'dup' }); // [script, len, len]
+    this.stackMap.push(null);
+    this.emitOp({ op: 'push', value: 253n }); // [script, len, len, 253]
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_LESSTHAN' }); // [script, len, isSmall]
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+
+    this.emitOp({ op: 'opcode', code: 'OP_IF' });
+    this.stackMap.pop(); // pop condition
+
+    // Then: 1-byte varint (len < 253)
+    // Use NUM2BIN 2 to avoid sign-magnitude issue for values 128-252,
+    // then take only the first (low) byte via SPLIT.
+    this.emitOp({ op: 'push', value: 2n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' }); // [script, len_2bytes]
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+    this.emitOp({ op: 'push', value: 1n }); // [script, len_2bytes, 1]
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [script, lowByte, highByte]
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null); // lowByte
+    this.stackMap.push(null); // highByte
+    this.emitOp({ op: 'drop' }); // [script, lowByte]
+    this.stackMap.pop();
+
+    this.emitOp({ op: 'opcode', code: 'OP_ELSE' });
+
+    // Else: 0xfd + 2-byte LE varint (len >= 253)
+    // Use NUM2BIN 4 to avoid sign-magnitude issue for values >= 32768,
+    // then take only the first 2 (low) bytes via SPLIT.
+    this.emitOp({ op: 'push', value: 4n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' }); // [script, len_4bytes]
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+    this.emitOp({ op: 'push', value: 2n }); // [script, len_4bytes, 2]
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [script, low2bytes, high2bytes]
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null); // low2bytes
+    this.stackMap.push(null); // high2bytes
+    this.emitOp({ op: 'drop' }); // [script, low2bytes]
+    this.stackMap.pop();
+    this.emitOp({ op: 'push', value: new Uint8Array([0xfd]) });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'swap' });
+    this.stackMap.swap();
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
+    this.stackMap.push(null);
+
+    this.emitOp({ op: 'opcode', code: 'OP_ENDIF' });
+    // --- Stack: [..., script, varint] ---
   }
 
   /**
@@ -506,6 +596,9 @@ class LoweringContext {
         break;
       case 'add_output':
         this.lowerAddOutput(name, value.satoshis, value.stateValues, value.preimage, bindingIndex, lastUses);
+        break;
+      case 'add_raw_output':
+        this.lowerAddRawOutput(name, value.satoshis, value.scriptBytes, bindingIndex, lastUses);
         break;
     }
   }
@@ -759,6 +852,16 @@ class LoweringContext {
     if (func.startsWith('verifySLHDSA_SHA2_')) {
       const paramKey = func.replace('verifySLHDSA_', '');
       this.lowerVerifySLHDSA(bindingName, paramKey, args, bindingIndex, lastUses);
+      return;
+    }
+
+    if (func === 'sha256Compress') {
+      this.lowerSha256Compress(bindingName, args, bindingIndex, lastUses);
+      return;
+    }
+
+    if (func === 'sha256Finalize') {
+      this.lowerSha256Finalize(bindingName, args, bindingIndex, lastUses);
       return;
     }
 
@@ -1293,11 +1396,8 @@ class LoweringContext {
    *   amount(8LE) + varint(scriptLen) + codePart + OP_RETURN + stateBytes
    * then returns hash256 of the result.
    *
-   * Key insight: the continuation script has the same length as the current
-   * script (fixed-size state serialization), so the varint encoding is
-   * identical. We extract `varint + scriptCode + amount` from the preimage,
-   * strip the current state + OP_RETURN from the scriptCode, append new
-   * OP_RETURN + stateBytes, prepend the amount, and hash.
+   * Uses _codePart implicit parameter for the code portion and extracts
+   * the amount from the preimage's scriptCode field.
    */
   private lowerComputeStateOutputHash(
     bindingName: string,
@@ -1305,143 +1405,103 @@ class LoweringContext {
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
-    // Compute fixed state serialization length from non-readonly properties.
-    const stateProps = this._properties.filter(p => !p.readonly);
-    let stateLen = 0;
-    for (const prop of stateProps) {
-      switch (prop.type) {
-        case 'bigint': stateLen += 8; break;
-        case 'boolean': stateLen += 1; break;
-        case 'PubKey': stateLen += 33; break;
-        case 'Addr': stateLen += 20; break;
-        case 'Sha256': stateLen += 32; break;
-        case 'Point': stateLen += 64; break;
-        default:
-          throw new Error(`computeStateOutputHash: unsupported mutable property type '${prop.type}' for property '${prop.name}'`);
-      }
-    }
-
     const preimageRef = args[0]!;
     const stateBytesRef = args[1]!;
 
-    // Bring stateBytes to stack, then preimage on top.
+    // Bring stateBytes to stack first.
     const stateLast = this.isLastUse(stateBytesRef, bindingIndex, lastUses);
     this.bringToTop(stateBytesRef, stateLast);
+
+    // Extract amount from preimage for the continuation output.
+    // We still need the amount from the current UTXO. Extract from preimage:
+    // BIP-143 preimage has amount at offset (104 + varint + scriptLen).
+    // Since the varint+scriptCode length varies, use end-relative:
+    // Last 44 bytes = nSeq(4) + hashOutputs(32) + nLocktime(4) + sighashType(4).
+    // Amount(8) is right before that.
     const preLast = this.isLastUse(preimageRef, bindingIndex, lastUses);
     this.bringToTop(preimageRef, preLast);
 
-    // --- Physical stack: [..., stateBytes, preimage] ---
-    // stackMap: [..., stateBytes_entry, preimage_entry]
-
-    // This function does NOT go through lowerExtractor, so stackMap must
-    // accurately track the physical stack.  Conventions:
-    //   OP_SIZE:  keeps value, pushes size → push(null) once
-    //   OP_SPLIT: pops value+position, pushes left+right → pop,pop,push,push
-    //   OP_CAT:   pops a+b, pushes a||b → pop,pop,push
-    //   OP_NIP:   removes second-from-top → pop,pop,push
-    //   OP_HASH256: replaces top → (no stackMap change)
-
-    // Step 1: Extract middle of preimage: varint + scriptCode + amount.
-    // Split at 104 and drop prefix.
-    this.emitOp({ op: 'push', value: 104n });
+    // Extract amount: last 52 bytes, take 8 bytes at offset 0.
+    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
     this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [prefix, rest]
-    this.stackMap.pop(); // pop 104
-    this.stackMap.pop(); // pop preimage
+    this.emitOp({ op: 'push', value: 52n }); // 8 (amount) + 44 (tail)
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [prefix, amountAndTail]
+    this.stackMap.pop();
+    this.stackMap.pop();
     this.stackMap.push(null); // prefix
-    this.stackMap.push(null); // rest
-    this.emitOp({ op: 'nip' }); // drop prefix, keep rest
-    this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null); // rest
-
-    // Drop last 44 bytes (nSeq+hashOutputs+nLocktime+sighashType).
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' }); // [rest, restLen]
-    this.stackMap.push(null); // restLen
-    this.emitOp({ op: 'push', value: 44n }); // [rest, restLen, 44]
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' }); // [rest, restLen-44]
+    this.stackMap.push(null); // amountAndTail
+    this.emitOp({ op: 'nip' }); // drop prefix
     this.stackMap.pop();
     this.stackMap.pop();
     this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [middle, tail44]
-    this.stackMap.pop(); // pop position
-    this.stackMap.pop(); // pop rest
-    this.stackMap.push(null); // middle
-    this.stackMap.push(null); // tail44
+    this.emitOp({ op: 'push', value: 8n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [amount(8), tail(44)]
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null); // amount
+    this.stackMap.push(null); // tail
     this.emitOp({ op: 'drop' }); // drop tail
     this.stackMap.pop();
-    // --- Stack: [..., stateBytes, middle(varint+scriptCode+amount)] ---
+    // --- Stack: [..., stateBytes, amount(8LE)] ---
 
-    // Step 2: Split off amount (last 8 bytes), save to altstack.
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' }); // [middle, middleLen]
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: 8n }); // [middle, middleLen, 8]
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' }); // [middle, middleLen-8]
+    // Save amount to altstack
+    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
     this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [varint+scriptCode, amount]
-    this.stackMap.pop(); // pop position
-    this.stackMap.pop(); // pop middle
-    this.stackMap.push(null); // varint+scriptCode
-    this.stackMap.push(null); // amount
-    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // amount → altstack
-    this.stackMap.pop();
-    // --- Stack: [..., stateBytes, varint+scriptCode] | alt: [amount] ---
 
-    // Step 3: Strip current state + OP_RETURN from end (stateLen + 1 bytes).
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' }); // [varint+sc, len]
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: BigInt(stateLen + 1) }); // [varint+sc, len, N]
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' }); // [varint+sc, len-N]
-    this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [varint+code, opReturn+state]
-    this.stackMap.pop(); // pop position
-    this.stackMap.pop(); // pop varint+sc
-    this.stackMap.push(null); // varint+code
-    this.stackMap.push(null); // opReturn+state
-    this.emitOp({ op: 'drop' }); // discard old state
-    this.stackMap.pop();
-    // --- Stack: [..., stateBytes, varint+codePart] ---
+    // Bring _codePart to top (PICK — never consume, reused across outputs)
+    this.bringToTop('_codePart', false);
+    // --- Stack: [..., stateBytes, codePart] ---
 
-    // Step 4: Append OP_RETURN byte (0x6a as data).
-    this.emitOp({ op: 'push', value: new Uint8Array([0x6a]) }); // [stateBytes, varint+code, 0x6a]
+    // Append OP_RETURN + stateBytes
+    this.emitOp({ op: 'push', value: new Uint8Array([0x6a]) });
     this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_CAT' }); // [stateBytes, varint+code+OP_RETURN]
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
     this.stackMap.pop();
     this.stackMap.pop();
     this.stackMap.push(null);
-    // --- Stack: [..., stateBytes, varint+codePart+OP_RETURN] ---
+    // --- Stack: [..., stateBytes, codePart+OP_RETURN] ---
 
-    // Step 5: Swap and CAT to append stateBytes.
     this.emitOp({ op: 'swap' });
     this.stackMap.swap();
-    // --- Stack: [..., varint+codePart+OP_RETURN, stateBytes] ---
-    this.emitOp({ op: 'opcode', code: 'OP_CAT' }); // a||b where a=varint+code+OR, b=stateBytes
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
     this.stackMap.pop();
     this.stackMap.pop();
     this.stackMap.push(null);
-    // --- Stack: [..., varint+newScript] ---
+    // --- Stack: [..., codePart+OP_RETURN+stateBytes] ---
 
-    // Step 6: Prepend amount from altstack.
+    // Compute varint prefix for script length
+    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
+    this.stackMap.push(null);
+    this.emitVarintEncoding();
+
+    // Prepend varint to script
+    this.emitOp({ op: 'swap' });
+    this.stackMap.swap();
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
+    this.stackMap.push(null);
+    // --- Stack: [..., varint+script] ---
+
+    // Prepend amount from altstack
     this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' });
     this.stackMap.push(null);
     this.emitOp({ op: 'swap' });
     this.stackMap.swap();
-    this.emitOp({ op: 'opcode', code: 'OP_CAT' }); // amount || varint+newScript
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
     this.stackMap.pop();
     this.stackMap.pop();
     this.stackMap.push(null);
-    // --- Stack: [..., fullOutputSerialization] ---
+    // --- Stack: [..., amount+varint+script] ---
 
-    // Step 7: Hash with SHA256d (replaces top in-place).
+    // Hash with SHA256d
     this.emitOp({ op: 'opcode', code: 'OP_HASH256' });
-    // --- Stack: [..., hash256(output)] ---
 
     this.stackMap.pop();
     this.stackMap.push(bindingName);
@@ -1461,29 +1521,21 @@ class LoweringContext {
   ): void {
     // computeStateOutput(preimage, stateBytes, newAmount)
     // Builds the continuation output using _newAmount instead of sourceSatoshis.
-    const stateProps = this._properties.filter(p => !p.readonly);
-    let stateLen = 0;
-    for (const prop of stateProps) {
-      switch (prop.type) {
-        case 'bigint': stateLen += 8; break;
-        case 'boolean': stateLen += 1; break;
-        case 'PubKey': stateLen += 33; break;
-        case 'Addr': stateLen += 20; break;
-        case 'Sha256': stateLen += 32; break;
-        case 'Point': stateLen += 64; break;
-        default:
-          throw new Error(`computeStateOutput: unsupported type '${prop.type}' for property '${prop.name}'`);
-      }
-    }
+    // Uses _codePart implicit parameter instead of extracting from preimage.
 
     const preimageRef = args[0]!;
     const stateBytesRef = args[1]!;
     const newAmountRef = args[2]!;
 
-    // Bring newAmount, stateBytes, then preimage to top.
+    // Consume preimage ref (no longer needed — we use _codePart and _newAmount).
+    const preLast = this.isLastUse(preimageRef, bindingIndex, lastUses);
+    this.bringToTop(preimageRef, preLast);
+    this.emitOp({ op: 'drop' });
+    this.stackMap.pop();
+
+    // Step 1: Convert _newAmount to 8-byte LE and save to altstack.
     const amountLast = this.isLastUse(newAmountRef, bindingIndex, lastUses);
     this.bringToTop(newAmountRef, amountLast);
-    // Convert _newAmount (script number) to 8-byte LE and save to altstack.
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -1492,76 +1544,44 @@ class LoweringContext {
     this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
     this.stackMap.pop();
 
+    // Step 2: Bring stateBytes to stack.
     const stateLast = this.isLastUse(stateBytesRef, bindingIndex, lastUses);
     this.bringToTop(stateBytesRef, stateLast);
-    const preLast = this.isLastUse(preimageRef, bindingIndex, lastUses);
-    this.bringToTop(preimageRef, preLast);
 
-    // Step 1: Extract middle of preimage: varint + scriptCode + amount.
-    this.emitOp({ op: 'push', value: 104n });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
-    this.stackMap.pop(); this.stackMap.pop();
-    this.stackMap.push(null); this.stackMap.push(null);
-    this.emitOp({ op: 'nip' });
-    this.stackMap.pop(); this.stackMap.pop();
-    this.stackMap.push(null);
+    // Step 3: Bring _codePart to top (PICK — never consume, reused across outputs)
+    this.bringToTop('_codePart', false);
+    // --- Stack: [..., stateBytes, codePart] ---
 
-    // Drop last 44 bytes (nSeq+hashOutputs+nLocktime+sighashType).
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: 44n });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
-    this.stackMap.pop(); this.stackMap.pop();
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
-    this.stackMap.pop(); this.stackMap.pop();
-    this.stackMap.push(null); this.stackMap.push(null);
-    this.emitOp({ op: 'drop' });
-    this.stackMap.pop();
-
-    // Step 2: Split off amount (last 8 bytes) and DROP it — we use _newAmount instead.
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: 8n });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
-    this.stackMap.pop(); this.stackMap.pop();
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
-    this.stackMap.pop(); this.stackMap.pop();
-    this.stackMap.push(null); this.stackMap.push(null);
-    this.emitOp({ op: 'drop' }); // drop sourceSatoshis — replaced by _newAmount
-    this.stackMap.pop();
-
-    // Step 3: Strip current state + OP_RETURN from end.
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: BigInt(stateLen + 1) });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
-    this.stackMap.pop(); this.stackMap.pop();
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
-    this.stackMap.pop(); this.stackMap.pop();
-    this.stackMap.push(null); this.stackMap.push(null);
-    this.emitOp({ op: 'drop' });
-    this.stackMap.pop();
-
-    // Step 4: Append OP_RETURN byte.
+    // Step 4: Append OP_RETURN + stateBytes
     this.emitOp({ op: 'push', value: new Uint8Array([0x6a]) });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_CAT' });
-    this.stackMap.pop(); this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.pop();
     this.stackMap.push(null);
+    // --- Stack: [..., stateBytes, codePart+OP_RETURN] ---
 
-    // Step 5: Swap and CAT to append stateBytes.
     this.emitOp({ op: 'swap' });
     this.stackMap.swap();
     this.emitOp({ op: 'opcode', code: 'OP_CAT' });
-    this.stackMap.pop(); this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.pop();
     this.stackMap.push(null);
+    // --- Stack: [..., codePart+OP_RETURN+stateBytes] ---
+
+    // Step 5: Compute varint prefix for script length
+    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
+    this.stackMap.push(null);
+    this.emitVarintEncoding();
+
+    // Prepend varint to script
+    this.emitOp({ op: 'swap' });
+    this.stackMap.swap();
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
+    this.stackMap.push(null);
+    // --- Stack: [..., varint+script] ---
 
     // Step 6: Prepend _newAmount (8-byte LE) from altstack.
     this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' });
@@ -1571,7 +1591,7 @@ class LoweringContext {
     this.emitOp({ op: 'opcode', code: 'OP_CAT' });
     this.stackMap.pop(); this.stackMap.pop();
     this.stackMap.push(null);
-    // --- Stack: [..., fullOutputSerialization] --- (NO hash)
+    // --- Stack: [..., amount(8LE)+varint+script] --- (NO hash)
 
     this.stackMap.pop();
     this.stackMap.push(bindingName);
@@ -1639,114 +1659,31 @@ class LoweringContext {
     bindingName: string,
     satoshis: string,
     stateValues: string[],
-    preimage: string,
+    _preimage: string,
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
     // Build a full BIP-143 output serialization:
     //   amount(8LE) + varint(scriptLen) + codePart + OP_RETURN + stateBytes
-    // This matches what extractOutputHash (SHA256d of concatenated outputs) expects.
+    // Uses _codePart implicit parameter (passed by SDK) instead of extracting
+    // codePart from the preimage. This is simpler and works with OP_CODESEPARATOR.
 
     const stateProps = this._properties.filter(p => !p.readonly);
 
-    // Compute fixed state serialization length from non-readonly properties.
-    let stateLen = 0;
-    for (const prop of stateProps) {
-      switch (prop.type) {
-        case 'bigint': stateLen += 8; break;
-        case 'boolean': stateLen += 1; break;
-        case 'PubKey': stateLen += 33; break;
-        case 'Addr': stateLen += 20; break;
-        case 'Sha256': stateLen += 32; break;
-        case 'Point': stateLen += 64; break;
-        default:
-          throw new Error(`addOutput: unsupported mutable property type '${prop.type}'`);
-      }
-    }
+    // Step 1: Bring _codePart to top (PICK — never consume, reused across outputs)
+    this.bringToTop('_codePart', false);
+    // --- Stack: [..., codePart] ---
 
-    // --- Extract varint + codePart from preimage ---
-    // PICK preimage (don't consume — it's used later by extractOutputHash)
-    const preIsLast = this.isLastUse(preimage, bindingIndex, lastUses);
-    this.bringToTop(preimage, preIsLast);
-
-    // Step 1: Extract middle of preimage: varint + scriptCode + amount.
-    // Split at 104 and drop prefix.
-    this.emitOp({ op: 'push', value: 104n });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [prefix, rest]
-    this.stackMap.pop(); // pop 104
-    this.stackMap.pop(); // pop preimage
-    this.stackMap.push(null); // prefix
-    this.stackMap.push(null); // rest
-    this.emitOp({ op: 'nip' }); // drop prefix, keep rest
-    this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null); // rest
-
-    // Drop last 44 bytes (nSeq+hashOutputs+nLocktime+sighashType).
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: 44n });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
-    this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [middle, tail44]
-    this.stackMap.pop(); // pop position
-    this.stackMap.pop(); // pop rest
-    this.stackMap.push(null); // middle
-    this.stackMap.push(null); // tail44
-    this.emitOp({ op: 'drop' }); // drop tail
-    this.stackMap.pop();
-    // --- Stack: [..., middle(varint+scriptCode+amount)] ---
-
-    // Step 2: Split off amount (last 8 bytes) and drop it.
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: 8n });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
-    this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [varint+scriptCode, amount]
-    this.stackMap.pop(); // pop position
-    this.stackMap.pop(); // pop middle
-    this.stackMap.push(null); // varint+scriptCode
-    this.stackMap.push(null); // amount
-    this.emitOp({ op: 'drop' }); // drop amount (we use our own satoshis)
-    this.stackMap.pop();
-    // --- Stack: [..., varint+scriptCode] ---
-
-    // Step 3: Strip current state + OP_RETURN from end (stateLen + 1 bytes).
-    this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: BigInt(stateLen + 1) });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
-    this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [varint+codePart, opReturn+state]
-    this.stackMap.pop(); // pop position
-    this.stackMap.pop(); // pop varint+scriptCode
-    this.stackMap.push(null); // varint+codePart
-    this.stackMap.push(null); // opReturn+state
-    this.emitOp({ op: 'drop' }); // discard old state
-    this.stackMap.pop();
-    // --- Stack: [..., varint+codePart] ---
-
-    // Step 4: Append OP_RETURN byte (0x6a).
+    // Step 2: Append OP_RETURN byte (0x6a).
     this.emitOp({ op: 'push', value: new Uint8Array([0x6a]) });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_CAT' });
     this.stackMap.pop();
     this.stackMap.pop();
     this.stackMap.push(null);
-    // --- Stack: [..., varint+codePart+OP_RETURN] ---
+    // --- Stack: [..., codePart+OP_RETURN] ---
 
-    // Step 5: Serialize each state value and concatenate.
+    // Step 3: Serialize each state value and concatenate.
     for (let i = 0; i < stateValues.length && i < stateProps.length; i++) {
       const valueRef = stateValues[i]!;
       const prop = stateProps[i]!;
@@ -1774,7 +1711,22 @@ class LoweringContext {
       this.emitOp({ op: 'opcode', code: 'OP_CAT' });
       this.stackMap.push(null);
     }
-    // --- Stack: [..., varint+codePart+OP_RETURN+stateBytes] ---
+    // --- Stack: [..., codePart+OP_RETURN+stateBytes] ---
+
+    // Step 4: Compute varint prefix for the full script length.
+    this.emitOp({ op: 'opcode', code: 'OP_SIZE' }); // [script, len]
+    this.stackMap.push(null);
+    this.emitVarintEncoding();
+    // --- Stack: [..., script, varint] ---
+
+    // Step 5: Prepend varint to script: SWAP CAT
+    this.emitOp({ op: 'swap' });
+    this.stackMap.swap();
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
+    this.stackMap.push(null);
+    // --- Stack: [..., varint+script] ---
 
     // Step 6: Prepend satoshis as 8-byte LE.
     const isLastSatoshis = this.isLastUse(satoshis, bindingIndex, lastUses);
@@ -1791,6 +1743,57 @@ class LoweringContext {
     this.emitOp({ op: 'opcode', code: 'OP_CAT' }); // satoshis || varint+script
     this.stackMap.push(null);
     // --- Stack: [..., amount(8LE)+varint+scriptPubKey] ---
+
+    // Rename top to binding name
+    this.stackMap.pop();
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  /**
+   * add_raw_output(satoshis, scriptBytes) — builds a raw output serialization:
+   *   amount(8LE) + varint(scriptLen) + scriptBytes
+   * The scriptBytes are used as-is (no codePart/state insertion).
+   */
+  private lowerAddRawOutput(
+    bindingName: string,
+    satoshis: string,
+    scriptBytes: string,
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    // Step 1: Bring scriptBytes to top
+    const scriptIsLast = this.isLastUse(scriptBytes, bindingIndex, lastUses);
+    this.bringToTop(scriptBytes, scriptIsLast);
+
+    // Step 2: Compute varint prefix for script length
+    this.emitOp({ op: 'opcode', code: 'OP_SIZE' }); // [script, len]
+    this.stackMap.push(null);
+    this.emitVarintEncoding();
+    // --- Stack: [..., script, varint] ---
+
+    // Step 3: Prepend varint to script: SWAP CAT
+    this.emitOp({ op: 'swap' }); // [varint, script]
+    this.stackMap.swap();
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' }); // [varint+script]
+    this.stackMap.push(null);
+
+    // Step 4: Prepend satoshis as 8-byte LE
+    const satIsLast = this.isLastUse(satoshis, bindingIndex, lastUses);
+    this.bringToTop(satoshis, satIsLast);
+    this.emitOp({ op: 'push', value: 8n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
+    this.stackMap.pop(); // pop width
+    // Stack: [..., varint+script, satoshis(8LE)]
+    this.emitOp({ op: 'swap' });
+    this.stackMap.swap();
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.emitOp({ op: 'opcode', code: 'OP_CAT' }); // satoshis || varint+script
+    this.stackMap.push(null);
 
     // Rename top to binding name
     this.stackMap.pop();
@@ -1970,6 +1973,11 @@ class LoweringContext {
     //   <G>                         -- push compressed generator point
     //   OP_CHECKSIGVERIFY           -- verify sig and remove from stack
     //   -- preimage remains on stack for field extractors
+
+    // Step 0: Emit OP_CODESEPARATOR so that the scriptCode in the BIP-143
+    // preimage is only the code after this point. This reduces preimage size
+    // for large scripts and is required for scripts > ~32KB.
+    this.emitOp({ op: 'opcode', code: 'OP_CODESEPARATOR' });
 
     // Step 1: Bring preimage to top.
     const isLast = this.isLastUse(preimage, bindingIndex, lastUses);
@@ -3242,6 +3250,50 @@ class LoweringContext {
   }
 
   // =========================================================================
+  // SHA-256 compression — delegates to sha256-codegen.ts
+  // =========================================================================
+
+  private lowerSha256Compress(
+    bindingName: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    if (args.length < 2) {
+      throw new Error('sha256Compress requires 2 arguments: state, block');
+    }
+    for (const arg of args) {
+      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+    }
+    for (let i = 0; i < 2; i++) this.stackMap.pop();
+
+    emitSha256Compress((op) => this.emitOp(op));
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  private lowerSha256Finalize(
+    bindingName: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    if (args.length < 3) {
+      throw new Error('sha256Finalize requires 3 arguments: state, remaining, msgBitLen');
+    }
+    for (const arg of args) {
+      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+    }
+    for (let i = 0; i < 3; i++) this.stackMap.pop();
+
+    emitSha256Finalize((op) => this.emitOp(op));
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  // =========================================================================
   // SLH-DSA verification — delegates to slh-dsa-codegen.ts
   // =========================================================================
 
@@ -3546,6 +3598,20 @@ function methodUsesCheckPreimage(bindings: ANFBinding[]): boolean {
   return false;
 }
 
+function methodUsesCodePart(bindings: ANFBinding[]): boolean {
+  for (const b of bindings) {
+    if (b.value.kind === 'add_output' || b.value.kind === 'add_raw_output') return true;
+    // Single-output stateful continuation uses computeStateOutput/computeStateOutputHash
+    if (b.value.kind === 'call' && (b.value.func === 'computeStateOutput' || b.value.func === 'computeStateOutputHash')) return true;
+    // Recurse into if-else branches and loops
+    if (b.value.kind === 'if') {
+      if (methodUsesCodePart(b.value.then) || methodUsesCodePart(b.value.else)) return true;
+    }
+    if (b.value.kind === 'loop' && methodUsesCodePart(b.value.body)) return true;
+  }
+  return false;
+}
+
 function lowerMethod(
   method: ANFMethod,
   properties: ANFProperty[],
@@ -3553,12 +3619,19 @@ function lowerMethod(
 ): StackMethod {
   const paramNames = method.params.map(p => p.name);
 
-  // If the method uses checkPreimage, the unlocking script pushes an
-  // implicit <sig> before all declared parameters (OP_PUSH_TX pattern).
-  // Insert _opPushTxSig at the base of the stack so it can be consumed
-  // by lowerCheckPreimage later.
+  // If the method uses checkPreimage, the unlocking script pushes implicit
+  // params before all declared parameters (OP_PUSH_TX pattern).
+  // _codePart: full code script (locking script minus state) as ByteString
+  // _opPushTxSig: ECDSA signature for OP_PUSH_TX verification
+  // These are inserted at the base of the stack so they can be consumed later.
   if (methodUsesCheckPreimage(method.body)) {
     paramNames.unshift('_opPushTxSig');
+    // _codePart is only needed when the method has add_output or add_raw_output
+    // (it provides the code script for continuation output construction).
+    // Stateless contracts and terminal methods don't use it.
+    if (methodUsesCodePart(method.body)) {
+      paramNames.unshift('_codePart');
+    }
   }
 
   const ctx = new LoweringContext(paramNames, properties, privateMethods);

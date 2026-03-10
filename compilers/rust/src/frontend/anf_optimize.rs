@@ -437,6 +437,10 @@ fn collect_refs_from_value(value: &ANFValue, refs: &mut HashSet<String>) {
                 refs.insert(preimage.clone());
             }
         }
+        ANFValue::AddRawOutput { satoshis, script_bytes } => {
+            refs.insert(satoshis.clone());
+            refs.insert(script_bytes.clone());
+        }
     }
 }
 
@@ -449,6 +453,7 @@ fn has_side_effect(value: &ANFValue) -> bool {
             | ANFValue::CheckPreimage { .. }
             | ANFValue::DeserializeState { .. }
             | ANFValue::AddOutput { .. }
+            | ANFValue::AddRawOutput { .. }
             | ANFValue::MethodCall { .. }
             | ANFValue::Call { .. }
     )

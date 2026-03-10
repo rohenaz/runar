@@ -793,7 +793,15 @@ fn lower_binary_expr(
 
     // For equality operators, annotate with operand type so stack lowering
     // can choose OP_EQUAL vs OP_NUMEQUAL.
+    // For +, annotate byte-typed operands so stack lowering can emit OP_CAT.
+    // For bitwise &, |, ^, annotate byte-typed operands.
     let result_type = if op.as_str() == "===" || op.as_str() == "!==" {
+        if is_byte_typed_expr(left, ctx) || is_byte_typed_expr(right, ctx) {
+            Some("bytes".to_string())
+        } else {
+            None
+        }
+    } else if op.as_str() == "&" || op.as_str() == "|" || op.as_str() == "^" {
         if is_byte_typed_expr(left, ctx) || is_byte_typed_expr(right, ctx) {
             Some("bytes".to_string())
         } else {
@@ -817,9 +825,16 @@ fn lower_unary_expr(
     ctx: &mut LoweringContext,
 ) -> String {
     let operand_ref = lower_expr_to_ref(operand, ctx);
+    // For ~, annotate byte-typed operands so downstream passes know the result is bytes.
+    let result_type = if op.as_str() == "~" && is_byte_typed_expr(operand, ctx) {
+        Some("bytes".to_string())
+    } else {
+        None
+    };
     ctx.emit(ANFValue::UnaryOp {
         op: op.as_str().to_string(),
         operand: operand_ref,
+        result_type,
     })
 }
 
@@ -871,8 +886,7 @@ fn lower_call_expr(
             let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
             let satoshis = arg_refs.first().cloned().unwrap_or_default();
             let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
-            let preimage = ctx.emit(ANFValue::LoadParam { name: "txPreimage".to_string() });
-            let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values, preimage });
+            let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values, preimage: String::new() });
             ctx.add_output_refs.push(r.clone());
             return r;
         }
@@ -884,8 +898,32 @@ fn lower_call_expr(
                 let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
                 let satoshis = arg_refs.first().cloned().unwrap_or_default();
                 let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
-                let preimage = ctx.emit(ANFValue::LoadParam { name: "txPreimage".to_string() });
-                let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values, preimage });
+                let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values, preimage: String::new() });
+                ctx.add_output_refs.push(r.clone());
+                return r;
+            }
+        }
+    }
+
+    // this.addRawOutput(satoshis, scriptBytes) -> special node (via PropertyAccess)
+    if let Expression::PropertyAccess { property } = callee {
+        if property == "addRawOutput" {
+            let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+            let satoshis = arg_refs.first().cloned().unwrap_or_default();
+            let script_bytes = if arg_refs.len() > 1 { arg_refs[1].clone() } else { String::new() };
+            let r = ctx.emit(ANFValue::AddRawOutput { satoshis, script_bytes });
+            ctx.add_output_refs.push(r.clone());
+            return r;
+        }
+    }
+    // this.addRawOutput(satoshis, scriptBytes) -> special node (via MemberExpr with this)
+    if let Expression::MemberExpr { object, property } = callee {
+        if let Expression::Identifier { name } = object.as_ref() {
+            if name == "this" && property == "addRawOutput" {
+                let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+                let satoshis = arg_refs.first().cloned().unwrap_or_default();
+                let script_bytes = if arg_refs.len() > 1 { arg_refs[1].clone() } else { String::new() };
+                let r = ctx.emit(ANFValue::AddRawOutput { satoshis, script_bytes });
                 ctx.add_output_refs.push(r.clone());
                 return r;
             }
@@ -1300,13 +1338,13 @@ fn stmt_has_add_output(stmt: &Statement) -> bool {
 fn expr_has_add_output(expr: &Expression) -> bool {
     if let Expression::CallExpr { callee, .. } = expr {
         if let Expression::PropertyAccess { property } = callee.as_ref() {
-            if property == "addOutput" {
+            if property == "addOutput" || property == "addRawOutput" {
                 return true;
             }
         }
         if let Expression::MemberExpr { object, property } = callee.as_ref() {
             if let Expression::Identifier { name } = object.as_ref() {
-                if name == "this" && property == "addOutput" {
+                if name == "this" && (property == "addOutput" || property == "addRawOutput") {
                     return true;
                 }
             }
