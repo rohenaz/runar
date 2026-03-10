@@ -478,7 +478,9 @@ func emitMethodDispatch(methods []StackMethod, ctx *emitContext) error {
 				return err
 			}
 		} else {
-			if err := ctx.emitOpcode("OP_DROP"); err != nil {
+			// Last method — verify the index matches (fail-closed for invalid selectors)
+			ctx.emitPush(bigIntPush(int64(i)))
+			if err := ctx.emitOpcode("OP_NUMEQUALVERIFY"); err != nil {
 				return err
 			}
 		}

@@ -552,8 +552,9 @@ function emitMethodDispatch(methods: StackMethod[], ctx: EmitContext): void {
       // Drop the method index since we matched
       ctx.emitOpcode('OP_DROP');
     } else {
-      // Last method — drop the index (no need to check, it's the default)
-      ctx.emitOpcode('OP_DROP');
+      // Last method — verify the index matches (fail-closed for invalid selectors)
+      ctx.emitPush(BigInt(i));
+      ctx.emitOpcode('OP_NUMEQUALVERIFY');
     }
 
     for (const op of method.ops) {

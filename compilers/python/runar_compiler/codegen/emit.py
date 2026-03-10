@@ -375,7 +375,9 @@ def _emit_method_dispatch(methods: list[StackMethod], ctx: _EmitContext) -> None
             ctx.emit_opcode("OP_IF")
             ctx.emit_opcode("OP_DROP")
         else:
-            ctx.emit_opcode("OP_DROP")
+            # Last method — verify the index matches (fail-closed for invalid selectors)
+            ctx.emit_push(big_int_push(i))
+            ctx.emit_opcode("OP_NUMEQUALVERIFY")
 
         for op in method.ops:
             _emit_stack_op(op, ctx)

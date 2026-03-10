@@ -355,7 +355,9 @@ fn emit_method_dispatch(
             ctx.emit_opcode("OP_IF")?;
             ctx.emit_opcode("OP_DROP")?;
         } else {
-            ctx.emit_opcode("OP_DROP")?;
+            // Last method — verify the index matches (fail-closed for invalid selectors)
+            ctx.emit_push(&PushValue::Int(i as i128));
+            ctx.emit_opcode("OP_NUMEQUALVERIFY")?;
         }
 
         for op in &method.ops {
