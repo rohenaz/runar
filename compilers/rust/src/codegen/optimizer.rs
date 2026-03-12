@@ -281,3 +281,450 @@ fn is_push_int(op: &StackOp, n: i128) -> bool {
 fn is_opcode(op: &StackOp, code: &str) -> bool {
     matches!(op, StackOp::Opcode(c) if c == code)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // 2-op optimizations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_swap_swap_removed() {
+        let ops = vec![StackOp::Swap, StackOp::Swap];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "SWAP SWAP should be eliminated, got {:?}", result);
+    }
+
+    #[test]
+    fn test_dup_drop_removed() {
+        let ops = vec![StackOp::Dup, StackOp::Drop];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "DUP DROP should be eliminated, got {:?}", result);
+    }
+
+    #[test]
+    fn test_push_drop_removed() {
+        let ops = vec![StackOp::Push(PushValue::Int(42)), StackOp::Drop];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "PUSH DROP should be eliminated, got {:?}", result);
+    }
+
+    #[test]
+    fn test_not_not_removed() {
+        let ops = vec![
+            StackOp::Opcode("OP_NOT".to_string()),
+            StackOp::Opcode("OP_NOT".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "NOT NOT should be eliminated, got {:?}", result);
+    }
+
+    #[test]
+    fn test_negate_negate_removed() {
+        let ops = vec![
+            StackOp::Opcode("OP_NEGATE".to_string()),
+            StackOp::Opcode("OP_NEGATE".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "NEGATE NEGATE should be eliminated, got {:?}", result);
+    }
+
+    #[test]
+    fn test_equal_verify_combined() {
+        let ops = vec![
+            StackOp::Opcode("OP_EQUAL".to_string()),
+            StackOp::Opcode("OP_VERIFY".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_EQUALVERIFY"));
+    }
+
+    #[test]
+    fn test_numequal_verify_combined() {
+        let ops = vec![
+            StackOp::Opcode("OP_NUMEQUAL".to_string()),
+            StackOp::Opcode("OP_VERIFY".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_NUMEQUALVERIFY"));
+    }
+
+    #[test]
+    fn test_checksig_verify_combined() {
+        let ops = vec![
+            StackOp::Opcode("OP_CHECKSIG".to_string()),
+            StackOp::Opcode("OP_VERIFY".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_CHECKSIGVERIFY"));
+    }
+
+    #[test]
+    fn test_push1_add_becomes_1add() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(1)),
+            StackOp::Opcode("OP_ADD".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_1ADD"));
+    }
+
+    #[test]
+    fn test_push1_sub_becomes_1sub() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(1)),
+            StackOp::Opcode("OP_SUB".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_1SUB"));
+    }
+
+    #[test]
+    fn test_push0_add_removed() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(0)),
+            StackOp::Opcode("OP_ADD".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "PUSH(0) ADD should be eliminated, got {:?}", result);
+    }
+
+    #[test]
+    fn test_push0_sub_removed() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(0)),
+            StackOp::Opcode("OP_SUB".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "PUSH(0) SUB should be eliminated, got {:?}", result);
+    }
+
+    #[test]
+    fn test_over_over_becomes_2dup() {
+        let ops = vec![StackOp::Over, StackOp::Over];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_2DUP"));
+    }
+
+    #[test]
+    fn test_drop_drop_becomes_2drop() {
+        let ops = vec![StackOp::Drop, StackOp::Drop];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_2DROP"));
+    }
+
+    #[test]
+    fn test_sha256_sha256_becomes_hash256() {
+        let ops = vec![
+            StackOp::Opcode("OP_SHA256".to_string()),
+            StackOp::Opcode("OP_SHA256".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_HASH256"));
+    }
+
+    #[test]
+    fn test_push0_numequal_becomes_not() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(0)),
+            StackOp::Opcode("OP_NUMEQUAL".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_NOT"));
+    }
+
+    // -----------------------------------------------------------------------
+    // PUSH + ROLL/PICK typed struct form
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_push0_roll_struct_removed() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(0)),
+            StackOp::Roll { depth: 0 },
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "PUSH(0) Roll{{0}} should be eliminated, got {:?}", result);
+    }
+
+    #[test]
+    fn test_push1_roll_struct_becomes_swap() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(1)),
+            StackOp::Roll { depth: 1 },
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Swap));
+    }
+
+    #[test]
+    fn test_push2_roll_struct_becomes_rot() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(2)),
+            StackOp::Roll { depth: 2 },
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Rot));
+    }
+
+    #[test]
+    fn test_push0_pick_struct_becomes_dup() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(0)),
+            StackOp::Pick { depth: 0 },
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Dup));
+    }
+
+    #[test]
+    fn test_push1_pick_struct_becomes_over() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(1)),
+            StackOp::Pick { depth: 1 },
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Over));
+    }
+
+    // -----------------------------------------------------------------------
+    // Opcode("OP_ROLL") / Opcode("OP_PICK") string form (SLH-DSA codegen)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_push0_opcode_roll_string_removed() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(0)),
+            StackOp::Opcode("OP_ROLL".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "PUSH(0) Opcode(OP_ROLL) should be eliminated, got {:?}", result);
+    }
+
+    #[test]
+    fn test_push1_opcode_roll_string_becomes_swap() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(1)),
+            StackOp::Opcode("OP_ROLL".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Swap));
+    }
+
+    #[test]
+    fn test_push2_opcode_roll_string_becomes_rot() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(2)),
+            StackOp::Opcode("OP_ROLL".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Rot));
+    }
+
+    #[test]
+    fn test_push0_opcode_pick_string_becomes_dup() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(0)),
+            StackOp::Opcode("OP_PICK".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Dup));
+    }
+
+    #[test]
+    fn test_push1_opcode_pick_string_becomes_over() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(1)),
+            StackOp::Opcode("OP_PICK".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Over));
+    }
+
+    // -----------------------------------------------------------------------
+    // 3-op optimizations (constant folding)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_constant_fold_add() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(3)),
+            StackOp::Push(PushValue::Int(7)),
+            StackOp::Opcode("OP_ADD".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Push(PushValue::Int(10))));
+    }
+
+    #[test]
+    fn test_constant_fold_sub() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(10)),
+            StackOp::Push(PushValue::Int(3)),
+            StackOp::Opcode("OP_SUB".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Push(PushValue::Int(7))));
+    }
+
+    #[test]
+    fn test_constant_fold_mul() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(4)),
+            StackOp::Push(PushValue::Int(5)),
+            StackOp::Opcode("OP_MUL".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Push(PushValue::Int(20))));
+    }
+
+    // -----------------------------------------------------------------------
+    // 4-op optimizations (chain folding)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chain_fold_add_add() {
+        // x PUSH(3) ADD PUSH(7) ADD -> x PUSH(10) ADD
+        let ops = vec![
+            StackOp::Dup, // stand-in for some value on stack
+            StackOp::Push(PushValue::Int(3)),
+            StackOp::Opcode("OP_ADD".to_string()),
+            StackOp::Push(PushValue::Int(7)),
+            StackOp::Opcode("OP_ADD".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 3, "expected DUP PUSH(10) ADD, got {:?}", result);
+        assert!(matches!(&result[0], StackOp::Dup));
+        assert!(matches!(&result[1], StackOp::Push(PushValue::Int(10))));
+        assert!(matches!(&result[2], StackOp::Opcode(c) if c == "OP_ADD"));
+    }
+
+    #[test]
+    fn test_chain_fold_sub_sub() {
+        let ops = vec![
+            StackOp::Dup,
+            StackOp::Push(PushValue::Int(2)),
+            StackOp::Opcode("OP_SUB".to_string()),
+            StackOp::Push(PushValue::Int(3)),
+            StackOp::Opcode("OP_SUB".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 3, "expected DUP PUSH(5) SUB, got {:?}", result);
+        assert!(matches!(&result[1], StackOp::Push(PushValue::Int(5))));
+        assert!(matches!(&result[2], StackOp::Opcode(c) if c == "OP_SUB"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-optimizable sequences pass through unchanged
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_non_optimizable_single_op_passthrough() {
+        let ops = vec![StackOp::Dup];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], StackOp::Dup));
+    }
+
+    #[test]
+    fn test_non_optimizable_sequence_passthrough() {
+        let ops = vec![
+            StackOp::Dup,
+            StackOp::Opcode("OP_HASH160".to_string()),
+            StackOp::Opcode("OP_EQUALVERIFY".to_string()),
+            StackOp::Opcode("OP_CHECKSIG".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 4, "non-optimizable sequence should pass through unchanged");
+        assert!(matches!(&result[0], StackOp::Dup));
+        assert!(matches!(&result[1], StackOp::Opcode(c) if c == "OP_HASH160"));
+        assert!(matches!(&result[2], StackOp::Opcode(c) if c == "OP_EQUALVERIFY"));
+        assert!(matches!(&result[3], StackOp::Opcode(c) if c == "OP_CHECKSIG"));
+    }
+
+    #[test]
+    fn test_large_push_with_roll_not_simplified() {
+        // PUSH(5) + OP_ROLL should NOT be simplified (only 0/1/2 are special-cased)
+        let ops = vec![
+            StackOp::Push(PushValue::Int(5)),
+            StackOp::Opcode("OP_ROLL".to_string()),
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 2, "PUSH(5) OP_ROLL should pass through unchanged");
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let ops: Vec<StackOp> = vec![];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Nested IF optimization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_nested_if_optimized() {
+        let ops = vec![StackOp::If {
+            then_ops: vec![
+                StackOp::Opcode("OP_EQUAL".to_string()),
+                StackOp::Opcode("OP_VERIFY".to_string()),
+            ],
+            else_ops: vec![StackOp::Swap, StackOp::Swap],
+        }];
+        let result = optimize_stack_ops(&ops);
+        assert_eq!(result.len(), 1);
+        if let StackOp::If { then_ops, else_ops } = &result[0] {
+            assert_eq!(then_ops.len(), 1, "then branch should be optimized");
+            assert!(matches!(&then_ops[0], StackOp::Opcode(c) if c == "OP_EQUALVERIFY"));
+            assert!(else_ops.is_empty(), "else branch SWAP SWAP should be eliminated");
+        } else {
+            panic!("expected If, got {:?}", result[0]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Iterative convergence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_iterative_optimization() {
+        // After first pass: PUSH(0) ADD is removed, leaving DUP DROP which is
+        // removed on the second pass
+        let ops = vec![
+            StackOp::Dup,
+            StackOp::Push(PushValue::Int(0)),
+            StackOp::Opcode("OP_ADD".to_string()),
+            StackOp::Drop,
+        ];
+        let result = optimize_stack_ops(&ops);
+        assert!(result.is_empty(), "iterative optimization should remove DUP (PUSH0 ADD -> empty) DROP -> DUP DROP -> empty, got {:?}", result);
+    }
+}

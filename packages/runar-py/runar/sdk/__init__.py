@@ -1,7 +1,7 @@
 """Runar SDK for Python — deployment and interaction with compiled contracts."""
 
 from runar.sdk.types import (
-    Utxo, Transaction, TxInput, TxOutput,
+    Utxo, TransactionData, Transaction, TxInput, TxOutput,
     RunarArtifact, Abi, AbiMethod, AbiParam,
     StateField, ConstructorSlot, DeployOptions, CallOptions, OutputSpec,
     PreparedCall, SdkValue,
@@ -18,7 +18,7 @@ from runar.sdk.oppushtx import compute_op_push_tx
 from runar.sdk.sha256_compress import sha256_compress_block, compute_partial_sha256_for_inductive
 
 __all__ = [
-    'Utxo', 'Transaction', 'TxInput', 'TxOutput',
+    'Utxo', 'TransactionData', 'Transaction', 'TxInput', 'TxOutput',
     'RunarArtifact', 'Abi', 'AbiMethod', 'AbiParam',
     'StateField', 'ConstructorSlot', 'DeployOptions', 'CallOptions', 'OutputSpec',
     'PreparedCall', 'SdkValue',

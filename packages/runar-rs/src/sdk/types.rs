@@ -7,9 +7,9 @@ use std::collections::HashMap;
 // Transaction types
 // ---------------------------------------------------------------------------
 
-/// A parsed Bitcoin transaction.
+/// A parsed Bitcoin transaction (data shape for get_transaction return).
 #[derive(Debug, Clone)]
-pub struct Transaction {
+pub struct TransactionData {
     pub txid: String,
     pub version: u32,
     pub inputs: Vec<TxInput>,
@@ -17,6 +17,9 @@ pub struct Transaction {
     pub locktime: u32,
     pub raw: Option<String>,
 }
+
+/// Backward compatibility alias.
+pub type Transaction = TransactionData;
 
 /// A transaction input.
 #[derive(Debug, Clone)]
@@ -226,6 +229,253 @@ impl SdkValue {
             SdkValue::Bytes(s) => s,
             _ => panic!("SdkValue::as_bytes called on non-Bytes variant"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Utxo
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn utxo_creation_and_field_access() {
+        let utxo = Utxo {
+            txid: "aa".repeat(32),
+            output_index: 0,
+            satoshis: 100_000,
+            script: "76a914".to_string(),
+        };
+        assert_eq!(utxo.txid, "aa".repeat(32));
+        assert_eq!(utxo.output_index, 0);
+        assert_eq!(utxo.satoshis, 100_000);
+        assert_eq!(utxo.script, "76a914");
+    }
+
+    #[test]
+    fn utxo_clone() {
+        let utxo = Utxo {
+            txid: "bb".repeat(32),
+            output_index: 1,
+            satoshis: 50_000,
+            script: "51".to_string(),
+        };
+        let cloned = utxo.clone();
+        assert_eq!(cloned.txid, utxo.txid);
+        assert_eq!(cloned.output_index, utxo.output_index);
+        assert_eq!(cloned.satoshis, utxo.satoshis);
+        assert_eq!(cloned.script, utxo.script);
+    }
+
+    // -----------------------------------------------------------------------
+    // TransactionData
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transaction_data_construction_defaults() {
+        let tx = TransactionData {
+            txid: "cc".repeat(32),
+            version: 1,
+            inputs: vec![],
+            outputs: vec![],
+            locktime: 0,
+            raw: None,
+        };
+        assert_eq!(tx.txid, "cc".repeat(32));
+        assert_eq!(tx.version, 1);
+        assert!(tx.inputs.is_empty());
+        assert!(tx.outputs.is_empty());
+        assert_eq!(tx.locktime, 0);
+        assert!(tx.raw.is_none());
+    }
+
+    #[test]
+    fn transaction_data_with_inputs_and_outputs() {
+        let tx = TransactionData {
+            txid: "dd".repeat(32),
+            version: 1,
+            inputs: vec![TxInput {
+                txid: "ee".repeat(32),
+                output_index: 0,
+                script: "00".to_string(),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOutput {
+                satoshis: 75_000,
+                script: "76a914".to_string(),
+            }],
+            locktime: 500_000,
+            raw: Some("0100000001...".to_string()),
+        };
+        assert_eq!(tx.inputs.len(), 1);
+        assert_eq!(tx.inputs[0].sequence, 0xffffffff);
+        assert_eq!(tx.outputs.len(), 1);
+        assert_eq!(tx.outputs[0].satoshis, 75_000);
+        assert_eq!(tx.locktime, 500_000);
+        assert!(tx.raw.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // RunarArtifact deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn runar_artifact_deserialize_minimal() {
+        let json = r#"{
+            "version": "0.1.0",
+            "contractName": "TestContract",
+            "abi": {
+                "constructor": { "params": [] },
+                "methods": []
+            },
+            "script": "5151"
+        }"#;
+        let artifact: RunarArtifact = serde_json::from_str(json).unwrap();
+        assert_eq!(artifact.version, "0.1.0");
+        assert_eq!(artifact.contract_name, "TestContract");
+        assert_eq!(artifact.script, "5151");
+        assert!(artifact.abi.constructor.params.is_empty());
+        assert!(artifact.abi.methods.is_empty());
+        assert!(artifact.state_fields.is_none());
+        assert!(artifact.constructor_slots.is_none());
+        assert!(artifact.code_separator_index.is_none());
+    }
+
+    #[test]
+    fn runar_artifact_deserialize_with_methods() {
+        let json = r#"{
+            "version": "0.1.0",
+            "contractName": "Counter",
+            "abi": {
+                "constructor": {
+                    "params": [{ "name": "count", "type": "bigint" }]
+                },
+                "methods": [{
+                    "name": "increment",
+                    "params": [],
+                    "isPublic": true
+                }]
+            },
+            "script": "00ab"
+        }"#;
+        let artifact: RunarArtifact = serde_json::from_str(json).unwrap();
+        assert_eq!(artifact.abi.constructor.params.len(), 1);
+        assert_eq!(artifact.abi.constructor.params[0].name, "count");
+        assert_eq!(artifact.abi.constructor.params[0].param_type, "bigint");
+        assert_eq!(artifact.abi.methods.len(), 1);
+        assert_eq!(artifact.abi.methods[0].name, "increment");
+        assert!(artifact.abi.methods[0].is_public);
+    }
+
+    #[test]
+    fn runar_artifact_deserialize_with_state_fields_and_slots() {
+        let json = r#"{
+            "version": "0.1.0",
+            "contractName": "Stateful",
+            "abi": {
+                "constructor": { "params": [{ "name": "x", "type": "bigint" }] },
+                "methods": [{ "name": "update", "params": [], "isPublic": true }]
+            },
+            "script": "aabb",
+            "stateFields": [{ "name": "x", "type": "bigint", "index": 0 }],
+            "constructorSlots": [{ "paramIndex": 0, "byteOffset": 5 }],
+            "codeSeparatorIndex": 10,
+            "codeSeparatorIndices": [10, 20]
+        }"#;
+        let artifact: RunarArtifact = serde_json::from_str(json).unwrap();
+        let sf = artifact.state_fields.as_ref().unwrap();
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sf[0].name, "x");
+        assert_eq!(sf[0].index, 0);
+        let cs = artifact.constructor_slots.as_ref().unwrap();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].param_index, 0);
+        assert_eq!(cs[0].byte_offset, 5);
+        assert_eq!(artifact.code_separator_index, Some(10));
+        assert_eq!(artifact.code_separator_indices, Some(vec![10, 20]));
+    }
+
+    // -----------------------------------------------------------------------
+    // SdkValue
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sdk_value_int() {
+        let v = SdkValue::Int(42);
+        assert_eq!(v.as_int(), 42);
+    }
+
+    #[test]
+    fn sdk_value_bool() {
+        let v = SdkValue::Bool(true);
+        assert!(v.as_bool());
+    }
+
+    #[test]
+    fn sdk_value_bytes() {
+        let v = SdkValue::Bytes("deadbeef".to_string());
+        assert_eq!(v.as_bytes(), "deadbeef");
+    }
+
+    #[test]
+    fn sdk_value_auto() {
+        let v = SdkValue::Auto;
+        assert_eq!(v, SdkValue::Auto);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-Int")]
+    fn sdk_value_as_int_panics_on_bool() {
+        SdkValue::Bool(true).as_int();
+    }
+
+    #[test]
+    #[should_panic(expected = "non-Bool")]
+    fn sdk_value_as_bool_panics_on_int() {
+        SdkValue::Int(1).as_bool();
+    }
+
+    #[test]
+    #[should_panic(expected = "non-Bytes")]
+    fn sdk_value_as_bytes_panics_on_int() {
+        SdkValue::Int(1).as_bytes();
+    }
+
+    #[test]
+    fn sdk_value_equality() {
+        assert_eq!(SdkValue::Int(5), SdkValue::Int(5));
+        assert_ne!(SdkValue::Int(5), SdkValue::Int(6));
+        assert_ne!(SdkValue::Int(1), SdkValue::Bool(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // DeployOptions / CallOptions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deploy_options_construction() {
+        let opts = DeployOptions {
+            satoshis: 1000,
+            change_address: Some("maddr".to_string()),
+        };
+        assert_eq!(opts.satoshis, 1000);
+        assert_eq!(opts.change_address.as_deref(), Some("maddr"));
+    }
+
+    #[test]
+    fn call_options_default() {
+        let opts = CallOptions::default();
+        assert!(opts.satoshis.is_none());
+        assert!(opts.change_address.is_none());
+        assert!(opts.new_state.is_none());
+        assert!(opts.outputs.is_none());
+        assert!(opts.terminal_outputs.is_none());
     }
 }
 

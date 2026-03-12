@@ -1,0 +1,31 @@
+{
+  "name": "runar-zkp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "ZKP (Groth16/BN254) verifier codegen for Rúnar Bitcoin Script contracts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit"
+  },
+  "files": ["dist"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/icellan/runar",
+    "directory": "packages/runar-zkp"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "runar-ir-schema": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

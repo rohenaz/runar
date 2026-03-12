@@ -132,3 +132,129 @@ pub fn ec_point_y(p: &[u8]) -> Bigint {
     bytes.copy_from_slice(&p[56..64]);
     u64::from_be_bytes(bytes) as i64
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: the secp256k1 generator point as a 64-byte Point.
+    fn ec_g() -> Point {
+        ec_mul_gen(1)
+    }
+
+    #[test]
+    fn ec_g_is_64_bytes() {
+        assert_eq!(ec_g().len(), 64);
+    }
+
+    #[test]
+    fn ec_g_is_on_curve() {
+        assert!(ec_on_curve(&ec_g()));
+    }
+
+    #[test]
+    fn ec_add_g_g_equals_ec_mul_g_2() {
+        let g = ec_g();
+        let sum = ec_add(&g, &g);
+        let doubled = ec_mul(&g, 2);
+        assert_eq!(sum, doubled);
+    }
+
+    #[test]
+    fn ec_add_g_g_equals_ec_mul_gen_2() {
+        let g = ec_g();
+        let sum = ec_add(&g, &g);
+        let gen2 = ec_mul_gen(2);
+        assert_eq!(sum, gen2);
+    }
+
+    #[test]
+    fn ec_mul_gen_1_equals_g() {
+        let g = ec_g();
+        let gen1 = ec_mul_gen(1);
+        assert_eq!(gen1, g);
+    }
+
+    #[test]
+    fn ec_negate_produces_on_curve_point() {
+        let g = ec_g();
+        let neg = ec_negate(&g);
+        assert_eq!(neg.len(), 64);
+        assert!(ec_on_curve(&neg));
+        // Negated point should differ from original (y coordinate differs)
+        assert_ne!(neg, g);
+    }
+
+    #[test]
+    fn ec_negate_double_negate_is_identity() {
+        let g = ec_g();
+        let double_neg = ec_negate(&ec_negate(&g));
+        assert_eq!(double_neg, g);
+    }
+
+    #[test]
+    fn ec_add_point_and_negation_is_identity() {
+        let g = ec_g();
+        let neg = ec_negate(&g);
+        let sum = ec_add(&g, &neg);
+        // Point at infinity = 64 zero bytes
+        assert_eq!(sum, vec![0u8; 64]);
+    }
+
+    #[test]
+    fn ec_make_point_round_trip() {
+        let x: Bigint = 12345;
+        let y: Bigint = 67890;
+        let p = ec_make_point(x, y);
+        assert_eq!(p.len(), 64);
+        assert_eq!(ec_point_x(&p), x);
+        assert_eq!(ec_point_y(&p), y);
+    }
+
+    #[test]
+    fn ec_encode_compressed_produces_33_bytes() {
+        let g = ec_g();
+        let compressed = ec_encode_compressed(&g);
+        assert_eq!(compressed.len(), 33);
+        // First byte must be 0x02 or 0x03 (compressed prefix)
+        assert!(compressed[0] == 0x02 || compressed[0] == 0x03);
+    }
+
+    #[test]
+    fn ec_on_curve_rejects_invalid_point() {
+        // Random 64 bytes very unlikely to be on the curve
+        let bad_point = vec![0xffu8; 64];
+        assert!(!ec_on_curve(&bad_point));
+    }
+
+    #[test]
+    fn ec_on_curve_rejects_wrong_length() {
+        assert!(!ec_on_curve(&[0u8; 32]));
+    }
+
+    #[test]
+    fn ec_on_curve_accepts_identity() {
+        assert!(ec_on_curve(&vec![0u8; 64]));
+    }
+
+    #[test]
+    fn ec_mod_reduce_basic() {
+        assert_eq!(ec_mod_reduce(10, 3), 1);
+        assert_eq!(ec_mod_reduce(-1, 5), 4);
+        assert_eq!(ec_mod_reduce(0, 7), 0);
+    }
+
+    #[test]
+    fn ec_mul_associative() {
+        // (G * 3) * 2 should equal G * 6
+        let g = ec_g();
+        let g3 = ec_mul(&g, 3);
+        let g3x2 = ec_mul(&g3, 2);
+        let g6 = ec_mul_gen(6);
+        assert_eq!(g3x2, g6);
+    }
+}
