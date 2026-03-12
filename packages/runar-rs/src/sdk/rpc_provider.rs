@@ -2,7 +2,8 @@
 //!
 //! Requires the `rpc` feature to be enabled (adds `reqwest` dependency).
 
-use super::types::{Transaction, TxOutput, Utxo};
+use bsv::transaction::Transaction as BsvTransaction;
+use super::types::{TransactionData, TxOutput, Utxo};
 use super::provider::Provider;
 use serde_json::Value;
 use std::io::{Read as IoRead, Write as IoWrite};
@@ -114,7 +115,7 @@ impl RPCProvider {
 }
 
 impl Provider for RPCProvider {
-    fn get_transaction(&self, txid: &str) -> Result<Transaction, String> {
+    fn get_transaction(&self, txid: &str) -> Result<TransactionData, String> {
         let raw = self.rpc_call("getrawtransaction", &[Value::from(txid), Value::from(true)])?;
         let raw_hex = raw["hex"].as_str().unwrap_or("").to_string();
 
@@ -131,7 +132,7 @@ impl Provider for RPCProvider {
             }
         }
 
-        Ok(Transaction {
+        Ok(TransactionData {
             txid: txid.to_string(),
             version: 1,
             inputs: Vec::new(),
@@ -141,7 +142,8 @@ impl Provider for RPCProvider {
         })
     }
 
-    fn broadcast(&mut self, raw_tx: &str) -> Result<String, String> {
+    fn broadcast(&mut self, tx: &BsvTransaction) -> Result<String, String> {
+        let raw_tx = tx.to_hex().map_err(|e| format!("broadcast: to_hex failed: {}", e))?;
         let txid = self.rpc_call("sendrawtransaction", &[Value::from(raw_tx)])?;
         let txid_str = txid.as_str()
             .ok_or_else(|| "RPC sendrawtransaction: expected string txid".to_string())?
@@ -262,4 +264,95 @@ fn decode_chunked(input: &str) -> Result<String, String> {
         }
     }
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_provider_new_sets_fields() {
+        let p = RPCProvider::new("http://localhost:8332", "user", "pass");
+        assert_eq!(p.url, "http://localhost:8332");
+        assert_eq!(p.user, "user");
+        assert_eq!(p.pass, "pass");
+        assert_eq!(p.network, "testnet");
+        assert!(!p.auto_mine);
+    }
+
+    #[test]
+    fn rpc_provider_new_regtest_sets_fields() {
+        let p = RPCProvider::new_regtest("http://localhost:18332", "bitcoin", "bitcoin");
+        assert_eq!(p.url, "http://localhost:18332");
+        assert_eq!(p.user, "bitcoin");
+        assert_eq!(p.pass, "bitcoin");
+        assert_eq!(p.network, "regtest");
+        assert!(p.auto_mine);
+    }
+
+    #[test]
+    fn rpc_provider_get_network() {
+        let p = RPCProvider::new("http://localhost:8332", "u", "p");
+        assert_eq!(p.get_network(), "testnet");
+
+        let p2 = RPCProvider::new_regtest("http://localhost:18332", "u", "p");
+        assert_eq!(p2.get_network(), "regtest");
+    }
+
+    #[test]
+    fn rpc_provider_get_fee_rate() {
+        let p = RPCProvider::new("http://localhost:8332", "u", "p");
+        assert_eq!(p.get_fee_rate().unwrap(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_url_with_path() {
+        let (host, path) = parse_url("http://localhost:8332/rpc").unwrap();
+        assert_eq!(host, "localhost:8332");
+        assert_eq!(path, "/rpc");
+    }
+
+    #[test]
+    fn parse_url_without_path() {
+        let (host, path) = parse_url("http://localhost:8332").unwrap();
+        assert_eq!(host, "localhost:8332");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_url_strips_https() {
+        let (host, _) = parse_url("https://node.example.com:443/api").unwrap();
+        assert_eq!(host, "node.example.com:443");
+    }
+
+    #[test]
+    fn base64_encode_basic() {
+        assert_eq!(base64_encode("user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(base64_encode(""), "");
+    }
+
+    #[test]
+    fn base64_encode_with_padding() {
+        // "a" -> "YQ==" (needs 2 padding chars)
+        assert_eq!(base64_encode("a"), "YQ==");
+        // "ab" -> "YWI=" (needs 1 padding char)
+        assert_eq!(base64_encode("ab"), "YWI=");
+        // "abc" -> "YWJj" (no padding)
+        assert_eq!(base64_encode("abc"), "YWJj");
+    }
+
+    #[test]
+    fn decode_chunked_single_chunk() {
+        let input = "5\r\nhello\r\n0\r\n";
+        let result = decode_chunked(input).unwrap();
+        assert_eq!(result, "hello");
+    }
 }

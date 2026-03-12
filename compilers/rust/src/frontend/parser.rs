@@ -1138,3 +1138,462 @@ pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
     // Default: TypeScript parser
     parse(source, file_name)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Basic P2PKH contract
+    // -----------------------------------------------------------------------
+
+    const P2PKH_SOURCE: &str = r#"
+        import { SmartContract, assert, Sig, PubKey, Ripemd160, hash160 } from 'runar-lang';
+
+        class P2PKH extends SmartContract {
+            readonly pubKeyHash: Ripemd160;
+
+            constructor(pubKeyHash: Ripemd160) {
+                super(pubKeyHash);
+            }
+
+            public unlock(sig: Sig, pubKey: PubKey) {
+                assert(hash160(pubKey) === this.pubKeyHash);
+                assert(checkSig(sig, pubKey));
+            }
+        }
+    "#;
+
+    #[test]
+    fn test_parse_p2pkh_contract_name() {
+        let result = parse(P2PKH_SOURCE, Some("P2PKH.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        assert_eq!(contract.name, "P2PKH");
+    }
+
+    #[test]
+    fn test_parse_p2pkh_parent_class() {
+        let result = parse(P2PKH_SOURCE, Some("P2PKH.runar.ts"));
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.parent_class, "SmartContract");
+    }
+
+    #[test]
+    fn test_parse_p2pkh_properties() {
+        let result = parse(P2PKH_SOURCE, Some("P2PKH.runar.ts"));
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.properties.len(), 1);
+        assert_eq!(contract.properties[0].name, "pubKeyHash");
+        assert!(contract.properties[0].readonly);
+        assert!(matches!(
+            &contract.properties[0].prop_type,
+            TypeNode::Primitive(PrimitiveTypeName::Ripemd160)
+        ));
+    }
+
+    #[test]
+    fn test_parse_p2pkh_constructor() {
+        let result = parse(P2PKH_SOURCE, Some("P2PKH.runar.ts"));
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.constructor.name, "constructor");
+        assert_eq!(contract.constructor.params.len(), 1);
+        assert_eq!(contract.constructor.params[0].name, "pubKeyHash");
+    }
+
+    #[test]
+    fn test_parse_p2pkh_methods() {
+        let result = parse(P2PKH_SOURCE, Some("P2PKH.runar.ts"));
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.methods.len(), 1);
+        assert_eq!(contract.methods[0].name, "unlock");
+        assert_eq!(contract.methods[0].visibility, Visibility::Public);
+        assert_eq!(contract.methods[0].params.len(), 2);
+        assert_eq!(contract.methods[0].params[0].name, "sig");
+        assert_eq!(contract.methods[0].params[1].name, "pubKey");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stateful Counter contract
+    // -----------------------------------------------------------------------
+
+    const COUNTER_SOURCE: &str = r#"
+        import { StatefulSmartContract, assert } from 'runar-lang';
+
+        class Counter extends StatefulSmartContract {
+            count: bigint;
+
+            constructor(count: bigint) {
+                super(count);
+            }
+
+            public increment() {
+                this.count++;
+                assert(this.count > 0n);
+            }
+        }
+    "#;
+
+    #[test]
+    fn test_parse_counter_stateful() {
+        let result = parse(COUNTER_SOURCE, Some("Counter.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        assert_eq!(contract.name, "Counter");
+        assert_eq!(contract.parent_class, "StatefulSmartContract");
+    }
+
+    #[test]
+    fn test_parse_counter_mutable_property() {
+        let result = parse(COUNTER_SOURCE, Some("Counter.runar.ts"));
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.properties.len(), 1);
+        assert_eq!(contract.properties[0].name, "count");
+        assert!(!contract.properties[0].readonly, "count should be mutable");
+        assert!(matches!(
+            &contract.properties[0].prop_type,
+            TypeNode::Primitive(PrimitiveTypeName::Bigint)
+        ));
+    }
+
+    #[test]
+    fn test_parse_counter_increment_method() {
+        let result = parse(COUNTER_SOURCE, Some("Counter.runar.ts"));
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.methods.len(), 1);
+        assert_eq!(contract.methods[0].name, "increment");
+        assert_eq!(contract.methods[0].visibility, Visibility::Public);
+        assert!(contract.methods[0].params.is_empty());
+        assert!(!contract.methods[0].body.is_empty(), "increment body should not be empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_multiple_methods() {
+        let source = r#"
+            import { SmartContract, assert } from 'runar-lang';
+
+            class Multi extends SmartContract {
+                readonly x: bigint;
+
+                constructor(x: bigint) {
+                    super(x);
+                }
+
+                public methodA(a: bigint) {
+                    assert(a > 0n);
+                }
+
+                public methodB(b: bigint) {
+                    assert(b > 0n);
+                }
+
+                private helper(v: bigint) {
+                    assert(v > 0n);
+                }
+            }
+        "#;
+        let result = parse(source, Some("Multi.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.methods.len(), 3);
+        assert_eq!(contract.methods[0].name, "methodA");
+        assert_eq!(contract.methods[0].visibility, Visibility::Public);
+        assert_eq!(contract.methods[1].name, "methodB");
+        assert_eq!(contract.methods[1].visibility, Visibility::Public);
+        assert_eq!(contract.methods[2].name, "helper");
+        assert_eq!(contract.methods[2].visibility, Visibility::Private);
+    }
+
+    // -----------------------------------------------------------------------
+    // Property with initializer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_property_with_initializer() {
+        let source = r#"
+            import { StatefulSmartContract, assert } from 'runar-lang';
+
+            class WithInit extends StatefulSmartContract {
+                count: bigint = 0n;
+
+                constructor() {
+                    super();
+                }
+
+                public check() {
+                    assert(this.count === 0n);
+                }
+            }
+        "#;
+        let result = parse(source, Some("WithInit.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.properties.len(), 1);
+        assert!(
+            contract.properties[0].initializer.is_some(),
+            "property should have an initializer"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Error handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_no_contract_class_error() {
+        let source = r#"
+            class NotAContract {
+                doSomething() {}
+            }
+        "#;
+        let result = parse(source, Some("bad.runar.ts"));
+        assert!(result.contract.is_none(), "should not produce a contract");
+        assert!(
+            result.errors.iter().any(|e| e.contains("No class extending SmartContract")),
+            "should report missing SmartContract error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_parse_syntax_error() {
+        let source = "class { this is not valid }}}}}";
+        let result = parse(source, Some("bad.runar.ts"));
+        assert!(
+            !result.errors.is_empty(),
+            "should report parse errors for invalid syntax"
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_source_error() {
+        let source = "";
+        let result = parse(source, Some("empty.runar.ts"));
+        assert!(result.contract.is_none());
+        assert!(
+            result.errors.iter().any(|e| e.contains("No class extending SmartContract")),
+            "empty source should report no contract found, got: {:?}",
+            result.errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Expressions: binary, unary, ternary, member access
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_binary_expressions() {
+        let source = r#"
+            import { SmartContract, assert } from 'runar-lang';
+
+            class BinOps extends SmartContract {
+                readonly x: bigint;
+
+                constructor(x: bigint) {
+                    super(x);
+                }
+
+                public check(a: bigint, b: bigint) {
+                    const sum = a + b;
+                    const diff = a - b;
+                    const prod = a * b;
+                    assert(sum > 0n);
+                }
+            }
+        "#;
+        let result = parse(source, Some("BinOps.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        let body = &contract.methods[0].body;
+        // Should have at least 3 variable declarations and 1 assert
+        assert!(body.len() >= 4, "expected at least 4 statements, got {}", body.len());
+    }
+
+    #[test]
+    fn test_parse_ternary_expression() {
+        let source = r#"
+            import { SmartContract, assert } from 'runar-lang';
+
+            class Ternary extends SmartContract {
+                readonly x: bigint;
+
+                constructor(x: bigint) {
+                    super(x);
+                }
+
+                public check(a: bigint) {
+                    const result = a > 0n ? 1n : 0n;
+                    assert(result === 1n);
+                }
+            }
+        "#;
+        let result = parse(source, Some("Ternary.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        // Find the ternary in the first variable declaration
+        if let Statement::VariableDecl { init, .. } = &contract.methods[0].body[0] {
+            assert!(
+                matches!(init, Expression::TernaryExpr { .. }),
+                "expected ternary expression, got {:?}",
+                init
+            );
+        } else {
+            panic!("expected VariableDecl as first statement");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_source dispatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_source_ts_dispatch() {
+        // parse_source with .runar.ts should use the TS parser
+        let result = parse_source(P2PKH_SOURCE, Some("P2PKH.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract via TS parser");
+        assert_eq!(contract.name, "P2PKH");
+    }
+
+    #[test]
+    fn test_parse_source_default_dispatch() {
+        // parse_source with no extension hint should default to TS parser
+        let result = parse_source(P2PKH_SOURCE, None);
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        assert!(result.contract.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // For loop
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_for_loop() {
+        let source = r#"
+            import { SmartContract, assert } from 'runar-lang';
+
+            class Loop extends SmartContract {
+                readonly x: bigint;
+
+                constructor(x: bigint) {
+                    super(x);
+                }
+
+                public check() {
+                    let sum = 0n;
+                    for (let i = 0n; i < 10n; i++) {
+                        sum += i;
+                    }
+                    assert(sum === 45n);
+                }
+            }
+        "#;
+        let result = parse(source, Some("Loop.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        let body = &contract.methods[0].body;
+        // Should contain a ForStatement
+        let has_for = body.iter().any(|s| matches!(s, Statement::ForStatement { .. }));
+        assert!(has_for, "should contain a ForStatement, got: {:?}", body);
+    }
+
+    // -----------------------------------------------------------------------
+    // If-else
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_if_else() {
+        let source = r#"
+            import { SmartContract, assert } from 'runar-lang';
+
+            class IfElse extends SmartContract {
+                readonly x: bigint;
+
+                constructor(x: bigint) {
+                    super(x);
+                }
+
+                public check(a: bigint) {
+                    if (a > 0n) {
+                        assert(a > 0n);
+                    } else {
+                        assert(a === 0n);
+                    }
+                }
+            }
+        "#;
+        let result = parse(source, Some("IfElse.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        let body = &contract.methods[0].body;
+        let has_if = body.iter().any(|s| matches!(s, Statement::IfStatement { .. }));
+        assert!(has_if, "should contain an IfStatement");
+    }
+
+    // -----------------------------------------------------------------------
+    // Exported contract class
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_exported_contract() {
+        let source = r#"
+            import { SmartContract, assert } from 'runar-lang';
+
+            export class Exported extends SmartContract {
+                readonly val: bigint;
+
+                constructor(val: bigint) {
+                    super(val);
+                }
+
+                public check() {
+                    assert(this.val > 0n);
+                }
+            }
+        "#;
+        let result = parse(source, Some("Exported.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.expect("exported class should be found");
+        assert_eq!(contract.name, "Exported");
+    }
+
+    // -----------------------------------------------------------------------
+    // Type parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_various_param_types() {
+        let source = r#"
+            import { SmartContract, assert, PubKey, Sig, ByteString, Sha256 } from 'runar-lang';
+
+            class TypeTest extends SmartContract {
+                readonly h: Sha256;
+
+                constructor(h: Sha256) {
+                    super(h);
+                }
+
+                public check(sig: Sig, pubKey: PubKey, data: ByteString, flag: boolean) {
+                    assert(flag);
+                }
+            }
+        "#;
+        let result = parse(source, Some("TypeTest.runar.ts"));
+        assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        let params = &contract.methods[0].params;
+        assert_eq!(params.len(), 4);
+        assert!(matches!(&params[0].param_type, TypeNode::Primitive(PrimitiveTypeName::Sig)));
+        assert!(matches!(&params[1].param_type, TypeNode::Primitive(PrimitiveTypeName::PubKey)));
+        assert!(matches!(&params[2].param_type, TypeNode::Primitive(PrimitiveTypeName::ByteString)));
+        assert!(matches!(&params[3].param_type, TypeNode::Primitive(PrimitiveTypeName::Boolean)));
+    }
+}

@@ -200,9 +200,13 @@ def num2bin(v: int, length: int) -> bytes:
         result.append(0x80 if negative else 0x00)
     elif negative:
         result[-1] |= 0x80
-    # Pad or truncate to requested length
-    while len(result) < length:
-        result.append(0)
+    # Pad to requested length, keeping sign bit on the last byte
+    if len(result) < length:
+        sign_byte = result[-1] & 0x80
+        result[-1] &= 0x7F  # clear sign from current last byte
+        while len(result) < length:
+            result.append(0)
+        result[-1] |= sign_byte  # set sign on actual last byte
     return bytes(result[:length])
 
 def bin2num(data: bytes) -> int:
