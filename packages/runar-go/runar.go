@@ -216,8 +216,18 @@ func Ripemd160Func(data ByteString) Ripemd160Hash {
 // ExtractLocktime returns 0 in test mode.
 func ExtractLocktime(p SigHashPreimage) int64 { return 0 }
 
-// ExtractOutputHash returns 32 zero bytes in test mode.
-func ExtractOutputHash(p SigHashPreimage) Sha256 { return Sha256(make([]byte, 32)) }
+// ExtractOutputHash returns the first 32 bytes of the preimage in test mode.
+// Tests set TxPreimage = Hash256(expectedOutputBytes) so the assertion
+// Hash256(outputs) == ExtractOutputHash(TxPreimage) passes.
+// Falls back to 32 zero bytes when the preimage is unset (nil/empty).
+func ExtractOutputHash(p SigHashPreimage) Sha256 {
+	if len(p) >= 32 {
+		result := make([]byte, 32)
+		copy(result, p[:32])
+		return Sha256(result)
+	}
+	return Sha256(make([]byte, 32))
+}
 
 // ExtractAmount returns 10000 in test mode.
 func ExtractAmount(p SigHashPreimage) int64 { return 10000 }

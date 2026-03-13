@@ -139,18 +139,12 @@ func TestTicTacToe_FullGameFlow(t *testing.T) {
 	}
 
 	// X plays position 2 to win top row (0,1,2).
-	// MoveAndWin is a terminal method: in unit tests the mock ExtractOutputHash
-	// returns zeros so the output-hash assertion always fires. We verify the
-	// method reaches that assertion (game-logic checks passed) rather than
-	// panicking earlier on an invalid sig or win condition.
-	func() {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected MoveAndWin to panic on preimage assertion in unit tests")
-			}
-		}()
-		g.MoveAndWin(2, playerXPK, mockSig, "00", 0)
-	}()
+	// Pre-compute the expected payout so we can set TxPreimage = Hash256(payout),
+	// satisfying the ExtractOutputHash assertion in MoveAndWin.
+	totalPayout := g.BetAmount * 2
+	payout := runar.Cat(runar.Cat(runar.Num2Bin(totalPayout, 8), g.P2pkhPrefix), runar.Cat(runar.Hash160(playerXPK), g.P2pkhSuffix))
+	g.TxPreimage = runar.Hash256(payout)
+	g.MoveAndWin(2, playerXPK, mockSig, "00", 0)
 }
 
 func TestTicTacToe_CheckWinRow(t *testing.T) {
