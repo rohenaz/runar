@@ -205,6 +205,38 @@ def compile_contract(rel_path: str) -> RunarArtifact:
     return RunarArtifact.from_dict(artifact_dict)
 
 
+def compile_contract_ts(rel_path: str) -> RunarArtifact:
+    """Compile a contract using the TypeScript compiler (via Node subprocess).
+
+    Falls back to this when the Python/Go compilers have known code generation
+    differences (e.g., deeply nested if/else if chains in private methods).
+    The TS compiler is the reference implementation.
+    """
+    import subprocess
+    abs_path = str(PROJECT_ROOT / rel_path)
+    file_name = Path(abs_path).name
+    node_script = f"""
+    const fs = require('fs');
+    const {{ compile }} = require('./packages/runar-compiler/dist/index.js');
+    const src = fs.readFileSync({json.dumps(abs_path)}, 'utf-8');
+    const result = compile(src, {{ fileName: {json.dumps(file_name)} }});
+    if (!result.artifact) {{
+        console.error('Compile failed:', JSON.stringify(result.errors));
+        process.exit(1);
+    }}
+    const out = JSON.stringify(result.artifact, (k,v) => typeof v === 'bigint' ? v.toString() + 'n' : v, 2);
+    console.log(out);
+    """
+    result = subprocess.run(
+        ['node', '-e', node_script],
+        capture_output=True, text=True, cwd=str(PROJECT_ROOT),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"TS compile failed for {rel_path}: {result.stderr}")
+    artifact_dict = json.loads(result.stdout)
+    return RunarArtifact.from_dict(artifact_dict)
+
+
 # ---------------------------------------------------------------------------
 # Provider helper
 # ---------------------------------------------------------------------------

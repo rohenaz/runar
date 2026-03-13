@@ -181,6 +181,14 @@ func (s *stackMap) peekAtDepth(depthFromTop int) string {
 	return s.slots[index]
 }
 
+func (s *stackMap) renameAtDepth(depthFromTop int, newName string) {
+	idx := len(s.slots) - 1 - depthFromTop
+	if idx < 0 || idx >= len(s.slots) {
+		panic(fmt.Sprintf("invalid stack depth for rename: %d", depthFromTop))
+	}
+	s.slots[idx] = newName
+}
+
 func (s *stackMap) clone() *stackMap {
 	slots := make([]string, len(s.slots))
 	copy(slots, s.slots)
@@ -301,6 +309,7 @@ type loweringContext struct {
 	privateMethods map[string]*ir.ANFMethod // private methods available for inlining
 	localBindings      map[string]bool // binding names in current lowerBindings scope; used by @ref: handler
 	outerProtectedRefs map[string]bool // parent-scope refs that must not be consumed (used after current if-branch)
+	insideBranch       bool            // true when executing inside an if-branch; update_prop skips old-value removal
 }
 
 func newLoweringContext(params []string, properties []ir.ANFProperty) *loweringContext {
@@ -795,6 +804,11 @@ func (ctx *loweringContext) lowerCall(bindingName, funcName string, args []strin
 		return
 	}
 
+	if funcName == "__array_access" {
+		ctx.lowerArrayAccess(bindingName, args, bindingIndex, lastUses)
+		return
+	}
+
 	if funcName == "substr" {
 		ctx.lowerSubstr(bindingName, args, bindingIndex, lastUses)
 		return
@@ -967,7 +981,15 @@ func (ctx *loweringContext) lowerCall(bindingName, funcName string, args []strin
 	ctx.trackDepth()
 }
 
-func (ctx *loweringContext) lowerMethodCall(bindingName, _ string, method string, args []string, bindingIndex int, lastUses map[string]int) {
+func (ctx *loweringContext) lowerMethodCall(bindingName, object string, method string, args []string, bindingIndex int, lastUses map[string]int) {
+	// Consume the @this object reference before dispatching — without this,
+	// a stale 0n sits on the stack and desyncs subsequent depths.
+	if ctx.sm.has(object) {
+		ctx.bringToTop(object, true)
+		ctx.emitOp(StackOp{Op: "drop"})
+		ctx.sm.pop()
+	}
+
 	if method == "getStateScript" {
 		ctx.lowerGetStateScript(bindingName)
 		return
@@ -986,19 +1008,44 @@ func (ctx *loweringContext) lowerMethodCall(bindingName, _ string, method string
 // inlineMethodCall inlines a private method by lowering its body in the current context.
 // The method's parameters are bound to the call arguments.
 func (ctx *loweringContext) inlineMethodCall(bindingName string, method *ir.ANFMethod, args []string, bindingIndex int, lastUses map[string]int) {
-	// First, bring all args to the top of the stack and rename them to the method param names
+	type shadowEntry struct {
+		paramName    string
+		shadowedName string
+	}
+	var shadowed []shadowEntry
+
+	// Bind call arguments to private method params.
 	for i, arg := range args {
 		if i < len(method.Params) {
 			isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
 			ctx.bringToTop(arg, isLast)
-			// Rename to param name
 			ctx.sm.pop()
-			ctx.sm.push(method.Params[i].Name)
+
+			paramName := method.Params[i].Name
+
+			// If paramName already exists on the stack, temporarily rename
+			// the existing entry to prevent duplicate-name issues.
+			if ctx.sm.has(paramName) {
+				existingDepth := ctx.sm.findDepth(paramName)
+				shadowedName := fmt.Sprintf("__shadowed_%d_%s", bindingIndex, paramName)
+				ctx.sm.renameAtDepth(existingDepth, shadowedName)
+				shadowed = append(shadowed, shadowEntry{paramName: paramName, shadowedName: shadowedName})
+			}
+
+			ctx.sm.push(paramName)
 		}
 	}
 
 	// Lower the method body
 	ctx.lowerBindings(method.Body, false)
+
+	// Restore shadowed names so the caller's scope sees its original entries.
+	for _, s := range shadowed {
+		if ctx.sm.has(s.shadowedName) {
+			depth := ctx.sm.findDepth(s.shadowedName)
+			ctx.sm.renameAtDepth(depth, s.paramName)
+		}
+	}
 
 	// The last binding's result should be on top of the stack.
 	// Rename it to the calling binding name.
@@ -1037,6 +1084,7 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	thenCtx := newLoweringContext(nil, ctx.properties)
 	thenCtx.sm = ctx.sm.clone()
 	thenCtx.outerProtectedRefs = protectedRefs
+	thenCtx.insideBranch = true
 	thenCtx.lowerBindings(thenBindings, ta)
 
 	if ta && thenCtx.sm.depth() > 1 {
@@ -1051,6 +1099,7 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	elseCtx := newLoweringContext(nil, ctx.properties)
 	elseCtx.sm = ctx.sm.clone()
 	elseCtx.outerProtectedRefs = protectedRefs
+	elseCtx.insideBranch = true
 	elseCtx.lowerBindings(elseBindings, ta)
 
 	if ta && elseCtx.sm.depth() > 1 {
@@ -1071,6 +1120,8 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	// but gone after then). Emit targeted ROLL+DROP in the else-branch
 	// to remove those same items, then push empty bytes as placeholder.
 	// OP_CAT with empty bytes is identity (no-op for output hashing).
+	// Identify items consumed asymmetrically between branches.
+	// Phase 1: collect consumed names from both directions.
 	postThenNames := thenCtx.sm.namedSlots()
 	var consumedNames []string
 	for name := range preIfNames {
@@ -1078,8 +1129,17 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 			consumedNames = append(consumedNames, name)
 		}
 	}
+	postElseNames := elseCtx.sm.namedSlots()
+	var elseConsumedNames []string
+	for name := range preIfNames {
+		if !postElseNames[name] && thenCtx.sm.has(name) {
+			elseConsumedNames = append(elseConsumedNames, name)
+		}
+	}
+
+	// Phase 2: perform ALL drops before any placeholder pushes.
+	// This prevents double-placeholder when bilateral drops balance each other.
 	if len(consumedNames) > 0 {
-		// Remove consumed items from else-branch, deepest first to keep depths stable
 		depths := make([]int, 0, len(consumedNames))
 		for _, n := range consumedNames {
 			depths = append(depths, elseCtx.sm.findDepth(n))
@@ -1093,27 +1153,15 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 				elseCtx.emitOp(StackOp{Op: "nip"})
 				elseCtx.sm.removeAtDepth(1)
 			} else {
-				// Push depth, then ROLL to bring item to top, then DROP
 				elseCtx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(depth))})
 				elseCtx.sm.push("")
 				elseCtx.emitOp(StackOp{Op: "roll", Depth: depth})
-				elseCtx.sm.pop() // remove depth literal
+				elseCtx.sm.pop()
 				removed := elseCtx.sm.removeAtDepth(depth)
 				elseCtx.sm.push(removed)
 				elseCtx.emitOp(StackOp{Op: "drop"})
 				elseCtx.sm.pop()
 			}
-		}
-		// Push empty bytes as placeholder result
-		elseCtx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bytes", Bytes: []byte{}}})
-		elseCtx.sm.push("")
-	}
-	// Handle the reverse case symmetrically (unlikely but safe)
-	postElseNames := elseCtx.sm.namedSlots()
-	var elseConsumedNames []string
-	for name := range preIfNames {
-		if !postElseNames[name] && thenCtx.sm.has(name) {
-			elseConsumedNames = append(elseConsumedNames, name)
 		}
 	}
 	if len(elseConsumedNames) > 0 {
@@ -1140,6 +1188,14 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 				thenCtx.sm.pop()
 			}
 		}
+	}
+
+	// Phase 3: single depth-balance check after ALL drops.
+	// Push placeholder only if one branch is still deeper than the other.
+	if thenCtx.sm.depth() > elseCtx.sm.depth() {
+		elseCtx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bytes", Bytes: []byte{}}})
+		elseCtx.sm.push("")
+	} else if elseCtx.sm.depth() > thenCtx.sm.depth() {
 		thenCtx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bytes", Bytes: []byte{}}})
 		thenCtx.sm.push("")
 	}
@@ -1165,7 +1221,50 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		}
 	}
 
-	ctx.sm.push(bindingName)
+	// The if expression may produce a result value on top.
+	if thenCtx.sm.depth() > ctx.sm.depth() {
+		// Branches increased depth — check if both updated the same property.
+		thenTop := thenCtx.sm.peekAtDepth(0)
+		elseTop := ""
+		if elseCtx.sm.depth() > 0 {
+			elseTop = elseCtx.sm.peekAtDepth(0)
+		}
+		isProperty := false
+		for _, p := range ctx.properties {
+			if p.Name == thenTop {
+				isProperty = true
+				break
+			}
+		}
+		if isProperty && thenTop != "" && thenTop == elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {
+			// Both branches did update_prop for the same property (e.g., turn flip).
+			ctx.sm.push(thenTop)
+			for d := 1; d < ctx.sm.depth(); d++ {
+				if ctx.sm.peekAtDepth(d) == thenTop {
+					if d == 1 {
+						ctx.emitOp(StackOp{Op: "nip"})
+						ctx.sm.removeAtDepth(1)
+					} else {
+						ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(d))})
+						ctx.sm.push("")
+						ctx.emitOp(StackOp{Op: "roll", Depth: d + 1})
+						ctx.sm.pop()
+						rolled := ctx.sm.removeAtDepth(d)
+						ctx.sm.push(rolled)
+						ctx.emitOp(StackOp{Op: "drop"})
+						ctx.sm.pop()
+					}
+					break
+				}
+			}
+		} else {
+			ctx.sm.push(bindingName)
+		}
+	} else if elseCtx.sm.depth() > ctx.sm.depth() {
+		ctx.sm.push(bindingName)
+	} else {
+		// Void if — don't push phantom
+	}
 	ctx.trackDepth()
 
 	if thenCtx.maxDepth > ctx.maxDepth {
@@ -1267,6 +1366,34 @@ func (ctx *loweringContext) lowerUpdateProp(propName, valueRef string, bindingIn
 	ctx.bringToTop(valueRef, isLast)
 	ctx.sm.pop()
 	ctx.sm.push(propName)
+
+	// When NOT inside an if-branch, remove the old property entry from
+	// the stack. After liftBranchUpdateProps transforms conditional
+	// property updates into flat if-expressions + top-level update_prop,
+	// the old value is dead and must be removed to keep stack depth correct.
+	// Inside branches, the old value is kept for lowerIf's same-property
+	// detection to handle correctly.
+	if !ctx.insideBranch {
+		for d := 1; d < ctx.sm.depth(); d++ {
+			if ctx.sm.peekAtDepth(d) == propName {
+				if d == 1 {
+					ctx.emitOp(StackOp{Op: "nip"})
+					ctx.sm.removeAtDepth(1)
+				} else {
+					ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(d))})
+					ctx.sm.push("")
+					ctx.emitOp(StackOp{Op: "roll", Depth: d + 1})
+					ctx.sm.pop()
+					rolled := ctx.sm.removeAtDepth(d)
+					ctx.sm.push(rolled)
+					ctx.emitOp(StackOp{Op: "drop"})
+					ctx.sm.pop()
+				}
+				break
+			}
+		}
+	}
+
 	ctx.trackDepth()
 }
 

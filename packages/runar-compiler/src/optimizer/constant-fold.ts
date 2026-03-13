@@ -260,9 +260,13 @@ function foldBinding(binding: ANFBinding, env: ConstEnv): ANFBinding {
   const { name, value } = binding;
   const foldedValue = foldValue(value, env);
 
-  // If the folded value is a load_const, register in the environment
+  // If the folded value is a load_const, register in the environment.
+  // Skip @ref: prefixed strings — they are binding aliases, not real constants.
   if (foldedValue.kind === 'load_const') {
-    env.set(name, foldedValue.value);
+    const v = foldedValue.value;
+    if (!(typeof v === 'string' && v.startsWith('@ref:'))) {
+      env.set(name, v);
+    }
   }
 
   return { name, value: foldedValue };

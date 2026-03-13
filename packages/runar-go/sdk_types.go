@@ -144,6 +144,7 @@ type RunarArtifact struct {
 	BuildTimestamp         string            `json:"buildTimestamp"`
 	CodeSeparatorIndex     *int              `json:"codeSeparatorIndex,omitempty"`
 	CodeSeparatorIndices   []int             `json:"codeSeparatorIndices,omitempty"`
+	ANF                    *ANFProgram       `json:"anf,omitempty"`
 }
 
 // ABI describes the contract's public interface.

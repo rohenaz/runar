@@ -615,10 +615,6 @@ class _TsParser:
             self.advance()  # consume :
             type_node = self._parse_type()
 
-            # In SmartContract, all properties are readonly
-            if parent_class == "SmartContract":
-                is_readonly = True
-
             # Parse optional initializer: = value
             initializer = None
             if self.check(TOK_ASSIGN):
@@ -641,8 +637,6 @@ class _TsParser:
             self.add_error(
                 f"property '{member_name}' must have an explicit type annotation"
             )
-            if parent_class == "SmartContract":
-                is_readonly = True
             return PropertyNode(
                 name=member_name,
                 type=CustomType(name="unknown"),

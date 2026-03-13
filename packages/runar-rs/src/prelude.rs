@@ -245,9 +245,16 @@ pub fn extract_locktime(_p: &[u8]) -> Int {
     0
 }
 
-/// Returns 32 zero bytes in test mode.
-pub fn extract_output_hash(_p: &[u8]) -> ByteString {
-    vec![0u8; 32]
+/// Returns the first 32 bytes of the preimage in test mode.
+/// Tests set `tx_preimage = hash256(expected_output_bytes)` so the assertion
+/// `hash256(outputs) == extract_output_hash(tx_preimage)` passes.
+/// Falls back to 32 zero bytes when the preimage is unset or shorter than 32 bytes.
+pub fn extract_output_hash(p: &[u8]) -> ByteString {
+    if p.len() >= 32 {
+        p[..32].to_vec()
+    } else {
+        vec![0u8; 32]
+    }
 }
 
 /// Returns `hash256([0u8; 72])` in test mode.
@@ -572,5 +579,110 @@ mod tests {
     #[should_panic(expected = "i64 overflow")]
     fn test_gcd_min_panics() {
         gcd(i64::MIN, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // safediv
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_safediv_positive() {
+        // 10 / 3 truncates toward zero in Rust
+        assert_eq!(safediv(10, 3), 3);
+    }
+
+    #[test]
+    fn test_safediv_truncates_toward_zero() {
+        // Rust integer division truncates toward zero: -7 / 2 == -3 (not -4)
+        assert_eq!(safediv(-7, 2), -3);
+    }
+
+    #[test]
+    #[should_panic(expected = "safediv: division by zero")]
+    fn test_safediv_by_zero_panics() {
+        safediv(42, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // safemod
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_safemod_positive() {
+        assert_eq!(safemod(10, 3), 1);
+    }
+
+    #[test]
+    fn test_safemod_negative() {
+        // Rust % follows the sign of the dividend: -7 % 2 == -1
+        assert_eq!(safemod(-7, 2), -1);
+    }
+
+    // -----------------------------------------------------------------------
+    // clamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_clamp_within_range() {
+        assert_eq!(clamp(5, 0, 10), 5);
+    }
+
+    #[test]
+    fn test_clamp_below() {
+        assert_eq!(clamp(-1, 0, 10), 0);
+    }
+
+    #[test]
+    fn test_clamp_above() {
+        assert_eq!(clamp(15, 0, 10), 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // sign
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sign_positive() {
+        assert_eq!(sign(42), 1);
+    }
+
+    #[test]
+    fn test_sign_negative() {
+        assert_eq!(sign(-42), -1);
+    }
+
+    #[test]
+    fn test_sign_zero() {
+        assert_eq!(sign(0), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // sqrt
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sqrt_perfect_square() {
+        assert_eq!(sqrt(9), 3);
+    }
+
+    #[test]
+    fn test_sqrt_non_perfect() {
+        // floor(sqrt(10)) == 3
+        assert_eq!(sqrt(10), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // log2
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_log2_power_of_two() {
+        assert_eq!(log2(8), 3);
+    }
+
+    #[test]
+    fn test_log2_non_power() {
+        // floor(log2(9)) == 3
+        assert_eq!(log2(9), 3);
     }
 }

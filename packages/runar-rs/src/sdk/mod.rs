@@ -10,6 +10,7 @@ pub mod signer;
 pub mod contract;
 pub mod oppushtx;
 pub mod sha256_compress;
+pub mod anf_interpreter;
 
 pub use types::*;
 pub use state::{serialize_state, deserialize_state, extract_state_from_script, find_last_op_return};

@@ -59,6 +59,9 @@ export { TokenWallet } from './tokens.js';
 export { InductiveProofManager, PROOF_SIZE, ZERO_PROOF } from './inductive-proof.js';
 export type { ProofGenerator } from './inductive-proof.js';
 
+// ANF interpreter (auto-compute state transitions)
+export { computeNewState } from './anf-interpreter.js';
+
 // Code generation
 export { generateTypescript } from './codegen/index.js';
 
