@@ -195,6 +195,13 @@ class StackMap:
             raise RuntimeError("stack underflow on dup")
         self.slots.append(self.slots[-1])
 
+    def rename_at_depth(self, depth_from_top: int, new_name: Optional[str]) -> None:
+        """Rename a slot at a given depth from top."""
+        idx = len(self.slots) - 1 - depth_from_top
+        if idx < 0 or idx >= len(self.slots):
+            raise RuntimeError(f"invalid stack depth for rename: {depth_from_top}")
+        self.slots[idx] = new_name if new_name is not None else ""
+
     def named_slots(self) -> set[str]:
         """Return the set of all non-empty slot names."""
         return {s for s in self.slots if s}
@@ -290,6 +297,7 @@ class _LoweringContext:
         self.private_methods: dict[str, ANFMethod] = {}
         self.local_bindings: dict[str, bool] = {}
         self.outer_protected_refs: Optional[set[str]] = None
+        self.inside_branch: bool = False
         self._track_depth()
 
     def _track_depth(self) -> None:
@@ -825,12 +833,22 @@ class _LoweringContext:
     def _lower_method_call(self, binding_name: str, _obj: str, method: str,
                            args: list[str], binding_index: int, last_uses: dict[str, int]) -> None:
         if method == "getStateScript":
+            # Consume the @this object reference — compile-time concept, not a runtime value.
+            if self.sm.has(_obj):
+                self.bring_to_top(_obj, True)
+                self.emit_op(StackOp(op="drop"))
+                self.sm.pop()
             self._lower_get_state_script(binding_name)
             return
 
         # Check if this is a private method call that should be inlined
         private_method = self.private_methods.get(method)
         if private_method is not None:
+            # Consume the @this object reference — compile-time concept, not a runtime value.
+            if self.sm.has(_obj):
+                self.bring_to_top(_obj, True)
+                self.emit_op(StackOp(op="drop"))
+                self.sm.pop()
             self._inline_method_call(binding_name, private_method, args, binding_index, last_uses)
             return
 
@@ -840,17 +858,40 @@ class _LoweringContext:
     def _inline_method_call(self, binding_name: str, method: ANFMethod,
                             args: list[str], binding_index: int, last_uses: dict[str, int]) -> None:
         """Inline a private method by lowering its body in the current context."""
+        # Track shadowed names so we can restore them after the body runs.
+        # When a param name already exists on the stack, temporarily rename
+        # the existing entry to avoid duplicate names which break Set-based
+        # branch reconciliation in lower_if.
+        shadowed: list[dict[str, object]] = []
+
         # Bring all args to top and rename them to the method param names
         for i, arg in enumerate(args):
             if i < len(method.params):
+                param_name = method.params[i].name
                 is_last = self._is_last_use(arg, binding_index, last_uses)
                 self.bring_to_top(arg, is_last)
-                # Rename to param name
                 self.sm.pop()
-                self.sm.push(method.params[i].name)
+
+                # If param_name already exists on the stack, temporarily rename
+                # the existing entry to prevent duplicate-name issues.
+                if self.sm.has(param_name):
+                    existing_depth = self.sm.find_depth(param_name)
+                    shadowed_name = f"__shadowed_{binding_index}_{param_name}"
+                    self.sm.rename_at_depth(existing_depth, shadowed_name)
+                    shadowed.append({"param_name": param_name, "shadowed_name": shadowed_name})
+
+                self.sm.push(param_name)
 
         # Lower the method body
         self.lower_bindings(method.body, False)
+
+        # Restore shadowed names so the caller's scope sees its original entries.
+        for entry in shadowed:
+            sn = str(entry["shadowed_name"])
+            pn = str(entry["param_name"])
+            if self.sm.has(sn):
+                depth = self.sm.find_depth(sn)
+                self.sm.rename_at_depth(depth, pn)
 
         # The last binding's result should be on top of the stack.
         # Rename it to the calling binding name.
@@ -887,6 +928,7 @@ class _LoweringContext:
         then_ctx = _LoweringContext(None, self.properties)
         then_ctx.sm = self.sm.clone()
         then_ctx.outer_protected_refs = protected_refs
+        then_ctx.inside_branch = True
         then_ctx.lower_bindings(then_bindings, terminal_assert)
 
         if terminal_assert and then_ctx.sm.depth() > 1:
@@ -899,6 +941,7 @@ class _LoweringContext:
         else_ctx = _LoweringContext(None, self.properties)
         else_ctx.sm = self.sm.clone()
         else_ctx.outer_protected_refs = protected_refs
+        else_ctx.inside_branch = True
         else_ctx.lower_bindings(else_bindings, terminal_assert)
 
         if terminal_assert and else_ctx.sm.depth() > 1:
@@ -917,11 +960,17 @@ class _LoweringContext:
         # but gone after then). Emit targeted ROLL+DROP in the else-branch
         # to remove those same items, then push empty bytes as placeholder.
         # OP_CAT with empty bytes is identity (no-op for output hashing).
+        # Phase 1: collect consumed names from both directions.
         post_then_names = then_ctx.sm.named_slots()
         consumed_names = [n for n in pre_if_names
                           if n not in post_then_names and else_ctx.sm.has(n)]
+        post_else_names = else_ctx.sm.named_slots()
+        else_consumed_names = [n for n in pre_if_names
+                               if n not in post_else_names and then_ctx.sm.has(n)]
+
+        # Phase 2: perform ALL drops before any placeholder pushes.
+        # This prevents double-placeholder when bilateral drops balance each other.
         if consumed_names:
-            # Remove consumed items from else-branch, deepest first
             depths = sorted([else_ctx.sm.find_depth(n) for n in consumed_names], reverse=True)
             for depth in depths:
                 if depth == 0:
@@ -931,7 +980,6 @@ class _LoweringContext:
                     else_ctx.emit_op(StackOp(op="nip"))
                     else_ctx.sm.remove_at_depth(1)
                 else:
-                    # Push depth, ROLL to bring item to top, then DROP
                     else_ctx.emit_op(StackOp(op="push", value=big_int_push(depth)))
                     else_ctx.sm.push("")
                     else_ctx.emit_op(StackOp(op="roll", depth=depth))
@@ -940,13 +988,6 @@ class _LoweringContext:
                     else_ctx.sm.push(rolled)
                     else_ctx.emit_op(StackOp(op="drop"))
                     else_ctx.sm.pop()
-            # Push empty bytes as placeholder result
-            else_ctx.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=b"")))
-            else_ctx.sm.push("")
-        # Handle the reverse case symmetrically (unlikely but safe)
-        post_else_names = else_ctx.sm.named_slots()
-        else_consumed_names = [n for n in pre_if_names
-                               if n not in post_else_names and then_ctx.sm.has(n)]
         if else_consumed_names:
             depths = sorted([then_ctx.sm.find_depth(n) for n in else_consumed_names], reverse=True)
             for depth in depths:
@@ -965,6 +1006,13 @@ class _LoweringContext:
                     then_ctx.sm.push(rolled)
                     then_ctx.emit_op(StackOp(op="drop"))
                     then_ctx.sm.pop()
+
+        # Phase 3: single depth-balance check after ALL drops.
+        # Push placeholder only if one branch is still deeper than the other.
+        if then_ctx.sm.depth() > else_ctx.sm.depth():
+            else_ctx.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=b"")))
+            else_ctx.sm.push("")
+        elif else_ctx.sm.depth() > then_ctx.sm.depth():
             then_ctx.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=b"")))
             then_ctx.sm.push("")
 
@@ -983,7 +1031,37 @@ class _LoweringContext:
                 depth = self.sm.find_depth(name)
                 self.sm.remove_at_depth(depth)
 
-        self.sm.push(binding_name)
+        # The if expression may produce a result value on top.
+        if then_ctx.sm.depth() > self.sm.depth():
+            then_top = then_ctx.sm.peek_at_depth(0)
+            else_top = else_ctx.sm.peek_at_depth(0) if else_ctx.sm.depth() > 0 else ""
+            is_property = any(p.name == then_top for p in self.properties)
+            if (is_property and then_top and then_top == else_top
+                    and then_top != binding_name and self.sm.has(then_top)):
+                # Both branches did update_prop for the same property
+                self.sm.push(then_top)
+                for d in range(1, self.sm.depth()):
+                    if self.sm.peek_at_depth(d) == then_top:
+                        if d == 1:
+                            self.emit_op(StackOp(op="nip"))
+                            self.sm.remove_at_depth(1)
+                        else:
+                            self.emit_op(StackOp(op="push", value=big_int_push(d)))
+                            self.sm.push("")
+                            self.emit_op(StackOp(op="roll", depth=d + 1))
+                            self.sm.pop()
+                            rolled = self.sm.remove_at_depth(d)
+                            self.sm.push(rolled)
+                            self.emit_op(StackOp(op="drop"))
+                            self.sm.pop()
+                        break
+            else:
+                self.sm.push(binding_name)
+        elif else_ctx.sm.depth() > self.sm.depth():
+            self.sm.push(binding_name)
+        else:
+            pass  # Void if — don't push phantom
+
         self._track_depth()
 
         if then_ctx.max_depth > self.max_depth:
@@ -1076,6 +1154,30 @@ class _LoweringContext:
         self.bring_to_top(value_ref, is_last)
         self.sm.pop()
         self.sm.push(prop_name)
+
+        # When NOT inside an if-branch, remove the old property entry from
+        # the stack. After liftBranchUpdateProps transforms conditional
+        # property updates into flat if-expressions + top-level update_prop,
+        # the old value is dead and must be removed to keep stack depth correct.
+        # Inside branches, the old value is kept for lower_if's same-property
+        # detection to handle correctly.
+        if not self.inside_branch:
+            for d in range(1, self.sm.depth()):
+                if self.sm.peek_at_depth(d) == prop_name:
+                    if d == 1:
+                        self.emit_op(StackOp(op="nip"))
+                        self.sm.remove_at_depth(1)
+                    else:
+                        self.emit_op(StackOp(op="push", value=big_int_push(d)))
+                        self.sm.push("")
+                        self.emit_op(StackOp(op="roll", depth=d + 1))
+                        self.sm.pop()
+                        rolled = self.sm.remove_at_depth(d)
+                        self.sm.push(rolled)
+                        self.emit_op(StackOp(op="drop"))
+                        self.sm.pop()
+                    break
+
         self._track_depth()
 
     # -----------------------------------------------------------------

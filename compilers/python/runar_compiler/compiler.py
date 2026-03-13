@@ -59,6 +59,7 @@ class StateField:
     name: str = ""
     type: str = ""
     index: int = 0
+    initial_value: str | int | bool | None = None
 
 
 @dataclass
@@ -84,6 +85,7 @@ class Artifact:
     code_separator_index: int | None = None
     code_separator_indices: list[int] | None = None
     build_timestamp: str = ""
+    anf: ANFProgram | None = None
 
 
 SCHEMA_VERSION = "runar-v0.1.0"
@@ -305,9 +307,12 @@ def _assemble_artifact(
 ) -> Artifact:
     """Build the final output artifact from the compilation products."""
     # Build ABI
+    # Initialized properties are excluded from constructor params — they
+    # get their values from the initializer, not from the caller.
     constructor_params = [
         ABIParam(name=prop.name, type=prop.type)
         for prop in program.properties
+        if prop.initial_value is None
     ]
 
     # Build state fields for stateful contracts
@@ -315,12 +320,18 @@ def _assemble_artifact(
     state_fields: list[StateField] = []
     for i, prop in enumerate(program.properties):
         if not prop.readonly:
-            state_fields.append(StateField(name=prop.name, type=prop.type, index=i))
+            sf = StateField(name=prop.name, type=prop.type, index=i)
+            if prop.initial_value is not None:
+                sf.initial_value = prop.initial_value
+            state_fields.append(sf)
 
     is_stateful = len(state_fields) > 0
 
+    # Build method ABIs (exclude constructor — it's in abi.constructor, not methods)
     methods: list[ABIMethod] = []
     for method in program.methods:
+        if method.name == "constructor":
+            continue
         params = [ABIParam(name=p.name, type=p.type) for p in method.params]
         # For stateful contracts, mark public methods without _changePKH as terminal
         is_terminal: bool | None = None
@@ -338,7 +349,7 @@ def _assemble_artifact(
     cs_index = code_separator_index if code_separator_index >= 0 else None
     cs_indices = code_separator_indices if code_separator_indices else None
 
-    return Artifact(
+    art = Artifact(
         version=SCHEMA_VERSION,
         compiler_version=COMPILER_VERSION,
         contract_name=program.contract_name,
@@ -354,6 +365,13 @@ def _assemble_artifact(
         code_separator_indices=cs_indices,
         build_timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
+
+    # Always include ANF IR for stateful contracts — the SDK uses it
+    # to auto-compute state transitions without requiring manual newState.
+    if is_stateful:
+        art.anf = program
+
+    return art
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +406,10 @@ def artifact_to_json(artifact: Artifact) -> str:
     }
     if artifact.state_fields:
         d["stateFields"] = [
-            {"name": sf.name, "type": sf.type, "index": sf.index}
+            {
+                "name": sf.name, "type": sf.type, "index": sf.index,
+                **({"initialValue": sf.initial_value} if sf.initial_value is not None else {}),
+            }
             for sf in artifact.state_fields
         ]
     if artifact.constructor_slots:
@@ -401,12 +422,92 @@ def artifact_to_json(artifact: Artifact) -> str:
     if artifact.code_separator_indices is not None:
         d["codeSeparatorIndices"] = artifact.code_separator_indices
     d["buildTimestamp"] = artifact.build_timestamp
+    if artifact.anf is not None:
+        d["anf"] = _serialize_anf_program(artifact.anf)
     return json.dumps(d, indent=2)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
+    """Serialize an ANFProgram to a JSON-compatible dict (camelCase keys)."""
+    def _ser_value(v: Any) -> dict[str, Any]:
+        """Serialize an ANFValue to a dict."""
+        d: dict[str, Any] = {"kind": v.kind}
+        if v.name is not None:
+            d["name"] = v.name
+        if v.raw_value is not None:
+            # raw_value is already JSON-ready (string, number, bool)
+            d["value"] = json.loads(v.raw_value) if isinstance(v.raw_value, str) else v.raw_value
+        if v.op is not None:
+            d["op"] = v.op
+        if v.left is not None:
+            d["left"] = v.left
+        if v.right is not None:
+            d["right"] = v.right
+        if v.result_type is not None:
+            d["result_type"] = v.result_type
+        if v.operand is not None:
+            d["operand"] = v.operand
+        if v.func is not None:
+            d["func"] = v.func
+        if v.args is not None:
+            d["args"] = v.args
+        if v.object is not None:
+            d["object"] = v.object
+        if v.method is not None:
+            d["method"] = v.method
+        if v.cond is not None:
+            d["cond"] = v.cond
+        if v.then is not None:
+            d["then"] = [_ser_binding(b) for b in v.then]
+        if v.else_ is not None:
+            d["else"] = [_ser_binding(b) for b in v.else_]
+        if v.count is not None:
+            d["count"] = v.count
+        if v.iter_var is not None:
+            d["iterVar"] = v.iter_var
+        if v.body is not None:
+            d["body"] = [_ser_binding(b) for b in v.body]
+        if v.value_ref is not None:
+            d["value"] = v.value_ref
+        if v.preimage is not None:
+            d["preimage"] = v.preimage
+        if v.satoshis is not None:
+            d["satoshis"] = v.satoshis
+        if v.state_values is not None:
+            d["stateValues"] = v.state_values
+        if v.script_bytes is not None:
+            d["scriptBytes"] = v.script_bytes
+        return d
+
+    def _ser_binding(b: Any) -> dict[str, Any]:
+        return {"name": b.name, "value": _ser_value(b.value)}
+
+    return {
+        "contractName": program.contract_name,
+        "properties": [
+            {
+                "name": p.name,
+                "type": p.type,
+                "readonly": p.readonly,
+                **({"initialValue": p.initial_value} if p.initial_value is not None else {}),
+            }
+            for p in program.properties
+        ],
+        "methods": [
+            {
+                "name": m.name,
+                "params": [{"name": p.name, "type": p.type} for p in m.params],
+                "body": [_ser_binding(b) for b in m.body],
+                "isPublic": m.is_public,
+            }
+            for m in program.methods
+        ],
+    }
+
 
 class CompilationError(Exception):
     """Raised when any compiler pass produces errors."""

@@ -46,6 +46,9 @@ export { buildP2PKHScript } from './script-utils.js';
 // Token management
 export { TokenWallet } from './tokens.js';
 
+// ANF interpreter (auto-compute state transitions)
+export { computeNewState } from './anf-interpreter.js';
+
 // Code generation
 export { generateTypescript } from './codegen/index.js';
 

@@ -291,7 +291,7 @@ func TestOptimizer_Push1Roll_BecomesSwap(t *testing.T) {
 func TestOptimizer_Push2Roll_BecomesRot(t *testing.T) {
 	ops := []StackOp{
 		pushBigIntOp(2),
-		{Op: "roll"},
+		{Op: "roll", Depth: 2},
 	}
 	result := OptimizeStackOps(ops)
 	if len(result) != 1 {

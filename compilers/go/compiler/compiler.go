@@ -43,9 +43,10 @@ type ABI struct {
 
 // StateField describes a stateful contract field.
 type StateField struct {
-	Name  string `json:"name"`
-	Type  string `json:"type"`
-	Index int    `json:"index"`
+	Name         string      `json:"name"`
+	Type         string      `json:"type"`
+	Index        int         `json:"index"`
+	InitialValue interface{} `json:"initialValue,omitempty"`
 }
 
 // ConstructorSlot records a constructor parameter placeholder in the compiled script.
@@ -122,9 +123,13 @@ func CompileFromProgram(program *ir.ANFProgram) (*Artifact, error) {
 // assembleArtifact builds the final output artifact from the compilation products.
 func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, constructorSlots []ConstructorSlot) *Artifact {
 	// Build ABI
-	constructorParams := make([]ABIParam, len(program.Properties))
-	for i, prop := range program.Properties {
-		constructorParams[i] = ABIParam{Name: prop.Name, Type: prop.Type}
+	// Build constructor params, excluding properties with initializers
+	// (properties with default values are not constructor parameters).
+	var constructorParams []ABIParam
+	for _, prop := range program.Properties {
+		if prop.InitialValue == nil {
+			constructorParams = append(constructorParams, ABIParam{Name: prop.Name, Type: prop.Type})
+		}
 	}
 
 	// Build state fields for stateful contracts.
@@ -132,17 +137,25 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 	var stateFields []StateField
 	for i, prop := range program.Properties {
 		if !prop.Readonly {
-			stateFields = append(stateFields, StateField{
+			sf := StateField{
 				Name:  prop.Name,
 				Type:  prop.Type,
 				Index: i,
-			})
+			}
+			if prop.InitialValue != nil {
+				sf.InitialValue = prop.InitialValue
+			}
+			stateFields = append(stateFields, sf)
 		}
 	}
 
 	isStateful := len(stateFields) > 0
-	methods := make([]ABIMethod, len(program.Methods))
-	for i, method := range program.Methods {
+	// Build method ABIs (exclude constructor — it's in abi.constructor, not methods)
+	var methods []ABIMethod
+	for _, method := range program.Methods {
+		if method.Name == "constructor" {
+			continue
+		}
 		params := make([]ABIParam, len(method.Params))
 		for j, p := range method.Params {
 			params[j] = ABIParam{Name: p.Name, Type: p.Type}
@@ -166,7 +179,7 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 				m.IsTerminal = &t
 			}
 		}
-		methods[i] = m
+		methods = append(methods, m)
 	}
 
 	return &Artifact{

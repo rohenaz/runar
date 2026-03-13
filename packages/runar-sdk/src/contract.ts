@@ -11,6 +11,7 @@ import { buildCallTransaction } from './calling.js';
 import { serializeState, extractStateFromScript, findLastOpReturn } from './state.js';
 import { computeOpPushTx } from './oppushtx.js';
 import { buildP2PKHScript } from './script-utils.js';
+import { computeNewState } from './anf-interpreter.js';
 import { Utils, Hash, Transaction as BsvTransaction, LockingScript, UnlockingScript } from '@bsv/sdk';
 
 /**
@@ -584,7 +585,15 @@ export class RunarContract {
     } else if (isStateful) {
       newSatoshis = options?.satoshis ?? this.currentUtxo.satoshis;
       if (options?.newState) {
+        // Explicit newState takes priority (backward compat)
         this._state = { ...this._state, ...options.newState };
+      } else if (methodNeedsChange && this.artifact.anf) {
+        // Auto-compute new state from ANF IR
+        const namedArgs = buildNamedArgs(userParams, resolvedArgs);
+        const computed = computeNewState(
+          this.artifact.anf, methodName, this._state, namedArgs,
+        );
+        this._state = { ...this._state, ...computed };
       }
       newLockingScript = this.getLockingScript();
     }
@@ -1229,6 +1238,21 @@ function reviveJsonValue(value: unknown, type: string): unknown {
     return BigInt(value);
   }
   return value;
+}
+
+/**
+ * Build a named argument map from positional args and user-visible params.
+ * Used to feed the ANF interpreter for auto-state computation.
+ */
+function buildNamedArgs(
+  userParams: Array<{ name: string; type: string }>,
+  resolvedArgs: unknown[],
+): Record<string, unknown> {
+  const named: Record<string, unknown> = {};
+  for (let i = 0; i < userParams.length; i++) {
+    named[userParams[i]!.name] = resolvedArgs[i];
+  }
+  return named;
 }
 
 // ---------------------------------------------------------------------------

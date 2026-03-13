@@ -197,6 +197,11 @@ impl StackMap {
         &self.slots[index]
     }
 
+    fn rename_at_depth(&mut self, depth_from_top: usize, new_name: &str) {
+        let idx = self.slots.len() - 1 - depth_from_top;
+        self.slots[idx] = new_name.to_string();
+    }
+
     fn swap(&mut self) {
         let n = self.slots.len();
         assert!(n >= 2, "stack underflow on swap");
@@ -323,6 +328,9 @@ struct LoweringContext {
     local_bindings: HashSet<String>,
     /// Parent-scope refs that must not be consumed (used after current if-branch).
     outer_protected_refs: Option<HashSet<String>>,
+    /// True when executing inside an if-branch. update_prop skips old-value
+    /// removal so that the same-property detection in lower_if can handle it.
+    inside_branch: bool,
 }
 
 impl LoweringContext {
@@ -335,6 +343,7 @@ impl LoweringContext {
             private_methods: HashMap::new(),
             local_bindings: HashSet::new(),
             outer_protected_refs: None,
+            inside_branch: false,
         };
         ctx.track_depth();
         ctx
@@ -1025,12 +1034,20 @@ impl LoweringContext {
     fn lower_method_call(
         &mut self,
         binding_name: &str,
-        _object: &str,
+        object: &str,
         method: &str,
         args: &[String],
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
+        // Consume the @this object reference — it's a compile-time concept,
+        // not a runtime value. Without this, 0n stays on the stack.
+        if self.sm.has(object) {
+            self.bring_to_top(object, true);
+            self.emit_op(StackOp::Drop);
+            self.sm.pop();
+        }
+
         if method == "getStateScript" {
             self.lower_get_state_script(binding_name);
             return;
@@ -1056,19 +1073,45 @@ impl LoweringContext {
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
-        // First, bring all args to the top of the stack and rename them to the method param names
+        // Track shadowed names so we can restore them after the body runs.
+        // When a param name already exists on the stack, temporarily rename
+        // the existing entry to avoid duplicate names which break Set-based
+        // branch reconciliation in lower_if.
+        let mut shadowed: Vec<(String, String)> = Vec::new();
+
+        // Bind call arguments to private method params.
         for (i, arg) in args.iter().enumerate() {
             if i < method.params.len() {
                 let is_last = self.is_last_use(arg, binding_index, last_uses);
                 self.bring_to_top(arg, is_last);
-                // Rename to param name
                 self.sm.pop();
-                self.sm.push(&method.params[i].name);
+
+                let param_name = &method.params[i].name;
+
+                // If param_name already exists on the stack, shadow it by renaming
+                // the existing entry to prevent duplicate-name issues.
+                if self.sm.has(param_name) {
+                    let existing_depth = self.sm.find_depth(param_name).unwrap();
+                    let shadowed_name = format!("__shadowed_{}_{}", binding_index, param_name);
+                    self.sm.rename_at_depth(existing_depth, &shadowed_name);
+                    shadowed.push((param_name.clone(), shadowed_name));
+                }
+
+                // Rename to param name
+                self.sm.push(param_name);
             }
         }
 
         // Lower the method body
         self.lower_bindings(&method.body, false);
+
+        // Restore shadowed names so the caller's scope sees its original entries.
+        for (param_name, shadowed_name) in &shadowed {
+            if self.sm.has(shadowed_name) {
+                let depth = self.sm.find_depth(shadowed_name).unwrap();
+                self.sm.rename_at_depth(depth, param_name);
+            }
+        }
 
         // The last binding's result should be on top of the stack.
         // Rename it to the calling binding name.
@@ -1113,6 +1156,7 @@ impl LoweringContext {
         let mut then_ctx = LoweringContext::new(&[], &self.properties);
         then_ctx.sm = self.sm.clone();
         then_ctx.outer_protected_refs = Some(protected_refs.clone());
+        then_ctx.inside_branch = true;
         then_ctx.lower_bindings(then_bindings, terminal_assert);
 
         if terminal_assert && then_ctx.sm.depth() > 1 {
@@ -1127,6 +1171,7 @@ impl LoweringContext {
         let mut else_ctx = LoweringContext::new(&[], &self.properties);
         else_ctx.sm = self.sm.clone();
         else_ctx.outer_protected_refs = Some(protected_refs);
+        else_ctx.inside_branch = true;
         else_ctx.lower_bindings(else_bindings, terminal_assert);
 
         if terminal_assert && else_ctx.sm.depth() > 1 {
@@ -1147,6 +1192,8 @@ impl LoweringContext {
         // but gone after then). Emit targeted ROLL+DROP in the else-branch
         // to remove those same items, then push empty bytes as placeholder.
         // OP_CAT with empty bytes is identity (no-op for output hashing).
+        // Identify items consumed asymmetrically between branches.
+        // Phase 1: collect consumed names from both directions.
         let post_then_names = then_ctx.sm.named_slots();
         let mut consumed_names: Vec<String> = Vec::new();
         for name in &pre_if_names {
@@ -1154,8 +1201,17 @@ impl LoweringContext {
                 consumed_names.push(name.clone());
             }
         }
+        let post_else_names = else_ctx.sm.named_slots();
+        let mut else_consumed_names: Vec<String> = Vec::new();
+        for name in &pre_if_names {
+            if !post_else_names.contains(name) && then_ctx.sm.has(name) {
+                else_consumed_names.push(name.clone());
+            }
+        }
+
+        // Phase 2: perform ALL drops before any placeholder pushes.
+        // This prevents double-placeholder when bilateral drops balance each other.
         if !consumed_names.is_empty() {
-            // Remove consumed items from else-branch, deepest first to keep depths stable
             let mut depths: Vec<usize> = consumed_names
                 .iter()
                 .map(|n| else_ctx.sm.find_depth(n).unwrap())
@@ -1169,27 +1225,15 @@ impl LoweringContext {
                     else_ctx.emit_op(StackOp::Nip);
                     else_ctx.sm.remove_at_depth(1);
                 } else {
-                    // Push depth, ROLL to bring item to top, then DROP
                     else_ctx.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
                     else_ctx.sm.push("");
                     else_ctx.emit_op(StackOp::Roll { depth });
-                    else_ctx.sm.pop(); // remove depth literal
+                    else_ctx.sm.pop();
                     let rolled = else_ctx.sm.remove_at_depth(depth);
                     else_ctx.sm.push(&rolled);
                     else_ctx.emit_op(StackOp::Drop);
                     else_ctx.sm.pop();
                 }
-            }
-            // Push empty bytes as placeholder result
-            else_ctx.emit_op(StackOp::Push(PushValue::Bytes(Vec::new())));
-            else_ctx.sm.push("");
-        }
-        // Handle the reverse case symmetrically (unlikely but safe)
-        let post_else_names = else_ctx.sm.named_slots();
-        let mut else_consumed_names: Vec<String> = Vec::new();
-        for name in &pre_if_names {
-            if !post_else_names.contains(name) && then_ctx.sm.has(name) {
-                else_consumed_names.push(name.clone());
             }
         }
         if !else_consumed_names.is_empty() {
@@ -1216,6 +1260,14 @@ impl LoweringContext {
                     then_ctx.sm.pop();
                 }
             }
+        }
+
+        // Phase 3: single depth-balance check after ALL drops.
+        // Push placeholder only if one branch is still deeper than the other.
+        if then_ctx.sm.depth() > else_ctx.sm.depth() {
+            else_ctx.emit_op(StackOp::Push(PushValue::Bytes(Vec::new())));
+            else_ctx.sm.push("");
+        } else if else_ctx.sm.depth() > then_ctx.sm.depth() {
             then_ctx.emit_op(StackOp::Push(PushValue::Bytes(Vec::new())));
             then_ctx.sm.push("");
         }
@@ -1242,7 +1294,46 @@ impl LoweringContext {
             }
         }
 
-        self.sm.push(binding_name);
+        // The if expression may produce a result value on top.
+        if then_ctx.sm.depth() > self.sm.depth() {
+            let then_top = then_ctx.sm.peek_at_depth(0).to_string();
+            let else_top = if else_ctx.sm.depth() > 0 {
+                else_ctx.sm.peek_at_depth(0).to_string()
+            } else {
+                String::new()
+            };
+            let is_property = self.properties.iter().any(|p| p.name == then_top);
+            if is_property && !then_top.is_empty() && then_top == else_top
+                && then_top != binding_name && self.sm.has(&then_top)
+            {
+                // Both branches did update_prop for the same property
+                self.sm.push(&then_top);
+                for d in 1..self.sm.depth() {
+                    if self.sm.peek_at_depth(d) == then_top {
+                        if d == 1 {
+                            self.emit_op(StackOp::Nip);
+                            self.sm.remove_at_depth(1);
+                        } else {
+                            self.emit_op(StackOp::Push(PushValue::Int(d as i128)));
+                            self.sm.push("");
+                            self.emit_op(StackOp::Roll { depth: d + 1 });
+                            self.sm.pop();
+                            let rolled = self.sm.remove_at_depth(d);
+                            self.sm.push(&rolled);
+                            self.emit_op(StackOp::Drop);
+                            self.sm.pop();
+                        }
+                        break;
+                    }
+                }
+            } else {
+                self.sm.push(binding_name);
+            }
+        } else if else_ctx.sm.depth() > self.sm.depth() {
+            self.sm.push(binding_name);
+        } else {
+            // Void if — don't push phantom
+        }
         self.track_depth();
 
         if then_ctx.max_depth > self.max_depth {
@@ -1353,6 +1444,34 @@ impl LoweringContext {
         self.bring_to_top(value_ref, is_last);
         self.sm.pop();
         self.sm.push(prop_name);
+
+        // When NOT inside an if-branch, remove the old property entry from
+        // the stack. After liftBranchUpdateProps transforms conditional
+        // property updates into flat if-expressions + top-level update_prop,
+        // the old value is dead and must be removed to keep stack depth correct.
+        // Inside branches, the old value is kept for lower_if's same-property
+        // detection to handle correctly.
+        if !self.inside_branch {
+            for d in 1..self.sm.depth() {
+                if self.sm.peek_at_depth(d) == prop_name {
+                    if d == 1 {
+                        self.emit_op(StackOp::Nip);
+                        self.sm.remove_at_depth(1);
+                    } else {
+                        self.emit_op(StackOp::Push(PushValue::Int(d as i128)));
+                        self.sm.push("");
+                        self.emit_op(StackOp::Roll { depth: d + 1 });
+                        self.sm.pop();
+                        let rolled = self.sm.remove_at_depth(d);
+                        self.sm.push(&rolled);
+                        self.emit_op(StackOp::Drop);
+                        self.sm.pop();
+                    }
+                    break;
+                }
+            }
+        }
+
         self.track_depth();
     }
 

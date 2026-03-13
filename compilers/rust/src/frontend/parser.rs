@@ -966,11 +966,11 @@ fn parse_binary_expression(
         swc::BinaryOp::BitOr => BinaryOp::BitOr,
         swc::BinaryOp::BitXor => BinaryOp::BitXor,
         swc::BinaryOp::EqEq => {
-            errors.push("Use === instead of == for equality comparison".to_string());
+            // Accept == and map to === (same as TS and Go parsers)
             BinaryOp::StrictEq
         }
         swc::BinaryOp::NotEq => {
-            errors.push("Use !== instead of != for inequality comparison".to_string());
+            // Accept != and map to !== (same as TS and Go parsers)
             BinaryOp::StrictNe
         }
         _ => {
