@@ -12,7 +12,7 @@ import { resolve } from 'node:path';
 import { PrivateKey } from '@bsv/sdk';
 import { ScriptExecutionContract } from '../script-execution.js';
 import { TestContract } from '../test-contract.js';
-import { ALICE, BOB, CHARLIE, DAVE, EVE, FRANK, GRACE, HEIDI, IVAN } from '../test-keys.js';
+import { ALICE, BOB, CHARLIE, DAVE, EVE, FRANK, GRACE, HEIDI } from '../test-keys.js';
 
 function privKey(hex: string): PrivateKey {
   return new PrivateKey(hex, 16);

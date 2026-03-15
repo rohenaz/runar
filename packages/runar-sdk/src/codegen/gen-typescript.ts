@@ -133,6 +133,18 @@ export function generateTypescript(artifact: RunarArtifact): string {
   emit('  }');
   blank();
 
+  // deployWithWallet
+  emit('  async deployWithWallet(options: { satoshis?: number; description?: string } = {}): Promise<{ txid: string; outputIndex: number }> {');
+  emit('    return this.inner.deployWithWallet(options);');
+  emit('  }');
+  blank();
+
+  // getLockingScript
+  emit('  getLockingScript(): string {');
+  emit('    return this.inner.getLockingScript();');
+  emit('  }');
+  blank();
+
   // contract getter
   emit('  get contract(): RunarContract {');
   emit('    return this.inner;');

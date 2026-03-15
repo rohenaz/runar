@@ -269,7 +269,9 @@ function foldBinding(binding: ANFBinding, env: ConstEnv): ANFBinding {
     }
   }
 
-  return { name, value: foldedValue };
+  const result: ANFBinding = { name, value: foldedValue };
+  if (binding.sourceLoc) result.sourceLoc = binding.sourceLoc;
+  return result;
 }
 
 function foldValue(value: ANFValue, env: ConstEnv): ANFValue {

@@ -277,6 +277,8 @@ export function compile(source: string, options?: CompileOptions): CompileResult
         constructorSlots: emitResult.constructorSlots,
         codeSeparatorIndex: emitResult.codeSeparatorIndex,
         codeSeparatorIndices: emitResult.codeSeparatorIndices,
+        includeSourceMap: emitResult.sourceMap.length > 0,
+        sourceMappings: emitResult.sourceMap,
       },
     );
 
