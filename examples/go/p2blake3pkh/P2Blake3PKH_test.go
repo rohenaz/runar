@@ -7,9 +7,9 @@ import (
 )
 
 func TestP2Blake3PKH_Unlock(t *testing.T) {
-	pk := runar.MockPubKey()
+	pk := runar.Alice.PubKey
 	c := &P2Blake3PKH{PubKeyHash: runar.Blake3Hash(pk)}
-	c.Unlock(runar.MockSig(), pk)
+	c.Unlock(runar.SignTestMessage(runar.Alice.PrivKey), pk)
 }
 
 func TestP2Blake3PKH_Unlock_WrongHash(t *testing.T) {
@@ -18,11 +18,11 @@ func TestP2Blake3PKH_Unlock_WrongHash(t *testing.T) {
 			t.Fatal("expected assertion failure for wrong public key hash")
 		}
 	}()
-	pk := runar.MockPubKey()
+	pk := runar.Alice.PubKey
 	// blake3Hash is mocked (always returns 32 zero bytes), so use a non-matching hash
 	wrongHash := runar.ByteString(string(make([]byte, 31)) + "\xff")
 	c := &P2Blake3PKH{PubKeyHash: wrongHash}
-	c.Unlock(runar.MockSig(), pk)
+	c.Unlock(runar.SignTestMessage(runar.Alice.PrivKey), pk)
 }
 
 func TestP2Blake3PKH_Compile(t *testing.T) {

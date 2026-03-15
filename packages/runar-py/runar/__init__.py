@@ -1,6 +1,6 @@
 """Runar - TypeScript-to-Bitcoin Script Compiler (Python runtime).
 
-Provides types, mock crypto, real hashes, EC operations, and base classes
+Provides types, real crypto, real hashes, EC operations, and base classes
 for writing and testing Runar smart contracts in Python.
 """
 
@@ -25,6 +25,16 @@ from runar.builtins import (
     verify_slh_dsa_sha2_192s, verify_slh_dsa_sha2_192f,
     verify_slh_dsa_sha2_256s, verify_slh_dsa_sha2_256f,
     blake3_compress, blake3_hash,
+)
+from runar.ecdsa import (
+    sign_test_message, pub_key_from_priv_key,
+    ecdsa_verify, ecdsa_sign,
+    TEST_MESSAGE, TEST_MESSAGE_DIGEST,
+)
+from runar.test_keys import (
+    TestKeyPair, TEST_KEYS,
+    ALICE, BOB, CHARLIE, DAVE, EVE,
+    FRANK, GRACE, HEIDI, IVAN, JUDY,
 )
 from runar.wots import wots_keygen, wots_sign, WOTSKeyPair
 from runar.slhdsa_impl import slh_keygen, slh_verify, SLHKeyPair
@@ -67,6 +77,13 @@ __all__ = [
     'verify_slh_dsa_sha2_128s', 'verify_slh_dsa_sha2_128f',
     'verify_slh_dsa_sha2_192s', 'verify_slh_dsa_sha2_192f',
     'verify_slh_dsa_sha2_256s', 'verify_slh_dsa_sha2_256f',
+    # ECDSA
+    'ecdsa_verify', 'ecdsa_sign', 'sign_test_message', 'pub_key_from_priv_key',
+    'TEST_MESSAGE', 'TEST_MESSAGE_DIGEST',
+    # Test keys
+    'TestKeyPair', 'TEST_KEYS',
+    'ALICE', 'BOB', 'CHARLIE', 'DAVE', 'EVE',
+    'FRANK', 'GRACE', 'HEIDI', 'IVAN', 'JUDY',
     # Preimage extraction
     'extract_locktime', 'extract_output_hash', 'extract_amount',
     'extract_version', 'extract_sequence',

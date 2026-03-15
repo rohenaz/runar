@@ -15,6 +15,8 @@
 import { describe, it, expect } from 'vitest';
 import { compile } from 'runar-compiler';
 import { TestContract } from '../test-contract.js';
+import { ALICE, BOB } from '../test-keys.js';
+import { signTestMessage } from '../crypto/ecdsa.js';
 
 // ---------------------------------------------------------------------------
 // Contract source: minimal stateful contract with 2 addOutput calls
@@ -139,16 +141,17 @@ describe('Multi-output stateful contracts', () => {
   });
 
   describe('Interpreter execution (TestContract)', () => {
+    const aliceSig = signTestMessage(ALICE.privKey);
+
     it('two-output split: interpreter succeeds with correct state', () => {
-      const pk = '02' + 'ab'.repeat(32);
       const contract = TestContract.fromSource(
         twoOutputSource,
-        { owner: pk, balance: 1000n },
+        { owner: ALICE.pubKey, balance: 1000n },
         'TwoOutput.runar.ts',
       );
       // split(sig, amount, outputSatoshis)
       const result = contract.call('split', {
-        sig: '00'.repeat(72),
+        sig: aliceSig,
         amount: 300n,
         outputSatoshis: 1n,
       });
@@ -156,33 +159,29 @@ describe('Multi-output stateful contracts', () => {
     });
 
     it('single-output send: interpreter succeeds', () => {
-      const pk = '02' + 'ab'.repeat(32);
-      const recipientPk = '03' + 'cd'.repeat(32);
       const contract = TestContract.fromSource(
         singleOutputSource,
-        { owner: pk, balance: 500n },
+        { owner: ALICE.pubKey, balance: 500n },
         'SingleOutput.runar.ts',
       );
       const result = contract.call('send', {
-        sig: '00'.repeat(72),
-        to: recipientPk,
+        sig: aliceSig,
+        to: BOB.pubKey,
         outputSatoshis: 1n,
       });
       expect(result.success).toBe(true);
     });
 
     it('conditional-output transfer (full amount): interpreter succeeds', () => {
-      const pk = '02' + 'ab'.repeat(32);
-      const recipientPk = '03' + 'cd'.repeat(32);
       const contract = TestContract.fromSource(
         conditionalOutputSource,
-        { owner: pk, balance: 1000n },
+        { owner: ALICE.pubKey, balance: 1000n },
         'ConditionalOutput.runar.ts',
       );
       // Transfer full amount (no second output)
       const result = contract.call('transfer', {
-        sig: '00'.repeat(72),
-        to: recipientPk,
+        sig: aliceSig,
+        to: BOB.pubKey,
         amount: 1000n,
         outputSatoshis: 1n,
       });
@@ -190,17 +189,15 @@ describe('Multi-output stateful contracts', () => {
     });
 
     it('conditional-output transfer (partial amount): interpreter succeeds', () => {
-      const pk = '02' + 'ab'.repeat(32);
-      const recipientPk = '03' + 'cd'.repeat(32);
       const contract = TestContract.fromSource(
         conditionalOutputSource,
-        { owner: pk, balance: 1000n },
+        { owner: ALICE.pubKey, balance: 1000n },
         'ConditionalOutput.runar.ts',
       );
       // Transfer partial amount (generates second output)
       const result = contract.call('transfer', {
-        sig: '00'.repeat(72),
-        to: recipientPk,
+        sig: aliceSig,
+        to: BOB.pubKey,
         amount: 300n,
         outputSatoshis: 1n,
       });
@@ -291,17 +288,16 @@ class FungibleToken extends StatefulSmartContract {
     });
 
     it('transfer (partial): interpreter succeeds with two outputs', () => {
-      const pk = '02' + 'ab'.repeat(32);
-      const recipientPk = '03' + 'cd'.repeat(32);
+      const aliceSig = signTestMessage(ALICE.privKey);
       const tokenId = 'deadbeef';
       const contract = TestContract.fromSource(
         fungibleTokenSource,
-        { owner: pk, balance: 1000n, mergeBalance: 0n, tokenId },
+        { owner: ALICE.pubKey, balance: 1000n, mergeBalance: 0n, tokenId },
         'FungibleToken.runar.ts',
       );
       const result = contract.call('transfer', {
-        sig: '00'.repeat(72),
-        to: recipientPk,
+        sig: aliceSig,
+        to: BOB.pubKey,
         amount: 300n,
         outputSatoshis: 1n,
       });
@@ -309,17 +305,16 @@ class FungibleToken extends StatefulSmartContract {
     });
 
     it('transfer (full balance): interpreter succeeds with one output', () => {
-      const pk = '02' + 'ab'.repeat(32);
-      const recipientPk = '03' + 'cd'.repeat(32);
+      const aliceSig = signTestMessage(ALICE.privKey);
       const tokenId = 'deadbeef';
       const contract = TestContract.fromSource(
         fungibleTokenSource,
-        { owner: pk, balance: 1000n, mergeBalance: 0n, tokenId },
+        { owner: ALICE.pubKey, balance: 1000n, mergeBalance: 0n, tokenId },
         'FungibleToken.runar.ts',
       );
       const result = contract.call('transfer', {
-        sig: '00'.repeat(72),
-        to: recipientPk,
+        sig: aliceSig,
+        to: BOB.pubKey,
         amount: 1000n,
         outputSatoshis: 1n,
       });
@@ -327,17 +322,16 @@ class FungibleToken extends StatefulSmartContract {
     });
 
     it('send: interpreter succeeds', () => {
-      const pk = '02' + 'ab'.repeat(32);
-      const recipientPk = '03' + 'cd'.repeat(32);
+      const aliceSig = signTestMessage(ALICE.privKey);
       const tokenId = 'deadbeef';
       const contract = TestContract.fromSource(
         fungibleTokenSource,
-        { owner: pk, balance: 500n, mergeBalance: 200n, tokenId },
+        { owner: ALICE.pubKey, balance: 500n, mergeBalance: 200n, tokenId },
         'FungibleToken.runar.ts',
       );
       const result = contract.call('send', {
-        sig: '00'.repeat(72),
-        to: recipientPk,
+        sig: aliceSig,
+        to: BOB.pubKey,
         outputSatoshis: 1n,
       });
       expect(result.success).toBe(true);

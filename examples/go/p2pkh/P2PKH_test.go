@@ -7,9 +7,9 @@ import (
 )
 
 func TestP2PKH_Unlock(t *testing.T) {
-	pk := runar.MockPubKey()
+	pk := runar.Alice.PubKey
 	c := &P2PKH{PubKeyHash: runar.Hash160(pk)}
-	c.Unlock(runar.MockSig(), pk)
+	c.Unlock(runar.SignTestMessage(runar.Alice.PrivKey), pk)
 }
 
 func TestP2PKH_Unlock_WrongKey(t *testing.T) {
@@ -18,10 +18,9 @@ func TestP2PKH_Unlock_WrongKey(t *testing.T) {
 			t.Fatal("expected assertion failure for wrong public key")
 		}
 	}()
-	pk := runar.MockPubKey()
-	wrongPk := runar.PubKey("\x03" + string(make([]byte, 32)))
+	pk := runar.Alice.PubKey
 	c := &P2PKH{PubKeyHash: runar.Hash160(pk)}
-	c.Unlock(runar.MockSig(), wrongPk)
+	c.Unlock(runar.SignTestMessage(runar.Bob.PrivKey), runar.Bob.PubKey)
 }
 
 func TestP2PKH_Compile(t *testing.T) {
@@ -32,11 +31,11 @@ func TestP2PKH_Compile(t *testing.T) {
 
 // Row 483: P2PKH is stateless — no mutable state tracked
 func TestP2PKH_IsStateless(t *testing.T) {
-	pk := runar.MockPubKey()
+	pk := runar.Alice.PubKey
 	c := &P2PKH{PubKeyHash: runar.Hash160(pk)}
 	// Stateless contracts have no AddOutputs tracking
 	// Calling Unlock does not accumulate state
-	c.Unlock(runar.MockSig(), pk)
+	c.Unlock(runar.SignTestMessage(runar.Alice.PrivKey), pk)
 	// After the call, no side-effects on the struct itself
 	// (the contract is stateless — properties are readonly)
 	if len(c.PubKeyHash) == 0 {

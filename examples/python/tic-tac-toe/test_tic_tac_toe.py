@@ -7,10 +7,11 @@ from conftest import load_contract
 contract_mod = load_contract(str(Path(__file__).parent / "TicTacToe.runar.py"))
 TicTacToe = contract_mod.TicTacToe
 
-from runar import mock_sig, mock_pub_key
+from runar import ALICE, BOB
 
-PLAYER_X = "02" + "aa" * 32
-PLAYER_O = "02" + "bb" * 32
+# Use real test keys as hex strings (TicTacToe uses hex-encoded pubkeys)
+PLAYER_X = ALICE.pub_key.hex()
+PLAYER_O = BOB.pub_key.hex()
 ZERO_PK = "00" * 33
 BET_AMOUNT = 1000
 
@@ -49,7 +50,7 @@ class TestJoin:
     def test_join(self):
         """Player O can join a waiting game."""
         game = make_game()
-        game.join(PLAYER_O, mock_sig())
+        game.join(PLAYER_O, BOB.test_sig)
         assert game.player_o == PLAYER_O
         assert game.status == 1
         assert game.turn == 1
@@ -58,7 +59,7 @@ class TestJoin:
         """Cannot join a game that is already in progress."""
         game = make_playing_game()
         with pytest.raises(AssertionError):
-            game.join(PLAYER_O, mock_sig())
+            game.join(PLAYER_O, BOB.test_sig)
 
 
 class TestMove:
@@ -66,14 +67,14 @@ class TestMove:
     def test_move_player_x(self):
         """Player X can place a mark on an empty cell."""
         game = make_playing_game()
-        game.move(0, PLAYER_X, mock_sig())
+        game.move(0, PLAYER_X, ALICE.test_sig)
         assert game.c0 == 1
         assert game.turn == 2
 
     def test_move_player_o(self):
         """Player O can place a mark on their turn."""
         game = make_playing_game(turn=2)
-        game.move(4, PLAYER_O, mock_sig())
+        game.move(4, PLAYER_O, BOB.test_sig)
         assert game.c4 == 2
         assert game.turn == 1
 
@@ -81,34 +82,34 @@ class TestMove:
         """Cannot place a mark on an occupied cell."""
         game = make_playing_game(c0=1)
         with pytest.raises(AssertionError):
-            game.move(0, PLAYER_X, mock_sig())
+            game.move(0, PLAYER_X, ALICE.test_sig)
 
     def test_move_rejects_when_not_playing(self):
         """Cannot move when game status is not 'playing'."""
         game = make_game()
         with pytest.raises(AssertionError):
-            game.move(0, PLAYER_X, mock_sig())
+            game.move(0, PLAYER_X, ALICE.test_sig)
 
     def test_full_game_flow(self):
         """Play through join + moves + X wins top row."""
         game = make_game()
 
         # Player O joins
-        game.join(PLAYER_O, mock_sig())
+        game.join(PLAYER_O, BOB.test_sig)
         assert game.status == 1
         assert game.turn == 1
 
         # X@0, O@3, X@1, O@4 — set up X to win with position 2 (top row)
-        game.move(0, PLAYER_X, mock_sig())
+        game.move(0, PLAYER_X, ALICE.test_sig)
         assert game.c0 == 1
 
-        game.move(3, PLAYER_O, mock_sig())
+        game.move(3, PLAYER_O, BOB.test_sig)
         assert game.c3 == 2
 
-        game.move(1, PLAYER_X, mock_sig())
+        game.move(1, PLAYER_X, ALICE.test_sig)
         assert game.c1 == 1
 
-        game.move(4, PLAYER_O, mock_sig())
+        game.move(4, PLAYER_O, BOB.test_sig)
         assert game.c4 == 2
         assert game.turn == 1  # X's turn
 
@@ -119,20 +120,20 @@ class TestMove:
         payout = cat(cat(num2bin(total_payout, 8), game.p2pkh_prefix),
                      cat(hash160(PLAYER_X), game.p2pkh_suffix))
         game.tx_preimage = hash256(payout)
-        game.move_and_win(2, PLAYER_X, mock_sig(), "00", 0)
+        game.move_and_win(2, PLAYER_X, ALICE.test_sig, "00", 0)
 
     def test_all_positions(self):
         """Each board position (0-8) can be played."""
         for pos in range(9):
             game = make_playing_game()
-            game.move(pos, PLAYER_X, mock_sig())
+            game.move(pos, PLAYER_X, ALICE.test_sig)
             assert getattr(game, f"c{pos}") == 1
 
     def test_move_rejects_invalid_position(self):
         """Position 9 (out of range) is rejected."""
         game = make_playing_game()
         with pytest.raises(AssertionError):
-            game.move(9, PLAYER_X, mock_sig())
+            game.move(9, PLAYER_X, ALICE.test_sig)
 
 
 class TestWinDetection:

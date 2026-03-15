@@ -7,9 +7,10 @@ import (
 )
 
 var (
-	playerXPK = runar.PubKey("02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	playerOPK = runar.PubKey("02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-	mockSig   = runar.Sig("3044deadbeef")
+	playerXPK  = runar.Alice.PubKey
+	playerOPK  = runar.Bob.PubKey
+	playerXSig = runar.SignTestMessage(runar.Alice.PrivKey)
+	playerOSig = runar.SignTestMessage(runar.Bob.PrivKey)
 )
 
 func newGame() *TicTacToe {
@@ -23,7 +24,7 @@ func newGame() *TicTacToe {
 
 func newPlayingGame() *TicTacToe {
 	g := newGame()
-	g.Join(playerOPK, mockSig)
+	g.Join(playerOPK, playerOSig)
 	return g
 }
 
@@ -32,7 +33,7 @@ func TestTicTacToe_Join(t *testing.T) {
 	if g.Status != 0 {
 		t.Fatalf("expected status=0 before join, got %d", g.Status)
 	}
-	g.Join(playerOPK, mockSig)
+	g.Join(playerOPK, playerOSig)
 	if g.PlayerO != playerOPK {
 		t.Errorf("expected playerO=%s, got %s", playerOPK, g.PlayerO)
 	}
@@ -51,13 +52,13 @@ func TestTicTacToe_JoinRejectsWhenPlaying(t *testing.T) {
 		}
 	}()
 	g := newPlayingGame()
-	g.Join(playerOPK, mockSig)
+	g.Join(playerOPK, playerOSig)
 }
 
 func TestTicTacToe_Move(t *testing.T) {
 	g := newPlayingGame()
 	// Turn=1 means player X moves
-	g.Move(4, playerXPK, mockSig)
+	g.Move(4, playerXPK, playerXSig)
 	if g.C4 != 1 {
 		t.Errorf("expected c4=1 (X), got %d", g.C4)
 	}
@@ -68,15 +69,15 @@ func TestTicTacToe_Move(t *testing.T) {
 
 func TestTicTacToe_MoveAlternatesTurn(t *testing.T) {
 	g := newPlayingGame()
-	g.Move(0, playerXPK, mockSig) // X plays position 0
+	g.Move(0, playerXPK, playerXSig) // X plays position 0
 	if g.Turn != 2 {
 		t.Fatalf("expected turn=2, got %d", g.Turn)
 	}
-	g.Move(4, playerOPK, mockSig) // O plays position 4
+	g.Move(4, playerOPK, playerOSig) // O plays position 4
 	if g.Turn != 1 {
 		t.Fatalf("expected turn=1, got %d", g.Turn)
 	}
-	g.Move(1, playerXPK, mockSig) // X plays position 1
+	g.Move(1, playerXPK, playerXSig) // X plays position 1
 	if g.Turn != 2 {
 		t.Fatalf("expected turn=2, got %d", g.Turn)
 	}
@@ -89,9 +90,9 @@ func TestTicTacToe_MoveRejectsOccupied(t *testing.T) {
 		}
 	}()
 	g := newPlayingGame()
-	g.Move(4, playerXPK, mockSig)
+	g.Move(4, playerXPK, playerXSig)
 	// Now c4 is occupied, O tries to play there
-	g.Move(4, playerOPK, mockSig)
+	g.Move(4, playerOPK, playerOSig)
 }
 
 func TestTicTacToe_MoveRejectsWrongPlayer(t *testing.T) {
@@ -102,7 +103,7 @@ func TestTicTacToe_MoveRejectsWrongPlayer(t *testing.T) {
 	}()
 	g := newPlayingGame()
 	// Turn=1 means X should move, but O tries
-	g.Move(4, playerOPK, mockSig)
+	g.Move(4, playerOPK, playerOSig)
 }
 
 func TestTicTacToe_MoveRejectsInvalidPosition(t *testing.T) {
@@ -112,25 +113,25 @@ func TestTicTacToe_MoveRejectsInvalidPosition(t *testing.T) {
 		}
 	}()
 	g := newPlayingGame()
-	g.Move(9, playerXPK, mockSig) // position 9 doesn't exist
+	g.Move(9, playerXPK, playerXSig) // position 9 doesn't exist
 }
 
 func TestTicTacToe_FullGameFlow(t *testing.T) {
 	g := newPlayingGame()
 	// X@0, O@3, X@1, O@4 — set up X to win with position 2 (top row)
-	g.Move(0, playerXPK, mockSig)
+	g.Move(0, playerXPK, playerXSig)
 	if g.C0 != 1 {
 		t.Fatalf("expected c0=1, got %d", g.C0)
 	}
-	g.Move(3, playerOPK, mockSig)
+	g.Move(3, playerOPK, playerOSig)
 	if g.C3 != 2 {
 		t.Fatalf("expected c3=2, got %d", g.C3)
 	}
-	g.Move(1, playerXPK, mockSig)
+	g.Move(1, playerXPK, playerXSig)
 	if g.C1 != 1 {
 		t.Fatalf("expected c1=1, got %d", g.C1)
 	}
-	g.Move(4, playerOPK, mockSig)
+	g.Move(4, playerOPK, playerOSig)
 	if g.C4 != 2 {
 		t.Fatalf("expected c4=2, got %d", g.C4)
 	}
@@ -144,7 +145,7 @@ func TestTicTacToe_FullGameFlow(t *testing.T) {
 	totalPayout := g.BetAmount * 2
 	payout := runar.Cat(runar.Cat(runar.Num2Bin(totalPayout, 8), g.P2pkhPrefix), runar.Cat(runar.Hash160(playerXPK), g.P2pkhSuffix))
 	g.TxPreimage = runar.Hash256(payout)
-	g.MoveAndWin(2, playerXPK, mockSig, "00", 0)
+	g.MoveAndWin(2, playerXPK, playerXSig, "00", 0)
 }
 
 func TestTicTacToe_CheckWinRow(t *testing.T) {

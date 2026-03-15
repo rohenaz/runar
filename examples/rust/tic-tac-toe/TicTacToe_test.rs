@@ -160,8 +160,10 @@ impl TicTacToe {
 // Test helpers
 // ---------------------------------------------------------------------------
 
-fn player_x() -> PubKey { b"player_x_pubkey_33bytes_padding!".to_vec() }
-fn player_o() -> PubKey { b"player_o_pubkey_33bytes_padding!".to_vec() }
+fn player_x() -> PubKey { ALICE.pub_key.to_vec() }
+fn player_o() -> PubKey { BOB.pub_key.to_vec() }
+fn player_x_sig() -> Sig { ALICE.sign_test_message() }
+fn player_o_sig() -> Sig { BOB.sign_test_message() }
 fn zero_pk() -> PubKey { vec![0u8; 33] }
 
 fn new_game() -> TicTacToe {
@@ -195,7 +197,7 @@ fn playing_game() -> TicTacToe {
 #[test]
 fn test_join() {
     let mut game = new_game();
-    game.join(player_o(), &mock_sig());
+    game.join(player_o(), &player_o_sig());
     assert_eq!(game.player_o, player_o());
     assert_eq!(game.status, 1);
     assert_eq!(game.turn, 1);
@@ -205,13 +207,13 @@ fn test_join() {
 #[should_panic]
 fn test_join_rejects_when_already_playing() {
     let mut game = playing_game();
-    game.join(player_o(), &mock_sig());
+    game.join(player_o(), &player_o_sig());
 }
 
 #[test]
 fn test_move_player_x() {
     let mut game = playing_game();
-    game.move_piece(0, player_x(), &mock_sig());
+    game.move_piece(0, player_x(), &player_x_sig());
     assert_eq!(game.c0, 1);
     assert_eq!(game.turn, 2);
 }
@@ -220,7 +222,7 @@ fn test_move_player_x() {
 fn test_move_player_o() {
     let mut game = playing_game();
     game.turn = 2;
-    game.move_piece(4, player_o(), &mock_sig());
+    game.move_piece(4, player_o(), &player_o_sig());
     assert_eq!(game.c4, 2);
     assert_eq!(game.turn, 1);
 }
@@ -230,36 +232,36 @@ fn test_move_player_o() {
 fn test_move_rejects_occupied_cell() {
     let mut game = playing_game();
     game.c0 = 1;
-    game.move_piece(0, player_x(), &mock_sig());
+    game.move_piece(0, player_x(), &player_x_sig());
 }
 
 #[test]
 #[should_panic]
 fn test_move_rejects_when_not_playing() {
     let mut game = new_game();
-    game.move_piece(0, player_x(), &mock_sig());
+    game.move_piece(0, player_x(), &player_x_sig());
 }
 
 #[test]
 #[should_panic]
 fn test_move_rejects_wrong_player() {
     let mut game = playing_game(); // turn=1 (player X's turn)
-    game.move_piece(0, player_o(), &mock_sig());
+    game.move_piece(0, player_o(), &player_o_sig());
 }
 
 #[test]
 fn test_multiple_moves() {
     let mut game = playing_game();
 
-    game.move_piece(0, player_x(), &mock_sig());
+    game.move_piece(0, player_x(), &player_x_sig());
     assert_eq!(game.c0, 1);
     assert_eq!(game.turn, 2);
 
-    game.move_piece(4, player_o(), &mock_sig());
+    game.move_piece(4, player_o(), &player_o_sig());
     assert_eq!(game.c4, 2);
     assert_eq!(game.turn, 1);
 
-    game.move_piece(8, player_x(), &mock_sig());
+    game.move_piece(8, player_x(), &player_x_sig());
     assert_eq!(game.c8, 1);
     assert_eq!(game.turn, 2);
 }
@@ -269,20 +271,20 @@ fn test_full_game_join_and_moves() {
     let mut game = new_game();
 
     // Join
-    game.join(player_o(), &mock_sig());
+    game.join(player_o(), &player_o_sig());
     assert_eq!(game.status, 1);
 
     // X@0, O@3, X@1, O@4 — set up X to win with position 2 (top row)
-    game.move_piece(0, player_x(), &mock_sig());
+    game.move_piece(0, player_x(), &player_x_sig());
     assert_eq!(game.c0, 1);
 
-    game.move_piece(3, player_o(), &mock_sig());
+    game.move_piece(3, player_o(), &player_o_sig());
     assert_eq!(game.c3, 2);
 
-    game.move_piece(1, player_x(), &mock_sig());
+    game.move_piece(1, player_x(), &player_x_sig());
     assert_eq!(game.c1, 1);
 
-    game.move_piece(4, player_o(), &mock_sig());
+    game.move_piece(4, player_o(), &player_o_sig());
     assert_eq!(game.c4, 2);
     assert_eq!(game.turn, 1); // X's turn
 
@@ -291,7 +293,7 @@ fn test_full_game_join_and_moves() {
     let total_payout = game.bet_amount * 2;
     let payout = cat(&cat(&cat(&num2bin(&total_payout, 8), &game.p2pkh_prefix), &hash160(&player_x())), &game.p2pkh_suffix);
     game.tx_preimage = hash256(&payout);
-    game.move_and_win(2, player_x(), &mock_sig(), b"00".to_vec(), 0);
+    game.move_and_win(2, player_x(), &player_x_sig(), b"00".to_vec(), 0);
 }
 
 #[test]

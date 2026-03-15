@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
-import { TestContract } from 'runar-testing';
+import { TestContract, ALICE, BOB, signTestMessage } from 'runar-testing';
 
 // ---------------------------------------------------------------------------
 // Byte-level helpers for pre-computing terminal method output hashes.
@@ -44,11 +44,11 @@ function p2pkhOutput(satoshis: bigint, playerHex: string, prefixHex: string, suf
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(__dirname, 'TicTacToe.runar.ts'), 'utf8');
 
-const PLAYER_X = '02' + 'aa'.repeat(32);
-const PLAYER_O = '02' + 'bb'.repeat(32);
+const PLAYER_X = ALICE.pubKey;
+const PLAYER_O = BOB.pubKey;
 const ZERO_PK = '00'.repeat(33);
-const MOCK_SIG = '30' + 'ff'.repeat(35);
-const MOCK_SIG2 = '30' + 'ee'.repeat(35);
+const SIG_X = signTestMessage(ALICE.privKey);
+const SIG_O = signTestMessage(BOB.privKey);
 const BET_AMOUNT = 1000n;
 const P2PKH_PREFIX = '1976a914';
 const P2PKH_SUFFIX = '88ac';
@@ -82,7 +82,7 @@ describe('TicTacToe', () => {
   describe('join', () => {
     it('allows player O to join a waiting game', () => {
       const game = makeGame();
-      const result = game.call('join', { opponentPK: PLAYER_O, sig: MOCK_SIG });
+      const result = game.call('join', { opponentPK: PLAYER_O, sig: SIG_O });
       expect(result.success).toBe(true);
       expect(game.state.playerO).toBe(PLAYER_O);
       expect(game.state.status).toBe(1n);
@@ -91,7 +91,7 @@ describe('TicTacToe', () => {
 
     it('rejects join when game is already playing', () => {
       const game = makePlayingGame();
-      const result = game.call('join', { opponentPK: PLAYER_O, sig: MOCK_SIG });
+      const result = game.call('join', { opponentPK: PLAYER_O, sig: SIG_O });
       expect(result.success).toBe(false);
     });
   });
@@ -99,7 +99,7 @@ describe('TicTacToe', () => {
   describe('move', () => {
     it('allows player X to place a mark on an empty cell', () => {
       const game = makePlayingGame();
-      const result = game.call('move', { position: 0n, player: PLAYER_X, sig: MOCK_SIG });
+      const result = game.call('move', { position: 0n, player: PLAYER_X, sig: SIG_X });
       expect(result.success).toBe(true);
       expect(game.state.c0).toBe(1n);
       expect(game.state.turn).toBe(2n);
@@ -107,7 +107,7 @@ describe('TicTacToe', () => {
 
     it('allows player O to place a mark on their turn', () => {
       const game = makePlayingGame({ turn: 2n });
-      const result = game.call('move', { position: 4n, player: PLAYER_O, sig: MOCK_SIG });
+      const result = game.call('move', { position: 4n, player: PLAYER_O, sig: SIG_O });
       expect(result.success).toBe(true);
       expect(game.state.c4).toBe(2n);
       expect(game.state.turn).toBe(1n);
@@ -115,27 +115,27 @@ describe('TicTacToe', () => {
 
     it('rejects move on an occupied cell', () => {
       const game = makePlayingGame({ c0: 1n });
-      const result = game.call('move', { position: 0n, player: PLAYER_X, sig: MOCK_SIG });
+      const result = game.call('move', { position: 0n, player: PLAYER_X, sig: SIG_X });
       expect(result.success).toBe(false);
     });
 
     it('rejects move when game is not playing', () => {
       const game = makeGame();
-      const result = game.call('move', { position: 0n, player: PLAYER_X, sig: MOCK_SIG });
+      const result = game.call('move', { position: 0n, player: PLAYER_X, sig: SIG_X });
       expect(result.success).toBe(false);
     });
 
     it('tracks state across multiple moves', () => {
       const game = makePlayingGame();
-      game.call('move', { position: 0n, player: PLAYER_X, sig: MOCK_SIG });
+      game.call('move', { position: 0n, player: PLAYER_X, sig: SIG_X });
       expect(game.state.c0).toBe(1n);
       expect(game.state.turn).toBe(2n);
 
-      game.call('move', { position: 4n, player: PLAYER_O, sig: MOCK_SIG });
+      game.call('move', { position: 4n, player: PLAYER_O, sig: SIG_O });
       expect(game.state.c4).toBe(2n);
       expect(game.state.turn).toBe(1n);
 
-      game.call('move', { position: 8n, player: PLAYER_X, sig: MOCK_SIG });
+      game.call('move', { position: 8n, player: PLAYER_X, sig: SIG_X });
       expect(game.state.c8).toBe(1n);
       expect(game.state.turn).toBe(2n);
     });
@@ -151,7 +151,7 @@ describe('TicTacToe', () => {
       // Pre-compute the payout hash so extractOutputHash returns it.
       const payout = p2pkhOutput(BET_AMOUNT * 2n, PLAYER_X, P2PKH_PREFIX, P2PKH_SUFFIX);
       game.setMockPreimageBytes({ outputHash: hash256U8(payout) });
-      const result = game.call('moveAndWin', { position: 2n, player: PLAYER_X, sig: MOCK_SIG, changePKH: '00', changeAmount: 0n });
+      const result = game.call('moveAndWin', { position: 2n, player: PLAYER_X, sig: SIG_X, changePKH: '00', changeAmount: 0n });
       if (!result.success) console.error('moveAndWin error:', result.error);
       expect(result.success).toBe(true);
     });
@@ -169,7 +169,7 @@ describe('TicTacToe', () => {
       const out1 = p2pkhOutput(BET_AMOUNT, PLAYER_X, P2PKH_PREFIX, P2PKH_SUFFIX);
       const out2 = p2pkhOutput(BET_AMOUNT, PLAYER_O, P2PKH_PREFIX, P2PKH_SUFFIX);
       game.setMockPreimageBytes({ outputHash: hash256U8(catU8(out1, out2)) });
-      const result = game.call('moveAndTie', { position: 8n, player: PLAYER_O, sig: MOCK_SIG, changePKH: '00', changeAmount: 0n });
+      const result = game.call('moveAndTie', { position: 8n, player: PLAYER_O, sig: SIG_O, changePKH: '00', changeAmount: 0n });
       expect(result.success).toBe(true);
     });
   });
@@ -177,21 +177,21 @@ describe('TicTacToe', () => {
   describe('full game flow', () => {
     it('plays through join + moves + X wins top row', () => {
       const game = makeGame();
-      const joinResult = game.call('join', { opponentPK: PLAYER_O, sig: MOCK_SIG });
+      const joinResult = game.call('join', { opponentPK: PLAYER_O, sig: SIG_O });
       expect(joinResult.success).toBe(true);
       expect(game.state.status).toBe(1n);
 
       // X@0, O@3, X@1, O@4 — set up X to win with position 2 (top row)
-      game.call('move', { position: 0n, player: PLAYER_X, sig: MOCK_SIG });
+      game.call('move', { position: 0n, player: PLAYER_X, sig: SIG_X });
       expect(game.state.c0).toBe(1n);
 
-      game.call('move', { position: 3n, player: PLAYER_O, sig: MOCK_SIG });
+      game.call('move', { position: 3n, player: PLAYER_O, sig: SIG_O });
       expect(game.state.c3).toBe(2n);
 
-      game.call('move', { position: 1n, player: PLAYER_X, sig: MOCK_SIG });
+      game.call('move', { position: 1n, player: PLAYER_X, sig: SIG_X });
       expect(game.state.c1).toBe(1n);
 
-      game.call('move', { position: 4n, player: PLAYER_O, sig: MOCK_SIG });
+      game.call('move', { position: 4n, player: PLAYER_O, sig: SIG_O });
       expect(game.state.c4).toBe(2n);
       expect(game.state.turn).toBe(1n); // X's turn
 
@@ -199,7 +199,7 @@ describe('TicTacToe', () => {
       // Pre-compute payout hash so extractOutputHash returns the right value.
       const payout = p2pkhOutput(BET_AMOUNT * 2n, PLAYER_X, P2PKH_PREFIX, P2PKH_SUFFIX);
       game.setMockPreimageBytes({ outputHash: hash256U8(payout) });
-      const winResult = game.call('moveAndWin', { position: 2n, player: PLAYER_X, sig: MOCK_SIG, changePKH: '00', changeAmount: 0n });
+      const winResult = game.call('moveAndWin', { position: 2n, player: PLAYER_X, sig: SIG_X, changePKH: '00', changeAmount: 0n });
       expect(winResult.success).toBe(true);
     });
   });

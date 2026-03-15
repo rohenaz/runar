@@ -1,13 +1,14 @@
 """Runar built-in functions.
 
-Real crypto verification for WOTS+ and SLH-DSA (when packages available).
-Mock crypto for ECDSA (checkSig always True — matches Go/Rust/TS behavior).
+Real crypto verification for ECDSA, Rabin, WOTS+, and SLH-DSA.
 Real hash functions use Python's hashlib (stdlib, no dependencies).
 """
 
 import hashlib
 import math
 
+from runar.ecdsa import ecdsa_verify, TEST_MESSAGE_DIGEST
+from runar.rabin_sig import rabin_verify as _rabin_verify_real
 from runar.wots import wots_verify as _wots_verify_real
 from runar.slhdsa_impl import slh_verify as _slh_verify
 
@@ -20,19 +21,51 @@ def assert_(condition: bool) -> None:
         raise AssertionError("runar: assertion failed")
 
 
-# -- Mock Crypto (ECDSA always True for business logic testing) --------------
+# -- Real ECDSA Verification ------------------------------------------------
 
-def check_sig(sig: bytes, pk: bytes) -> bool:
-    return True
+def check_sig(sig, pk) -> bool:
+    """Verify an ECDSA signature over the fixed TEST_MESSAGE.
+
+    Uses real secp256k1 ECDSA verification against SHA256("runar-test-message-v1").
+    Accepts both raw bytes and hex-encoded strings (Runar ByteString convention).
+    """
+    return ecdsa_verify(_as_bytes(sig), _as_bytes(pk), TEST_MESSAGE_DIGEST)
 
 def check_multi_sig(sigs: list, pks: list) -> bool:
+    """Verify multiple ECDSA signatures (Bitcoin-style multi-sig).
+
+    Each signature is verified against the public keys in order.
+    Accepts both raw bytes and hex-encoded strings.
+    """
+    if len(sigs) > len(pks):
+        return False
+    pk_idx = 0
+    for s in sigs:
+        matched = False
+        while pk_idx < len(pks):
+            if check_sig(s, pks[pk_idx]):
+                pk_idx += 1
+                matched = True
+                break
+            pk_idx += 1
+        if not matched:
+            return False
     return True
 
 def check_preimage(preimage: bytes) -> bool:
+    """Mock preimage check — always returns True for business logic testing."""
     return True
 
+
+# -- Real Rabin Verification ------------------------------------------------
+
 def verify_rabin_sig(msg: bytes, sig: bytes, padding: bytes, pk: bytes) -> bool:
-    return True
+    """Verify a Rabin signature.
+
+    All parameters are bytes. sig and pk are interpreted as unsigned
+    little-endian integers. Equation: (sig^2 + padding) mod n == SHA256(msg) mod n.
+    """
+    return _rabin_verify_real(msg, sig, padding, pk)
 
 
 # -- Real WOTS+ Verification ------------------------------------------------
@@ -279,10 +312,22 @@ def len_(data) -> int:
 # -- Test Helpers ------------------------------------------------------------
 
 def mock_sig() -> bytes:
-    return b'\x00' * 72
+    """Return ALICE's real ECDSA test signature (DER-encoded).
+
+    This is a valid signature over TEST_MESSAGE that will pass check_sig()
+    verification when paired with mock_pub_key().
+    """
+    from runar.test_keys import ALICE
+    return ALICE.test_sig
 
 def mock_pub_key() -> bytes:
-    return b'\x02' + b'\x00' * 32
+    """Return ALICE's real compressed public key (33 bytes).
+
+    This is a valid secp256k1 public key that will pass check_sig()
+    verification when paired with mock_sig().
+    """
+    from runar.test_keys import ALICE
+    return ALICE.pub_key
 
 def mock_preimage() -> bytes:
     return b'\x00' * 181

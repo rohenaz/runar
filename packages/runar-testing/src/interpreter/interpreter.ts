@@ -17,6 +17,8 @@ import {
   SLH_SHA2_192s, SLH_SHA2_192f,
   SLH_SHA2_256s, SLH_SHA2_256f,
 } from '../crypto/slh-dsa.js';
+import { verifyTestMessageSig } from '../crypto/ecdsa.js';
+import { rabinVerify as rabinVerifyImpl } from '../crypto/rabin.js';
 import type {
   ContractNode,
   MethodNode,
@@ -665,13 +667,17 @@ export class RunarInterpreter {
       }
 
       case 'checkSig': {
-        // In interpreter mode, checkSig always returns true (mock).
-        return { kind: 'boolean', value: true };
+        // Real ECDSA verification over the fixed TEST_MESSAGE.
+        const sig = this.toBytes(args[0]!);
+        const pubKey = this.toBytes(args[1]!);
+        return { kind: 'boolean', value: verifyTestMessageSig(sig, pubKey) };
       }
 
       case 'checkMultiSig': {
-        // Mock: always returns true.
-        return { kind: 'boolean', value: true };
+        // checkMultiSig is not currently used in any contracts.
+        // When array types are added to the interpreter, this should
+        // verify each sig against the pubkeys using verifyTestMessageSig.
+        return { kind: 'boolean', value: false };
       }
 
       case 'len': {
@@ -896,8 +902,14 @@ export class RunarInterpreter {
       case 'checkPreimage':
         return { kind: 'boolean', value: true };
 
-      case 'verifyRabinSig':
-        return { kind: 'boolean', value: true };
+      case 'verifyRabinSig': {
+        // Real Rabin verification: (sig² + padding) mod n === SHA256(msg) mod n
+        const rabinMsg = this.toBytes(args[0]!);
+        const rabinSig = this.toBigInt(args[1]!);
+        const rabinPad = this.toBytes(args[2]!);
+        const rabinPk = this.toBigInt(args[3]!);
+        return { kind: 'boolean', value: rabinVerifyImpl(rabinMsg, rabinSig, rabinPad, rabinPk) };
+      }
 
       case 'verifyWOTS': {
         const wotsMsg = this.toBytes(args[0]!);

@@ -1,10 +1,14 @@
-// Package runar provides types and mock functions for Rúnar smart contract
+// Package runar provides types and crypto functions for Rúnar smart contract
 // development in Go. Contracts import this package to get IDE support,
 // type checking, and the ability to run native Go tests.
 //
-// Crypto functions like CheckSig are mocked (always return true) to enable
-// testing business logic without real signatures. Hash functions (Hash160,
-// Hash256, etc.) compute real hashes.
+// Crypto functions (CheckSig, VerifyRabinSig, VerifyWOTS, etc.) perform real
+// verification using the go-sdk ECDSA library and modular arithmetic.
+// CheckPreimage remains mocked (always returns true) since it requires a full
+// transaction context. Hash functions (Hash160, Hash256, etc.) compute real hashes.
+//
+// Test key pairs (Alice, Bob, Charlie) and SignTestMessage() provide deterministic
+// ECDSA keys and signatures for contract testing.
 //
 // Byte types use string as the underlying type so == comparison works
 // naturally in contract code, matching Rúnar's === semantics.
@@ -121,27 +125,51 @@ func Assert(cond bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Mock crypto — always succeed for testing business logic
+// Crypto functions — real ECDSA and Rabin verification, mocked preimage
 // ---------------------------------------------------------------------------
 
-// CheckSig always returns true in test mode.
+// CheckSig performs real ECDSA signature verification against TestMessageDigest.
+// The signature must be DER-encoded and the public key must be a valid
+// compressed or uncompressed secp256k1 key.
 func CheckSig(sig Sig, pk PubKey) bool {
-	return true
+	return ecdsaVerify([]byte(sig), []byte(pk), TestMessageDigest[:])
 }
 
-// CheckMultiSig always returns true in test mode.
+// CheckMultiSig performs real ordered multi-signature verification.
+// Each signature is verified against the corresponding public key in order,
+// matching Bitcoin's OP_CHECKMULTISIG semantics (ordered, 1:1 pairing).
 func CheckMultiSig(sigs []Sig, pks []PubKey) bool {
+	if len(sigs) > len(pks) {
+		return false
+	}
+	pkIdx := 0
+	for _, sig := range sigs {
+		matched := false
+		for pkIdx < len(pks) {
+			if ecdsaVerify([]byte(sig), []byte(pks[pkIdx]), TestMessageDigest[:]) {
+				pkIdx++
+				matched = true
+				break
+			}
+			pkIdx++
+		}
+		if !matched {
+			return false
+		}
+	}
 	return true
 }
 
 // CheckPreimage always returns true in test mode.
+// Real preimage verification requires a full transaction context.
 func CheckPreimage(preimage SigHashPreimage) bool {
 	return true
 }
 
-// VerifyRabinSig always returns true in test mode.
+// VerifyRabinSig performs real Rabin signature verification using modular arithmetic.
+// Checks that (sig^2 + padding) mod pubkey == SHA256(msg).
 func VerifyRabinSig(msg ByteString, sig RabinSig, padding ByteString, pk RabinPubKey) bool {
-	return true
+	return rabinVerifyImpl([]byte(msg), []byte(sig), []byte(padding), []byte(pk))
 }
 
 // VerifyWOTS performs real WOTS+ signature verification using SHA-256 hash chains.
@@ -500,18 +528,6 @@ func ToBool(n int64) bool {
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
-
-// MockSig returns a dummy signature for testing.
-func MockSig() Sig {
-	return Sig(make([]byte, 72))
-}
-
-// MockPubKey returns a dummy compressed public key for testing.
-func MockPubKey() PubKey {
-	pk := make([]byte, 33)
-	pk[0] = 0x02
-	return PubKey(pk)
-}
 
 // MockPreimage returns a dummy sighash preimage for testing.
 func MockPreimage() SigHashPreimage {

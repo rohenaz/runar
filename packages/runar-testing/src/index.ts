@@ -57,6 +57,26 @@ export {
 } from './test-keys.js';
 export type { TestKey } from './test-keys.js';
 
+// ECDSA crypto (real signing/verification over fixed test message)
+export {
+  signTestMessage,
+  pubKeyFromPrivKey,
+  verifyTestMessageSig,
+  verifyTestMessageSigHex,
+  TEST_MESSAGE,
+  TEST_MESSAGE_DIGEST,
+} from './crypto/ecdsa.js';
+
+// Rabin signature primitives (real signing/verification)
+export {
+  rabinSign,
+  rabinVerify,
+  rabinVerifyHex,
+  generateRabinKeyPair,
+  RABIN_TEST_KEY,
+} from './crypto/rabin.js';
+export type { RabinKeyPair } from './crypto/rabin.js';
+
 // Post-quantum crypto primitives
 export { wotsKeygen, wotsSign, wotsVerify, WOTS_PARAMS } from './crypto/wots.js';
 export type { WOTSKeyPair } from './crypto/wots.js';

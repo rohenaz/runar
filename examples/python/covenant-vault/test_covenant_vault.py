@@ -6,7 +6,7 @@ from conftest import load_contract
 contract_mod = load_contract(str(Path(__file__).parent / "CovenantVault.runar.py"))
 CovenantVault = contract_mod.CovenantVault
 
-from runar import mock_sig, mock_pub_key, mock_preimage, hash160
+from runar import hash160, ALICE, BOB
 
 
 # Native execution test for CovenantVault is limited because the
@@ -24,8 +24,8 @@ def test_compile():
         source = f.read()
     compile_check(source, "CovenantVault.runar.py")
     c = CovenantVault(
-        owner=mock_pub_key(),
-        recipient=hash160(mock_pub_key()),
+        owner=ALICE.pub_key,
+        recipient=hash160(BOB.pub_key),
         min_amount=1000,
     )
     # Contract construction succeeds — logic verified by conformance suite

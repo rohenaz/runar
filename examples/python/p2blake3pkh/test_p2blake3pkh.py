@@ -7,22 +7,22 @@ from conftest import load_contract
 contract_mod = load_contract(str(Path(__file__).parent / "P2Blake3PKH.runar.py"))
 P2Blake3PKH = contract_mod.P2Blake3PKH
 
-from runar import blake3_hash, mock_sig, mock_pub_key
+from runar import blake3_hash, ALICE
 
 
 def test_unlock():
-    pk = mock_pub_key()
+    pk = ALICE.pub_key
     c = P2Blake3PKH(pub_key_hash=blake3_hash(pk))
-    c.unlock(mock_sig(), pk)
+    c.unlock(ALICE.test_sig, pk)
 
 
 def test_unlock_wrong_hash():
-    pk = mock_pub_key()
+    pk = ALICE.pub_key
     # blake3_hash is mocked (always returns 32 zero bytes), so use a non-matching hash
     wrong_hash = b'\xff' * 32
     c = P2Blake3PKH(pub_key_hash=wrong_hash)
     with pytest.raises(AssertionError):
-        c.unlock(mock_sig(), pk)
+        c.unlock(ALICE.test_sig, pk)
 
 
 def test_compile():

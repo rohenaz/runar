@@ -65,27 +65,45 @@ pub struct OutputSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// Mock crypto — always succeed for testing business logic
+// Real crypto verification (ECDSA, Rabin) + mocked checkPreimage
 // ---------------------------------------------------------------------------
 
-/// Always returns `true` in test mode.
-pub fn check_sig(_sig: &[u8], _pk: &[u8]) -> bool {
+/// Real ECDSA verification over the fixed TEST_MESSAGE.
+///
+/// Verifies the given DER-encoded signature against the compressed public
+/// key using secp256k1 over the canonical test message
+/// `"runar-test-message-v1"`. Handles optional trailing sighash byte.
+pub fn check_sig(sig: &[u8], pk: &[u8]) -> bool {
+    crate::ecdsa::ecdsa_verify(sig, pk)
+}
+
+/// Real ordered multi-sig ECDSA verification over the fixed TEST_MESSAGE.
+///
+/// Each signature in `sigs` must correspond to a public key in `pks`
+/// (in order). All signatures must be valid.
+pub fn check_multi_sig(sigs: &[&[u8]], pks: &[&[u8]]) -> bool {
+    if sigs.len() != pks.len() {
+        return false;
+    }
+    for (sig, pk) in sigs.iter().zip(pks.iter()) {
+        if !crate::ecdsa::ecdsa_verify(sig, pk) {
+            return false;
+        }
+    }
     true
 }
 
-/// Always returns `true` in test mode.
-pub fn check_multi_sig(_sigs: &[&[u8]], _pks: &[&[u8]]) -> bool {
-    true
-}
-
-/// Always returns `true` in test mode.
+/// Always returns `true` in test mode (preimage verification is mocked).
 pub fn check_preimage(_preimage: &[u8]) -> bool {
     true
 }
 
-/// Always returns `true` in test mode.
-pub fn verify_rabin_sig(_msg: &[u8], _sig: &[u8], _padding: &[u8], _pk: &[u8]) -> bool {
-    true
+/// Real Rabin signature verification.
+///
+/// Equation: `(sig^2 + padding) mod n == SHA256(msg) mod n`
+/// where all byte slices are interpreted as unsigned little-endian big integers.
+pub fn verify_rabin_sig(msg: &[u8], sig: &[u8], padding: &[u8], pk: &[u8]) -> bool {
+    crate::rabin::rabin_verify(msg, sig, padding, pk)
 }
 
 /// Real WOTS+ signature verification using SHA-256 hash chains.
@@ -142,6 +160,15 @@ pub use crate::slh_dsa::{
     SLH_SHA2_128S, SLH_SHA2_128F, SLH_SHA2_192S, SLH_SHA2_192F,
     SLH_SHA2_256S, SLH_SHA2_256F,
 };
+
+pub use crate::ecdsa::{
+    sign_test_message, pub_key_from_priv_key, ecdsa_verify,
+    TEST_MESSAGE, TEST_MESSAGE_DIGEST,
+};
+
+pub use crate::test_keys::{TestKeyPair, ALICE, BOB, CHARLIE};
+
+pub use crate::rabin::rabin_sign_trivial;
 
 // ---------------------------------------------------------------------------
 // Real hash functions
@@ -421,8 +448,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_check_sig_always_true() {
-        assert!(check_sig(&mock_sig(), &mock_pub_key()));
+    fn test_check_sig_real_ecdsa() {
+        let sig = ALICE.sign_test_message();
+        assert!(check_sig(&sig, ALICE.pub_key));
+    }
+
+    #[test]
+    fn test_check_sig_rejects_wrong_key() {
+        let sig = ALICE.sign_test_message();
+        assert!(!check_sig(&sig, BOB.pub_key));
+    }
+
+    #[test]
+    fn test_check_multi_sig_real() {
+        let alice_sig = ALICE.sign_test_message();
+        let bob_sig = BOB.sign_test_message();
+        assert!(check_multi_sig(
+            &[alice_sig.as_slice(), bob_sig.as_slice()],
+            &[ALICE.pub_key, BOB.pub_key],
+        ));
+    }
+
+    #[test]
+    fn test_check_multi_sig_rejects_wrong_order() {
+        let alice_sig = ALICE.sign_test_message();
+        let bob_sig = BOB.sign_test_message();
+        // Wrong order: alice sig checked against bob key
+        assert!(!check_multi_sig(
+            &[alice_sig.as_slice(), bob_sig.as_slice()],
+            &[BOB.pub_key, ALICE.pub_key],
+        ));
     }
 
     #[test]

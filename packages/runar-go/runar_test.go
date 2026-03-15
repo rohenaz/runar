@@ -18,9 +18,34 @@ func TestAssert_False(t *testing.T) {
 	Assert(false)
 }
 
-func TestCheckSig_AlwaysTrue(t *testing.T) {
-	if !CheckSig(MockSig(), MockPubKey()) {
-		t.Error("CheckSig should always return true in test mode")
+func TestCheckSig_RealECDSA(t *testing.T) {
+	sig := SignTestMessage(Alice.PrivKey)
+	if !CheckSig(sig, Alice.PubKey) {
+		t.Error("CheckSig should return true for valid ECDSA signature")
+	}
+}
+
+func TestCheckSig_WrongKey(t *testing.T) {
+	sig := SignTestMessage(Alice.PrivKey)
+	if CheckSig(sig, Bob.PubKey) {
+		t.Error("CheckSig should return false when sig doesn't match pubkey")
+	}
+}
+
+func TestCheckMultiSig_RealECDSA(t *testing.T) {
+	sigA := SignTestMessage(Alice.PrivKey)
+	sigB := SignTestMessage(Bob.PrivKey)
+	if !CheckMultiSig([]Sig{sigA, sigB}, []PubKey{Alice.PubKey, Bob.PubKey}) {
+		t.Error("CheckMultiSig should return true for valid ordered signatures")
+	}
+}
+
+func TestCheckMultiSig_WrongOrder(t *testing.T) {
+	sigA := SignTestMessage(Alice.PrivKey)
+	sigB := SignTestMessage(Bob.PrivKey)
+	// Signatures in wrong order relative to pubkeys
+	if CheckMultiSig([]Sig{sigB, sigA}, []PubKey{Alice.PubKey, Bob.PubKey}) {
+		t.Error("CheckMultiSig should return false for wrong signature order")
 	}
 }
 
@@ -46,7 +71,7 @@ func TestHash160_Deterministic(t *testing.T) {
 }
 
 func TestHash160_Comparable(t *testing.T) {
-	pk := MockPubKey()
+	pk := Alice.PubKey
 	h1 := Hash160(pk)
 	h2 := Hash160(pk)
 	// This is the key test: == must work on Addr (string-backed)
@@ -154,20 +179,46 @@ func TestReverseBytes(t *testing.T) {
 	}
 }
 
-func TestMockSig(t *testing.T) {
-	sig := MockSig()
-	if len(sig) != 72 {
-		t.Errorf("MockSig should be 72 bytes, got %d", len(sig))
+func TestSignTestMessage(t *testing.T) {
+	sig := SignTestMessage(Alice.PrivKey)
+	if len(sig) == 0 {
+		t.Error("SignTestMessage should produce a non-empty signature")
+	}
+	// DER signatures start with 0x30
+	if sig[0] != 0x30 {
+		t.Errorf("DER signature should start with 0x30, got 0x%02x", sig[0])
 	}
 }
 
-func TestMockPubKey(t *testing.T) {
-	pk := MockPubKey()
-	if len(pk) != 33 {
-		t.Errorf("MockPubKey should be 33 bytes, got %d", len(pk))
+func TestTestKeys_PubKeyLength(t *testing.T) {
+	if len(Alice.PubKey) != 33 {
+		t.Errorf("Alice.PubKey should be 33 bytes, got %d", len(Alice.PubKey))
 	}
-	if pk[0] != 0x02 {
-		t.Errorf("MockPubKey should start with 0x02, got 0x%02x", pk[0])
+	if len(Bob.PubKey) != 33 {
+		t.Errorf("Bob.PubKey should be 33 bytes, got %d", len(Bob.PubKey))
+	}
+	if len(Charlie.PubKey) != 33 {
+		t.Errorf("Charlie.PubKey should be 33 bytes, got %d", len(Charlie.PubKey))
+	}
+}
+
+func TestTestKeys_PubKeyHashLength(t *testing.T) {
+	if len(Alice.PubKeyHash) != 20 {
+		t.Errorf("Alice.PubKeyHash should be 20 bytes, got %d", len(Alice.PubKeyHash))
+	}
+}
+
+func TestTestKeys_Hash160Matches(t *testing.T) {
+	computed := Hash160(Alice.PubKey)
+	if computed != Alice.PubKeyHash {
+		t.Error("Hash160(Alice.PubKey) should equal Alice.PubKeyHash")
+	}
+}
+
+func TestTestKeys_PubKeyFromPrivKey(t *testing.T) {
+	pk := PubKeyFromPrivKey(Alice.PrivKey)
+	if pk != Alice.PubKey {
+		t.Error("PubKeyFromPrivKey should produce Alice.PubKey")
 	}
 }
 
