@@ -129,7 +129,7 @@ class Blake3DebugCompress extends SmartContract {
   public inspect(chainingValue: ByteString, block: ByteString) {
     const result = blake3Compress(chainingValue, block);
     // Leave result on the stack, push true for script success
-    assert(result !== b'');
+    assert(result !== "");
   }
 }
 `;

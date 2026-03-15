@@ -7,6 +7,8 @@
  *   - `.runar.sol`  → Solidity-like syntax
  *   - `.runar.move` → Move-style resource language
  *   - `.runar.py`   → Python (hand-written tokenizer with INDENT/DEDENT + recursive descent)
+ *   - `.runar.go`   → Go (hand-written tokenizer + recursive descent, extends ParserCore)
+ *   - `.runar.rs`   → Rust (hand-written tokenizer + recursive descent, extends ParserCore)
  */
 
 import {
@@ -44,6 +46,8 @@ import { makeDiagnostic } from '../errors.js';
 import { parseSolSource } from './01-parse-sol.js';
 import { parseMoveSource } from './01-parse-move.js';
 import { parsePythonSource } from './01-parse-python.js';
+import { parseGoSource } from './01-parse-go.js';
+import { parseRustSource } from './01-parse-rust.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -73,6 +77,12 @@ export function parse(source: string, fileName?: string): ParseResult {
   }
   if (file.endsWith('.runar.py')) {
     return parsePythonSource(source, file);
+  }
+  if (file.endsWith('.runar.go')) {
+    return parseGoSource(source, file);
+  }
+  if (file.endsWith('.runar.rs')) {
+    return parseRustSource(source, file);
   }
 
   // Default: TypeScript parser (for .runar.ts and any unrecognized extension)

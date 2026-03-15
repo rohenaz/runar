@@ -143,6 +143,17 @@ const BUILTIN_FUNCTIONS: Map<string, FuncSig> = new Map([
 ]);
 
 // ---------------------------------------------------------------------------
+// Known global constants (e.g., EC constants, SigHash namespace)
+// ---------------------------------------------------------------------------
+
+const KNOWN_GLOBALS: Map<string, TType> = new Map([
+  ['SigHash', '<namespace>'], // SigHash.ALL, SigHash.FORKID, etc.
+  ['EC_P', 'bigint'],         // secp256k1 field prime
+  ['EC_N', 'bigint'],         // secp256k1 group order
+  ['EC_G', 'Point'],          // secp256k1 generator point
+]);
+
+// ---------------------------------------------------------------------------
 // Subtyping: Domain types that are subtypes of ByteString
 // ---------------------------------------------------------------------------
 
@@ -439,9 +450,20 @@ class TypeChecker {
         // Check if it's a builtin function name (used as a reference)
         if (BUILTIN_FUNCTIONS.has(expr.name)) return '<builtin>';
 
-        // Not found -- could be an undeclared variable
-        // We don't error here because it could be a forward reference
-        // or a global builtin. The call checker will catch it.
+        // Check if it's a known global constant
+        const globalType = KNOWN_GLOBALS.get(expr.name);
+        if (globalType !== undefined) return globalType;
+
+        // Check if it's a contract property used as a bare identifier
+        // (some frontends like Solidity emit `pubKeyHash` instead of `this.pubKeyHash`)
+        const propType = this.propTypes.get(expr.name);
+        if (propType !== undefined) return propType;
+
+        // Undeclared variable -- emit error
+        this.errors.push(makeDiagnostic(
+          `Undefined variable '${expr.name}'`,
+          'error',
+        ));
         return '<unknown>';
       }
 

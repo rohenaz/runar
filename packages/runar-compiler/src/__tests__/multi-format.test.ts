@@ -74,27 +74,22 @@ describe('Multi-format: parse() dispatch', () => {
     expect(result.contract!.name).toBe('P2PKH');
   });
 
-  it('falls back to TypeScript parser for .runar.go extension (TS has no Go parser) (row 318)', () => {
-    // The TS compiler has no Go-format parser. A .runar.go file passed to parse()
-    // will be routed to the TypeScript parser (the default fallback).
-    // Go source is not valid TypeScript, so the result should have errors or a null contract.
+  it('parses .runar.go files using the Go parser (row 318)', () => {
     const source = readConformanceSource('basic-p2pkh', '.runar.go');
     if (!source) return;
     const result = parse(source, 'basic-p2pkh.runar.go');
-    // TS parser sees Go source → should fail (contract === null or errors present)
-    // This is the expected behavior: TS does not support .runar.go
-    const hasErrorsOrNoContract = result.contract === null || result.errors.some(e => e.severity === 'error');
-    expect(hasErrorsOrNoContract).toBe(true);
+    expect(result.errors.filter(e => e.severity === 'error')).toEqual([]);
+    expect(result.contract).not.toBeNull();
+    expect(result.contract!.name).toBe('P2PKH');
   });
 
-  it('falls back to TypeScript parser for .runar.rs extension (TS has no Rust parser) (row 321)', () => {
-    // Similarly, .runar.rs files are passed to the TypeScript parser fallback.
+  it('dispatches .runar.rs to Rust parser (row 321)', () => {
     const source = readConformanceSource('basic-p2pkh', '.runar.rs');
     if (!source) return;
     const result = parse(source, 'basic-p2pkh.runar.rs');
-    // Rust source is not valid TypeScript → errors or null contract
-    const hasErrorsOrNoContract = result.contract === null || result.errors.some(e => e.severity === 'error');
-    expect(hasErrorsOrNoContract).toBe(true);
+    expect(result.errors.filter(e => e.severity === 'error')).toEqual([]);
+    expect(result.contract).not.toBeNull();
+    expect(result.contract!.name).toBe('P2PKH');
   });
 
   it('unknown extension produces errors or falls back to TS parser (row 323)', () => {
