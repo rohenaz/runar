@@ -788,11 +788,30 @@ fn test_empty_ir_error() {
 // ---------------------------------------------------------------------------
 
 fn conformance_source(test_name: &str) -> String {
-    let path = conformance_dir()
+    // Try direct .runar.ts file first
+    let direct = conformance_dir()
         .join(test_name)
         .join(format!("{}.runar.ts", test_name));
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read source {}: {}", path.display(), e))
+    if direct.exists() {
+        return std::fs::read_to_string(&direct)
+            .unwrap_or_else(|e| panic!("failed to read source {}: {}", direct.display(), e));
+    }
+
+    // Resolve via source.json
+    let source_json_path = conformance_dir().join(test_name).join("source.json");
+    if source_json_path.exists() {
+        let json_str = std::fs::read_to_string(&source_json_path)
+            .unwrap_or_else(|e| panic!("failed to read source.json for {}: {}", test_name, e));
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .unwrap_or_else(|e| panic!("failed to parse source.json for {}: {}", test_name, e));
+        if let Some(ts_ref) = parsed["sources"][".runar.ts"].as_str() {
+            let resolved = conformance_dir().join(test_name).join(ts_ref);
+            return std::fs::read_to_string(&resolved)
+                .unwrap_or_else(|e| panic!("failed to read referenced source {}: {}", resolved.display(), e));
+        }
+    }
+
+    panic!("no .runar.ts source found for conformance test {}", test_name);
 }
 
 fn example_source(contract_dir: &str, file_name: &str) -> String {
@@ -900,18 +919,20 @@ fn test_source_compile_stateful() {
 
 #[test]
 fn test_source_compile_all_conformance() {
-    // Only directories that have a .runar.ts source file (20 of 27).
-    // The remaining 7 (auction, blake3, covenant-vault, escrow, schnorr-zkp,
-    // token-ft, token-nft) only have source.json and are covered by the
-    // IR-based test_all_conformance_tests instead.
+    // All 27 conformance tests — source files are resolved from either
+    // direct .runar.ts files or via source.json references.
     let test_dirs = [
         "arithmetic",
+        "auction",
         "basic-p2pkh",
+        "blake3",
         "boolean-logic",
         "bounded-loop",
         "convergence-proof",
+        "covenant-vault",
         "ec-demo",
         "ec-primitives",
+        "escrow",
         "function-patterns",
         "if-else",
         "if-without-else",
@@ -922,9 +943,12 @@ fn test_source_compile_all_conformance() {
         "post-quantum-wallet",
         "post-quantum-wots",
         "property-initializers",
+        "schnorr-zkp",
         "sphincs-wallet",
         "stateful",
         "stateful-counter",
+        "token-ft",
+        "token-nft",
     ];
 
     let no_fold = CompileOptions { disable_constant_folding: true };

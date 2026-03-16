@@ -15,18 +15,27 @@ from conftest import conformance_dir, must_compile_source, load_conformance_scri
 
 
 def _source_path(test_name: str) -> str:
-    """Get the .runar.ts source path for a conformance test."""
+    """Get the .runar.ts source path for a conformance test.
+
+    Checks for a direct .runar.ts file first, then falls back to resolving
+    the .runar.ts reference in source.json.
+    """
+    import json
     source_dir = conformance_dir() / test_name
+    # Direct .runar.ts file in the conformance directory
     for f in source_dir.iterdir():
         if f.name.endswith(".runar.ts"):
             return str(f)
-    raise FileNotFoundError(f"No .runar.ts file in {source_dir}")
-
-
-def _has_source(test_name: str) -> bool:
-    """Check if a conformance test has a .runar.ts source file."""
-    source_dir = conformance_dir() / test_name
-    return any(f.name.endswith(".runar.ts") for f in source_dir.iterdir())
+    # Resolve via source.json reference
+    source_json = source_dir / "source.json"
+    if source_json.exists():
+        refs = json.loads(source_json.read_text(encoding="utf-8"))
+        ts_ref = refs.get("sources", {}).get(".runar.ts")
+        if ts_ref:
+            resolved = (source_dir / ts_ref).resolve()
+            if resolved.exists():
+                return str(resolved)
+    raise FileNotFoundError(f"No .runar.ts source for {test_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +107,8 @@ ALL_CONFORMANCE_TESTS = [
     "token-nft",
 ]
 
-# Tests that have .runar.ts source files (not IR-only)
-SOURCE_TESTS = [t for t in ALL_CONFORMANCE_TESTS if _has_source(t)]
+# All conformance tests have source files (either direct .runar.ts or via source.json)
+SOURCE_TESTS = ALL_CONFORMANCE_TESTS
 
 
 # ---------------------------------------------------------------------------
