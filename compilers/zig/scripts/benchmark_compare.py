@@ -543,7 +543,7 @@ def maybe_read_command_output(cmd: list[str], timeout_sec: float = 10.0) -> str 
 
 def collect_environment(args: argparse.Namespace) -> dict[str, object]:
     git_commit = maybe_read_command_output(["git", "rev-parse", "HEAD"])
-    git_status = maybe_read_command_output(["git", "status", "--short"])
+    git_status = maybe_read_command_output(["git", "status", "--short", "--untracked-files=no"])
     node_version = maybe_read_command_output([args.node_bin, "--version"])
     zig_version = maybe_read_command_output(["zig", "version"])
     return {
