@@ -1,5 +1,7 @@
 const std = @import("std");
 const root = @import("../examples_test.zig");
+const runar = @import("runar");
+const Sha256FinalizeTest = @import("Sha256FinalizeTest.runar.zig").Sha256FinalizeTest;
 
 fn contractPath(comptime basename: []const u8) []const u8 {
     return "sha256-finalize/" ++ basename;
@@ -10,41 +12,23 @@ fn runCompileChecks(comptime basename: []const u8) !void {
     try root.runar.compileCheckFile(std.testing.allocator, contractPath(basename));
 }
 
-fn sha256Digest(message: []const u8) [32]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(message, &digest, .{});
-    return digest;
-}
-
-const MirrorSha256FinalizeTest = struct {
-    expected: [32]u8,
-
-    fn init(expected: [32]u8) MirrorSha256FinalizeTest {
-        return .{ .expected = expected };
-    }
-
-    fn verify(self: MirrorSha256FinalizeTest, finalized: [32]u8, remaining: []const u8, msg_bit_len: i64) bool {
-        return msg_bit_len == @as(i64, @intCast(remaining.len * 8)) and
-            std.mem.eql(u8, self.expected[0..], finalized[0..]);
-    }
-};
-
 test "compile-check Sha256FinalizeTest.runar.zig" {
     try runCompileChecks("Sha256FinalizeTest.runar.zig");
 }
 
 test "Sha256FinalizeTest stores expected digest" {
-    const expected = sha256Digest("abc");
-    const contract = MirrorSha256FinalizeTest.init(expected);
-    try std.testing.expectEqualSlices(u8, expected[0..], contract.expected[0..]);
+    const state = runar.sha256("state");
+    const expected = runar.sha256Finalize(state, "abc", 24);
+    const contract = Sha256FinalizeTest.init(expected);
+    try std.testing.expectEqualSlices(u8, expected, contract.expected);
 }
 
-test "Sha256FinalizeTest verify checks digest bytes and message bit length" {
-    const remaining = "abc";
-    const expected = sha256Digest(remaining);
-    const contract = MirrorSha256FinalizeTest.init(expected);
+test "Sha256FinalizeTest verify checks the real finalized digest" {
+    const state = runar.sha256("state");
+    const contract = Sha256FinalizeTest.init(runar.sha256Finalize(state, "abc", 24));
+    contract.verify(state, "abc", 24);
+}
 
-    try std.testing.expect(contract.verify(expected, remaining, 24));
-    try std.testing.expect(!contract.verify(expected, remaining, 23));
-    try std.testing.expect(!contract.verify(sha256Digest("abcd"), remaining, 24));
+test "Sha256FinalizeTest verify rejects mismatched digest bytes through the real assertion path" {
+    try root.runar.expectAssertFailure(std.testing.allocator, "sha256-finalize-mismatch");
 }

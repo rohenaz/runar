@@ -46,7 +46,7 @@ pub fn compileCheckSource(
     };
 
     const validation = try frontend.validateContract(work_allocator, contract);
-    if (validation.errors.len != 0 and !isIgnorableZigConstructorValidation(validation.errors)) {
+    if (validation.errors.len != 0) {
         return .{
             .stage = .validate,
             .messages = try duplicateDiagnostics(allocator, validation.errors),
@@ -168,6 +168,35 @@ test "compileCheckSource reports validation failures" {
     try std.testing.expect(result.messages.len != 0);
 }
 
+test "compileCheckSource reports Zig constructor assignment failures" {
+    const source =
+        \\const runar = @import("runar");
+        \\
+        \\pub const Broken = struct {
+        \\    pub const Contract = runar.SmartContract;
+        \\
+        \\    owner: runar.PubKey,
+        \\    amount: i64,
+        \\
+        \\    pub fn init(owner: runar.PubKey, amount: i64) Broken {
+        \\        return .{ .owner = owner };
+        \\    }
+        \\
+        \\    pub fn unlock(self: *const Broken) void {
+        \\        runar.assert(self.amount > 0);
+        \\    }
+        \\};
+    ;
+
+    const result = try compileCheckSource(std.testing.allocator, source, "BrokenCtor.runar.zig");
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.ok());
+    try std.testing.expectEqual(CompileCheckStage.validate, result.stage.?);
+    try std.testing.expectEqual(@as(usize, 1), result.messages.len);
+    try std.testing.expectEqualStrings("property must be assigned in the constructor", result.messages[0]);
+}
+
 test "compileCheckFile reads and checks a file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -201,13 +230,4 @@ test "compileCheckFile reads and checks a file" {
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(result.ok());
-}
-
-fn isIgnorableZigConstructorValidation(diagnostics: anytype) bool {
-    for (diagnostics) |diagnostic| {
-        if (!std.mem.eql(u8, diagnostic.message, "constructor must call super() with all parameters")) {
-            return false;
-        }
-    }
-    return diagnostics.len != 0;
 }

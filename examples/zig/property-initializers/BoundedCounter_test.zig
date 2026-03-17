@@ -1,25 +1,9 @@
 const std = @import("std");
 
 const root = @import("../examples_test.zig");
+const BoundedCounter = @import("BoundedCounter.runar.zig").BoundedCounter;
 
 const contract_source = @embedFile("BoundedCounter.runar.zig");
-
-const BoundedCounterMirror = struct {
-    count: i64 = 0,
-    max_count: i64,
-    active: bool = true,
-
-    fn increment(self: *BoundedCounterMirror, amount: i64) !void {
-        if (!self.active) return error.Inactive;
-        const next = self.count + amount;
-        if (next > self.max_count) return error.CountOverflow;
-        self.count = next;
-    }
-
-    fn reset(self: *BoundedCounterMirror) void {
-        self.count = 0;
-    }
-};
 
 test "compile-check BoundedCounter.runar.zig" {
     const allocator = std.testing.allocator;
@@ -34,23 +18,21 @@ test "compile-check BoundedCounter.runar.zig" {
 }
 
 test "bounded counter defaults active and resets" {
-    var counter = BoundedCounterMirror{ .max_count = 10 };
+    var counter = BoundedCounter.init(10);
     try std.testing.expect(counter.active);
     try std.testing.expectEqual(@as(i64, 0), counter.count);
 
-    try counter.increment(4);
+    counter.increment(4);
     try std.testing.expectEqual(@as(i64, 4), counter.count);
 
     counter.reset();
     try std.testing.expectEqual(@as(i64, 0), counter.count);
 }
 
-test "bounded counter enforces active flag and max" {
-    var counter = BoundedCounterMirror{ .max_count = 5 };
-    try counter.increment(5);
-    try std.testing.expectEqual(@as(i64, 5), counter.count);
-    try std.testing.expectError(error.CountOverflow, counter.increment(1));
+test "bounded counter overflow fails through the real contract assertion path" {
+    try root.runar.expectAssertFailure(std.testing.allocator, "bounded-counter-overflow");
+}
 
-    counter.active = false;
-    try std.testing.expectError(error.Inactive, counter.increment(1));
+test "bounded counter inactive flag fails through the real contract assertion path" {
+    try root.runar.expectAssertFailure(std.testing.allocator, "bounded-counter-inactive");
 }

@@ -22,6 +22,7 @@ pub const OutputSnapshot = base.OutputSnapshot;
 pub const Readonly = base.Readonly;
 pub const SmartContract = base.SmartContract;
 pub const StatefulSmartContract = base.StatefulSmartContract;
+pub const StatefulContext = base.StatefulContext;
 pub const StatefulSmartContractError = base.StatefulSmartContractError;
 
 pub const TestKeyPair = test_keys.TestKeyPair;
@@ -41,6 +42,7 @@ pub const sha256 = builtins.sha256;
 pub const ripemd160 = builtins.ripemd160;
 pub const hash160 = builtins.hash160;
 pub const hash256 = builtins.hash256;
+pub const bytesEq = builtins.bytesEq;
 pub const checkSig = builtins.checkSig;
 pub const checkMultiSig = builtins.checkMultiSig;
 pub const checkPreimage = builtins.checkPreimage;

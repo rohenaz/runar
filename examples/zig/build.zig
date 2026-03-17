@@ -17,6 +17,19 @@ pub fn build(b: *std.Build) void {
     });
     runar_module.addImport("runar_frontend", frontend_module);
 
+    const assert_probe = b.addExecutable(.{
+        .name = "assert_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("assert_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    assert_probe.root_module.addImport("runar", runar_module);
+
+    const build_options = b.addOptions();
+    build_options.addOptionPath("assert_probe_path", assert_probe.getEmittedBin());
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("examples_test.zig"),
@@ -25,8 +38,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("runar", runar_module);
+    tests.root_module.addImport("build_options", build_options.createModule());
 
     const run_tests = b.addRunArtifact(tests);
+    run_tests.step.dependOn(&assert_probe.step);
     const test_step = b.step("test", "Run Zig example tests");
     test_step.dependOn(&run_tests.step);
 }

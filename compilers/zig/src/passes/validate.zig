@@ -37,17 +37,36 @@ pub const ValidationResult = struct {
     warnings: []CompilerDiagnostic,
 };
 
+const ConstructorValidationMode = enum {
+    generic,
+    zig,
+};
+
 /// Validate a Runar AST against language subset constraints.
 /// Does NOT modify the AST; only reports errors and warnings.
 /// Caller owns the returned slices and must free them with the same allocator.
 pub fn validate(allocator: Allocator, contract: ContractNode) !ValidationResult {
+    return validateWithMode(allocator, contract, .generic);
+}
+
+/// Validate a Zig AST against Runar language subset constraints.
+/// Zig constructors use `init` field assignment, not `super(...)`.
+pub fn validateZig(allocator: Allocator, contract: ContractNode) !ValidationResult {
+    return validateWithMode(allocator, contract, .zig);
+}
+
+fn validateWithMode(
+    allocator: Allocator,
+    contract: ContractNode,
+    mode: ConstructorValidationMode,
+) !ValidationResult {
     var errors: std.ArrayListUnmanaged(CompilerDiagnostic) = .empty;
     defer errors.deinit(allocator);
     var warnings: std.ArrayListUnmanaged(CompilerDiagnostic) = .empty;
     defer warnings.deinit(allocator);
 
     try validateProperties(allocator, contract, &errors, &warnings);
-    try validateConstructor(allocator, contract, &errors);
+    try validateConstructor(allocator, contract, mode, &errors);
     try validateMethods(allocator, contract, &errors, &warnings);
     try checkNoRecursion(allocator, contract, &errors);
 
@@ -149,46 +168,42 @@ fn validateProperties(
 fn validateConstructor(
     allocator: Allocator,
     contract: ContractNode,
+    mode: ConstructorValidationMode,
     errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
 ) !void {
     const ctor = contract.constructor;
+    const is_zig_constructor = mode == .zig or isZigConstructor(ctor);
 
-    // Check super() call: constructor must have super_args (the parser populates this
-    // from the super() call). If super_args is empty AND there are constructor params,
-    // that means super() was not called with all params.
-    // However, the Zig AST models super_args explicitly. If there are params but
-    // no super_args, the super() call is missing or incomplete.
-    // Zig-style constructors use `return .{ .field = val }` which the parser
-    // models as a MethodNode body, not ConstructorNode super_args/assignments.
-    // Only check super()/assignments for TS-style constructors that have them.
-    const is_zig_style = ctor.super_args.len == 0 and ctor.assignments.len == 0;
-
-    if (!is_zig_style and ctor.params.len > 0 and ctor.super_args.len == 0) {
+    if (!is_zig_constructor and ctor.params.len > 0 and ctor.super_args.len == 0) {
         try errors.append(allocator, .{
             .message = "constructor must call super() with all parameters",
             .severity = .@"error",
         });
     }
 
-    // Check all properties are assigned in constructor (skip for Zig-style)
-    if (!is_zig_style) {
-        for (contract.properties) |prop| {
-            var assigned = false;
-            for (ctor.assignments) |assignment| {
-                if (std.mem.eql(u8, assignment.target, prop.name)) {
-                    assigned = true;
-                    break;
-                }
-            }
-            // Properties with initializers don't need constructor assignments
-            if (!assigned and prop.initializer == null) {
-                try errors.append(allocator, .{
-                    .message = "property must be assigned in the constructor",
-                    .severity = .@"error",
-                });
+    for (contract.properties) |prop| {
+        var assigned = false;
+        for (ctor.assignments) |assignment| {
+            if (std.mem.eql(u8, assignment.target, prop.name)) {
+                assigned = true;
+                break;
             }
         }
+        // Properties with initializers don't need constructor assignments
+        if (!assigned and prop.initializer == null) {
+            try errors.append(allocator, .{
+                .message = "property must be assigned in the constructor",
+                .severity = .@"error",
+            });
+        }
     }
+}
+
+fn isZigConstructor(ctor: ConstructorNode) bool {
+    for (ctor.params) |param| {
+        if (param.type_name.len == 0) return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -532,6 +547,10 @@ fn makeAssignment(target: []const u8) types.AssignmentNode {
 }
 
 fn makeParam(name: []const u8) types.ParamNode {
+    return .{ .name = name, .type_name = "bigint" };
+}
+
+fn makeZigParam(name: []const u8) types.ParamNode {
     return .{ .name = name };
 }
 
@@ -683,6 +702,60 @@ test "constructor missing super() call reports error" {
         }
     }
     try testing.expect(found);
+}
+
+test "zig constructor without super() passes when properties are assigned" {
+    const allocator = testing.allocator;
+    const props = [_]PropertyNode{
+        makeProperty("pk", .pub_key, true),
+    };
+    var assignments = [_]types.AssignmentNode{
+        .{ .target = "pk", .value = .{ .identifier = "pk" } },
+    };
+    var params = [_]types.ParamNode{makeZigParam("pk")};
+    const contract = ContractNode{
+        .name = "P2PKH",
+        .parent_class = .smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &.{}, .assignments = &assignments },
+        .methods = &.{},
+    };
+    const result = try validateZig(allocator, contract);
+    defer freeResult(allocator, result);
+
+    try testing.expectEqual(@as(usize, 0), result.errors.len);
+}
+
+test "zig constructor missing property assignment reports error without super() noise" {
+    const allocator = testing.allocator;
+    const props = [_]PropertyNode{
+        makeProperty("pk", .pub_key, true),
+        makeProperty("amount", .bigint, true),
+    };
+    var assignments = [_]types.AssignmentNode{
+        .{ .target = "pk", .value = .{ .identifier = "pk" } },
+    };
+    var params = [_]types.ParamNode{ makeZigParam("pk"), makeZigParam("amount") };
+    const contract = ContractNode{
+        .name = "Bad",
+        .parent_class = .smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &.{}, .assignments = &assignments },
+        .methods = &.{},
+    };
+    const result = try validateZig(allocator, contract);
+    defer freeResult(allocator, result);
+
+    var found_assignment_error = false;
+    for (result.errors) |err| {
+        if (std.mem.indexOf(u8, err.message, "super()") != null) {
+            return error.TestUnexpectedResult;
+        }
+        if (std.mem.eql(u8, err.message, "property must be assigned in the constructor")) {
+            found_assignment_error = true;
+        }
+    }
+    try testing.expect(found_assignment_error);
 }
 
 test "constructor missing property assignment reports error" {

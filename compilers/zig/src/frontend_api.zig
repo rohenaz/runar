@@ -5,7 +5,7 @@ const validate = @import("passes/validate.zig");
 pub const parseZig = parse_zig.parseZig;
 pub const ParseResult = parse_zig.ParseResult;
 
-pub const validateContract = validate.validate;
+pub const validateContract = validate.validateZig;
 pub const ValidationResult = validate.ValidationResult;
 
 pub const typeCheck = typecheck.typeCheck;

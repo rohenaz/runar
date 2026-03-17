@@ -1,5 +1,6 @@
 const std = @import("std");
 const runtime = @import("runar");
+const build_options = @import("build_options");
 
 pub const runar = struct {
     pub fn compileCheckSource(
@@ -30,7 +31,37 @@ pub const runar = struct {
             return error.CompileCheckFailed;
         }
     }
+
+    pub fn expectAssertFailure(
+        allocator: std.mem.Allocator,
+        probe_case: []const u8,
+    ) !void {
+        const result = try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ build_options.assert_probe_path, probe_case },
+            .max_output_bytes = 64 * 1024,
+        });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+
+        switch (result.term) {
+            .Exited => |code| try std.testing.expect(code != 0),
+            .Signal => {},
+            else => return error.TestUnexpectedResult,
+        }
+
+        const saw_assert_panic =
+            std.mem.indexOf(u8, result.stdout, "runar assertion failed") != null or
+            std.mem.indexOf(u8, result.stderr, "runar assertion failed") != null;
+        try std.testing.expect(saw_assert_panic);
+    }
 };
+
+pub fn expectAssertFailure(probe_case: []const u8) !void {
+    try runar.expectAssertFailure(std.testing.allocator, probe_case);
+}
 
 test {
     _ = @import("./auction/Auction_test.zig");

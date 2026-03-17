@@ -1,5 +1,7 @@
 const std = @import("std");
 const root = @import("../examples_test.zig");
+const runar = @import("runar");
+const Blake3Test = @import("Blake3Test.runar.zig").Blake3Test;
 
 fn contractPath(comptime basename: []const u8) []const u8 {
     return "blake3/" ++ basename;
@@ -10,45 +12,28 @@ fn runCompileChecks(comptime basename: []const u8) !void {
     try root.runar.compileCheckFile(std.testing.allocator, contractPath(basename));
 }
 
-fn blake3Digest(message: []const u8) [32]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(message, &digest, .{});
-    return digest;
-}
-
-const MirrorBlake3Test = struct {
-    expected: [32]u8,
-
-    fn init(expected: [32]u8) MirrorBlake3Test {
-        return .{ .expected = expected };
-    }
-
-    fn verifyHash(self: MirrorBlake3Test, message: []const u8) bool {
-        const digest = blake3Digest(message);
-        return std.mem.eql(u8, self.expected[0..], digest[0..]);
-    }
-
-    fn verifyCompress(self: MirrorBlake3Test, compressed: [32]u8) bool {
-        return std.mem.eql(u8, self.expected[0..], compressed[0..]);
-    }
-};
-
 test "compile-check Blake3Test.runar.zig" {
     try runCompileChecks("Blake3Test.runar.zig");
 }
 
-test "Blake3Test verifyHash checks the BLAKE3 digest" {
-    const expected = blake3Digest("abc");
-    const contract = MirrorBlake3Test.init(expected);
-
-    try std.testing.expect(contract.verifyHash("abc"));
-    try std.testing.expect(!contract.verifyHash("abcd"));
+test "Blake3Test verifyHash checks the real BLAKE3 helper" {
+    const expected = runar.blake3Hash("abc");
+    const contract = Blake3Test.init(expected);
+    contract.verifyHash("abc");
 }
 
-test "Blake3Test verifyCompress checks the builtin output bytes" {
-    const expected = blake3Digest("compressed");
-    const contract = MirrorBlake3Test.init(expected);
+test "Blake3Test verifyHash rejects mismatched digest bytes through the real assertion path" {
+    try root.runar.expectAssertFailure(std.testing.allocator, "blake3-hash-mismatch");
+}
 
-    try std.testing.expect(contract.verifyCompress(expected));
-    try std.testing.expect(!contract.verifyCompress(blake3Digest("other")));
+test "Blake3Test verifyCompress checks the real compression helper" {
+    const state = runar.sha256("state");
+    const block = [_]u8{'a'} ** 64;
+    const expected = runar.blake3Compress(state, &block);
+    const contract = Blake3Test.init(expected);
+    contract.verifyCompress(state, &block);
+}
+
+test "Blake3Test verifyCompress rejects mismatched compressed bytes through the real assertion path" {
+    try root.runar.expectAssertFailure(std.testing.allocator, "blake3-compress-mismatch");
 }

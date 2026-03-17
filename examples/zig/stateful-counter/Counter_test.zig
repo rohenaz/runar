@@ -1,21 +1,9 @@
 const std = @import("std");
 
 const root = @import("../examples_test.zig");
+const Counter = @import("Counter.runar.zig").Counter;
 
 const contract_source = @embedFile("Counter.runar.zig");
-
-const CounterMirror = struct {
-    count: i64,
-
-    fn increment(self: *CounterMirror) void {
-        self.count += 1;
-    }
-
-    fn decrement(self: *CounterMirror) !void {
-        if (self.count <= 0) return error.CounterUnderflow;
-        self.count -= 1;
-    }
-};
 
 test "compile-check Counter.runar.zig" {
     const allocator = std.testing.allocator;
@@ -29,17 +17,16 @@ test "compile-check Counter.runar.zig" {
     try root.runar.compileCheckSource(allocator, contract_source, "Counter.runar.zig");
 }
 
-test "counter mirror increments and decrements" {
-    var counter = CounterMirror{ .count = 2 };
+test "counter executes increment and decrement directly" {
+    var counter = Counter.init(2);
 
     counter.increment();
     try std.testing.expectEqual(@as(i64, 3), counter.count);
 
-    try counter.decrement();
+    counter.decrement();
     try std.testing.expectEqual(@as(i64, 2), counter.count);
 }
 
-test "counter mirror rejects decrement at zero" {
-    var counter = CounterMirror{ .count = 0 };
-    try std.testing.expectError(error.CounterUnderflow, counter.decrement());
+test "counter decrement at zero fails through the real contract assertion path" {
+    try root.runar.expectAssertFailure(std.testing.allocator, "counter-underflow");
 }

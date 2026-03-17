@@ -1,5 +1,7 @@
 const std = @import("std");
 const root = @import("../examples_test.zig");
+const runar = @import("runar");
+const Escrow = @import("Escrow.runar.zig").Escrow;
 
 fn contractPath(comptime basename: []const u8) []const u8 {
     return "escrow/" ++ basename;
@@ -9,46 +11,27 @@ fn runCompileChecks(comptime basename: []const u8) !void {
     try root.runar.compileCheckSource(std.testing.allocator, @embedFile(basename), basename);
     try root.runar.compileCheckFile(std.testing.allocator, contractPath(basename));
 }
-const MirrorEscrow = struct {
-    buyer: []const u8,
-    seller: []const u8,
-    arbiter: []const u8,
-
-    fn init(buyer: []const u8, seller: []const u8, arbiter: []const u8) MirrorEscrow {
-        return .{
-            .buyer = buyer,
-            .seller = seller,
-            .arbiter = arbiter,
-        };
-    }
-
-    fn release(self: MirrorEscrow, seller_sig_ok: bool, arbiter_sig_ok: bool) bool {
-        _ = self;
-        return seller_sig_ok and arbiter_sig_ok;
-    }
-
-    fn refund(self: MirrorEscrow, buyer_sig_ok: bool, arbiter_sig_ok: bool) bool {
-        _ = self;
-        return buyer_sig_ok and arbiter_sig_ok;
-    }
-};
 
 test "compile-check Escrow.runar.zig" {
     try runCompileChecks("Escrow.runar.zig");
 }
 
 test "Escrow init stores all parties" {
-    const contract = MirrorEscrow.init("buyer", "seller", "arbiter");
-    try std.testing.expectEqualStrings("buyer", contract.buyer);
-    try std.testing.expectEqualStrings("seller", contract.seller);
-    try std.testing.expectEqualStrings("arbiter", contract.arbiter);
+    const contract = Escrow.init(runar.ALICE.pubKey, runar.BOB.pubKey, runar.CHARLIE.pubKey);
+    try std.testing.expectEqualSlices(u8, runar.ALICE.pubKey, contract.buyer);
+    try std.testing.expectEqualSlices(u8, runar.BOB.pubKey, contract.seller);
+    try std.testing.expectEqualSlices(u8, runar.CHARLIE.pubKey, contract.arbiter);
 }
 
-test "Escrow release and refund require both signatures" {
-    const contract = MirrorEscrow.init("buyer", "seller", "arbiter");
+test "Escrow release and refund execute with matching fixture signatures" {
+    const contract = Escrow.init(runar.ALICE.pubKey, runar.BOB.pubKey, runar.CHARLIE.pubKey);
 
-    try std.testing.expect(contract.release(true, true));
-    try std.testing.expect(!contract.release(true, false));
-    try std.testing.expect(contract.refund(true, true));
-    try std.testing.expect(!contract.refund(false, true));
+    contract.release(
+        runar.signTestMessage(runar.BOB),
+        runar.signTestMessage(runar.CHARLIE),
+    );
+    contract.refund(
+        runar.signTestMessage(runar.ALICE),
+        runar.signTestMessage(runar.CHARLIE),
+    );
 }
