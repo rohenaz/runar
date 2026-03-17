@@ -82,3 +82,39 @@ describe('parseZigSource readonly stateful fields', () => {
     }
   });
 });
+
+describe('parseZigSource bytes equality lowering', () => {
+  it('parses runar.bytesEq(a, b) as byte equality instead of a builtin call', () => {
+    const source = `
+      const runar = @import("runar");
+
+      pub const EqContract = struct {
+        pub const Contract = runar.SmartContract;
+
+        pub fn unlock(self: EqContract, a: runar.ByteString, b: runar.ByteString) {
+          _ = self;
+          return runar.bytesEq(a, b);
+        }
+      };
+    `;
+
+    const { direct, dispatch } = parseContract(source);
+
+    for (const contract of [direct, dispatch]) {
+      const unlock = contract.methods.find(method => method.name === 'unlock');
+      expect(unlock?.body).toHaveLength(1);
+
+      const ret = unlock?.body[0];
+      expect(ret?.kind).toBe('return_statement');
+
+      if (ret?.kind === 'return_statement') {
+        expect(ret.value).toEqual({
+          kind: 'binary_expr',
+          op: '===',
+          left: { kind: 'identifier', name: 'a' },
+          right: { kind: 'identifier', name: 'b' },
+        });
+      }
+    }
+  });
+});

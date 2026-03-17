@@ -294,6 +294,17 @@ const Parser = struct {
         return Expression{ .method_call = mc };
     }
 
+    fn makeRunarBuiltinExpr(self: *Parser, member: []const u8, args: []Expression) ?Expression {
+        if (std.mem.eql(u8, member, "bytesEq")) {
+            if (args.len != 2) {
+                self.addError("runar.bytesEq expects exactly 2 arguments");
+                return null;
+            }
+            return self.makeBinOp(.eq, args[0], args[1]);
+        }
+        return self.makeCall(member, args);
+    }
+
     // ---- Top-level ----
 
     fn parse(self: *Parser) ParseResult {
@@ -516,6 +527,14 @@ const Parser = struct {
         return .{ .custom_type = name };
     }
 
+    fn typeNodeName(type_node: TypeNode) []const u8 {
+        return switch (type_node) {
+            .primitive_type => |ptn| ptn.toTsString(),
+            .fixed_array_type => "array",
+            .custom_type => |name| name,
+        };
+    }
+
     // ---- Constructor ----
 
     fn parseConstructor(self: *Parser, properties: []const PropertyNode) ?ConstructorNode {
@@ -616,7 +635,12 @@ const Parser = struct {
         if (self.current.kind != .ident) return null;
         const n = self.bump();
         if (self.expect(.colon) == null) return null;
-        return ParamNode{ .name = n.text, .type_info = typeNodeToRunarType(self.parseTypeNode()) };
+        const type_node = self.parseTypeNode();
+        return ParamNode{
+            .name = n.text,
+            .type_info = typeNodeToRunarType(type_node),
+            .type_name = typeNodeName(type_node),
+        };
     }
 
     fn skipTypeAnnotation(self: *Parser) void {
@@ -870,7 +894,7 @@ const Parser = struct {
                     };
                     // Strip runar. namespace: runar.assert(x) → assert(x)
                     if (std.mem.eql(u8, object_name, "runar")) {
-                        expr = self.makeCall(member, args) orelse return null;
+                        expr = self.makeRunarBuiltinExpr(member, args) orelse return null;
                     } else {
                         expr = self.makeMethodCall(object_name, member, args) orelse return null;
                     }
@@ -896,6 +920,19 @@ const Parser = struct {
 
     fn parsePrimary(self: *Parser) ?Expression {
         return switch (self.current.kind) {
+            .dot => blk: {
+                _ = self.bump();
+                if (self.current.kind != .lbrace) break :blk null;
+                _ = self.bump();
+                var elems: std.ArrayListUnmanaged(Expression) = .empty;
+                while (self.current.kind != .rbrace and self.current.kind != .eof) {
+                    const elem = self.parseExpression() orelse return null;
+                    elems.append(self.allocator, elem) catch return null;
+                    if (self.current.kind == .comma) _ = self.bump();
+                }
+                _ = self.expect(.rbrace);
+                break :blk .{ .array_literal = elems.items };
+            },
             .number => blk: { const tok = self.bump(); break :blk Expression{ .literal_int = std.fmt.parseInt(i64, tok.text, 10) catch { self.addErrorFmt("invalid integer: '{s}'", .{tok.text}); break :blk null; } }; },
             .kw_true => blk: { _ = self.bump(); break :blk Expression{ .literal_bool = true }; },
             .kw_false => blk: { _ = self.bump(); break :blk Expression{ .literal_bool = false }; },
@@ -1356,6 +1393,36 @@ test "logical or operator" {
     try std.testing.expectEqual(@as(usize, 0), res.errors.len);
     switch (res.contract.?.methods[0].body[0].expr_stmt) {
         .call => |c| { try std.testing.expectEqualStrings("assert", c.callee); switch (c.args[0]) { .binary_op => |b| try std.testing.expectEqual(BinOperator.or_op, b.op), else => return error.UnexpectedVariant } },
+        else => return error.UnexpectedVariant,
+    }
+}
+
+test "parse runar.bytesEq as binary equality" {
+    const source =
+        \\const runar = @import("runar");
+        \\pub const B = struct {
+        \\    pub const Contract = runar.SmartContract;
+        \\    expected: runar.ByteString,
+        \\    pub fn init(expected: runar.ByteString) B { return .{ .expected = expected }; }
+        \\    pub fn check(self: *const B, actual: runar.ByteString) void {
+        \\        runar.assert(runar.bytesEq(actual, self.expected));
+        \\    }
+        \\};
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const res = parseZig(arena.allocator(), source, "B.runar.zig");
+    try std.testing.expectEqual(@as(usize, 0), res.errors.len);
+    const stmt = res.contract.?.methods[0].body[0];
+    switch (stmt.expr_stmt) {
+        .call => |c| {
+            try std.testing.expectEqualStrings("assert", c.callee);
+            try std.testing.expectEqual(@as(usize, 1), c.args.len);
+            switch (c.args[0]) {
+                .binary_op => |b| try std.testing.expectEqual(BinOperator.eq, b.op),
+                else => return error.UnexpectedVariant,
+            }
+        },
         else => return error.UnexpectedVariant,
     }
 }

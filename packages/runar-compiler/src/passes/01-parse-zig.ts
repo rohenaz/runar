@@ -858,6 +858,18 @@ class ZigParser extends ParserCore<ZigToken> {
   protected parsePrimary(): Expression {
     const token = this.current();
 
+    if (token.type === '.' && this.tokens[this.pos + 1]?.type === '{') {
+      this.advance();
+      this.advance();
+      const elements: Expression[] = [];
+      while (this.current().type !== '}' && this.current().type !== 'eof') {
+        elements.push(this.parseExpression());
+        if (this.current().type === ',') this.advance();
+      }
+      this.expect('}');
+      return { kind: 'array_literal', elements };
+    }
+
     if (token.type === 'number') {
       this.advance();
       return { kind: 'bigint_literal', value: BigInt(token.value) };
@@ -902,6 +914,14 @@ class ZigParser extends ParserCore<ZigToken> {
       if (token.value === 'runar' && this.current().type === '.') {
         this.advance();
         const builtin = this.expect('ident').value;
+        if (builtin === 'bytesEq' && this.current().type === '(') {
+          this.advance();
+          const left = this.parseExpression();
+          this.expect(',');
+          const right = this.parseExpression();
+          this.expect(')');
+          return { kind: 'binary_expr', op: '===', left, right };
+        }
         return { kind: 'identifier', name: builtin };
       }
 

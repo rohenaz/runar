@@ -10,7 +10,7 @@ pub const P2Blake3PKH = struct {
     }
 
     pub fn unlock(self: *const P2Blake3PKH, sig: runar.Sig, pubKey: runar.PubKey) void {
-        runar.assert(runar.blake3Hash(pubKey) == self.pubKeyHash);
+        runar.assert(runar.bytesEq(runar.blake3Hash(pubKey), self.pubKeyHash));
         runar.assert(runar.checkSig(sig, pubKey));
     }
 };

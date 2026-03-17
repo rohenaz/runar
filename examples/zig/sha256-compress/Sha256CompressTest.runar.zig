@@ -10,6 +10,6 @@ pub const Sha256CompressTest = struct {
     }
 
     pub fn verify(self: *const Sha256CompressTest, state: runar.ByteString, block: runar.ByteString) void {
-        runar.assert(runar.sha256Compress(state, block) == self.expected);
+        runar.assert(runar.bytesEq(runar.sha256Compress(state, block), self.expected));
     }
 };
