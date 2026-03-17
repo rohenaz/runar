@@ -835,10 +835,10 @@
 24293 225210782 1760154801000000000 0c7d3ee9ea8e698a843ee6039fd161c4 1 std/os/linux/bpf/helpers.zig
 3221 225210256 1760154801000000000 fda67b74062c7f535bb0a6d0f1fe74fb 1 std/crypto/codecs/asn1/der/ArrayListReverse.zig
 3842 300219268 1773721284487856760 8d4a1c0df463f67efdeab9b0e9a8a6da 0 /Users/satchmo/code/runar/compilers/zig/src/main.zig
-23577 300203973 1773719287166721399 1c97a742bcbb5e7605a39f97039ca474 0 /Users/satchmo/code/runar/compilers/zig/src/ir/types.zig
-73015 300218460 1773720970342574814 b0f9427247898aa17c1ddf18ccd89696 0 /Users/satchmo/code/runar/compilers/zig/src/ir/json.zig
-73965 300218369 1773720896105511503 5cb3117519372ee98956f594da16c97f 0 /Users/satchmo/code/runar/compilers/zig/src/passes/stack_lower.zig
-28227 300202164 1773718770201059744 ac04e9534ef256ade42a409f19ffa752 0 /Users/satchmo/code/runar/compilers/zig/src/passes/peephole.zig
+23229 300221397 1773721868799587285 c03cb41e5889eff7a2883dd8a98e3923 0 /Users/satchmo/code/runar/compilers/zig/src/ir/types.zig
+73315 300221651 1773721888581149337 cf49a709869c64b45b0619d1fff42614 0 /Users/satchmo/code/runar/compilers/zig/src/ir/json.zig
+76290 300222360 1773722008835419350 a30ed96288d2c45065442a1591ddbf51 0 /Users/satchmo/code/runar/compilers/zig/src/passes/stack_lower.zig
+28923 300222550 1773722045188694554 07241f5e9e6d0685858b735571997cbc 0 /Users/satchmo/code/runar/compilers/zig/src/passes/peephole.zig
 38310 300204039 1773719323487123599 4db5cc14daad0fc71506404747c2a8a9 0 /Users/satchmo/code/runar/compilers/zig/src/codegen/emit.zig
 25476 300201382 1773718405059427845 dceb33a25038409bac4b1c07f375888d 0 /Users/satchmo/code/runar/compilers/zig/src/codegen/opcodes.zig
 58805 300218763 1773721157748693875 593dd95bc156edde20a48f9f876666dd 0 /Users/satchmo/code/runar/compilers/zig/src/passes/parse_zig.zig
@@ -846,5 +846,5 @@
 40863 300219504 1773721362326396725 147e02907813dae33a675d64c07a4a22 0 /Users/satchmo/code/runar/compilers/zig/src/passes/validate.zig
 67524 300219652 1773721476390953660 35a0944cef039c54356b69426b94ae3b 0 /Users/satchmo/code/runar/compilers/zig/src/passes/typecheck.zig
 61940 300217341 1773720367744655966 be39e17cc71e422d6b0d5bd7ef4e9fe7 0 /Users/satchmo/code/runar/compilers/zig/src/passes/anf_lower.zig
-48188 300219588 1773721461381944631 5cf6cfeafc6bd0206346778cabedf879 0 /Users/satchmo/code/runar/compilers/zig/src/passes/constant_fold.zig
-29938 300219343 1773721320891514940 ff0ec510c9305d9ddd518b7287a7e25e 0 /Users/satchmo/code/runar/compilers/zig/src/passes/ec_optimizer.zig
+50494 300222027 1773721948261742952 050d6c17389c10acf69b30225ab0a066 0 /Users/satchmo/code/runar/compilers/zig/src/passes/constant_fold.zig
+31931 300222467 1773722033512332084 545ad042d20b12a3484bdd3b0e7154c3 0 /Users/satchmo/code/runar/compilers/zig/src/passes/ec_optimizer.zig

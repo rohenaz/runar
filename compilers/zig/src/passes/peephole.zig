@@ -91,29 +91,40 @@ pub fn optimize(allocator: Allocator, methods: []const types.StackMethod) ![]typ
 
 /// Optimize a single instruction sequence. Returns a new slice (caller owns).
 /// Applies rules iteratively until no more changes occur or max_iterations reached.
+/// Uses two alternating buffers to avoid allocating a new slice per iteration.
 pub fn optimizeOps(allocator: Allocator, ops: []const Inst) ![]Inst {
-    // Copy input into a working list
-    var current = try allocator.alloc(Inst, ops.len);
-    @memcpy(current, ops);
+    // Two reusable buffers that alternate roles (input/output) each iteration
+    var buf_a = std.ArrayListUnmanaged(Inst).empty;
+    defer buf_a.deinit(allocator);
+    var buf_b = std.ArrayListUnmanaged(Inst).empty;
+    defer buf_b.deinit(allocator);
+
+    // Seed buf_a with the input
+    try buf_a.ensureTotalCapacity(allocator, ops.len);
+    buf_a.appendSliceAssumeCapacity(ops);
 
     var iteration: usize = 0;
     while (iteration < max_iterations) : (iteration += 1) {
-        const next = try runOnePass(allocator, current);
-        if (next.len == current.len and sliceEql(next, current)) {
-            // No change — fixed point reached
-            allocator.free(next);
-            return current;
-        }
-        allocator.free(current);
-        current = next;
+        const changed = try runOnePass(allocator, buf_a.items, &buf_b);
+        if (!changed) break;
+        // Swap: buf_b becomes input, buf_a becomes output for next iteration
+        const tmp = buf_a;
+        buf_a = buf_b;
+        buf_b = tmp;
     }
-    return current;
+
+    // Return owned slice from whichever buffer holds the final result
+    // buf_a always holds the current result (either unchanged or post-swap)
+    const result = try allocator.alloc(Inst, buf_a.items.len);
+    @memcpy(result, buf_a.items);
+    return result;
 }
 
 /// A single left-to-right pass applying all rules greedily (largest window first).
-fn runOnePass(allocator: Allocator, ops: []const Inst) ![]Inst {
-    var out = std.ArrayListUnmanaged(Inst).empty;
-    errdefer out.deinit(allocator);
+/// Writes results into `out` (cleared first). Returns true if any rule fired.
+fn runOnePass(allocator: Allocator, ops: []const Inst, out: *std.ArrayListUnmanaged(Inst)) !bool {
+    out.clearRetainingCapacity();
+    var changed = false;
 
     var i: usize = 0;
     while (i < ops.len) {
@@ -124,6 +135,7 @@ fn runOnePass(allocator: Allocator, ops: []const Inst) ![]Inst {
                     if (inst) |r| try out.append(allocator, r);
                 }
                 i += 4;
+                changed = true;
                 continue;
             }
         }
@@ -134,6 +146,7 @@ fn runOnePass(allocator: Allocator, ops: []const Inst) ![]Inst {
                     if (inst) |r| try out.append(allocator, r);
                 }
                 i += 3;
+                changed = true;
                 continue;
             }
         }
@@ -144,6 +157,7 @@ fn runOnePass(allocator: Allocator, ops: []const Inst) ![]Inst {
                     if (inst) |r| try out.append(allocator, r);
                 }
                 i += 2;
+                changed = true;
                 continue;
             }
         }
@@ -152,7 +166,7 @@ fn runOnePass(allocator: Allocator, ops: []const Inst) ![]Inst {
         i += 1;
     }
 
-    return try out.toOwnedSlice(allocator);
+    return changed;
 }
 
 // ============================================================================

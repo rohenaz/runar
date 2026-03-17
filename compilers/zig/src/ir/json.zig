@@ -153,52 +153,61 @@ fn parseBinding(allocator: std.mem.Allocator, obj: std.json.ObjectMap) BindingEr
     };
 }
 
+const KindTag = enum {
+    load_param, load_prop, load_const, bin_op, unary_op, call, method_call,
+    @"if", loop, assert, update_prop, get_state_script, check_preimage,
+    deserialize_state, add_output, add_raw_output,
+};
+
+const kind_map = std.StaticStringMap(KindTag).initComptime(.{
+    .{ "load_param", .load_param },
+    .{ "load_prop", .load_prop },
+    .{ "load_const", .load_const },
+    .{ "bin_op", .bin_op },
+    .{ "unary_op", .unary_op },
+    .{ "call", .call },
+    .{ "method_call", .method_call },
+    .{ "if", .@"if" },
+    .{ "loop", .loop },
+    .{ "assert", .assert },
+    .{ "update_prop", .update_prop },
+    .{ "get_state_script", .get_state_script },
+    .{ "check_preimage", .check_preimage },
+    .{ "deserialize_state", .deserialize_state },
+    .{ "add_output", .add_output },
+    .{ "add_raw_output", .add_raw_output },
+});
+
 fn parseANFValue(allocator: std.mem.Allocator, obj: std.json.ObjectMap) BindingError!types.ANFValue {
     const kind = try getString(obj, "kind");
+    const tag = kind_map.get(kind) orelse return ParseError.InvalidKind;
 
-    if (std.mem.eql(u8, kind, "load_param")) {
-        return .{ .load_param = .{
+    return switch (tag) {
+        .load_param => .{ .load_param = .{
             .name = try allocator.dupe(u8, try getString(obj, "name")),
-        } };
-    } else if (std.mem.eql(u8, kind, "load_prop")) {
-        return .{ .load_prop = .{
+        } },
+        .load_prop => .{ .load_prop = .{
             .name = try allocator.dupe(u8, try getString(obj, "name")),
-        } };
-    } else if (std.mem.eql(u8, kind, "load_const")) {
-        return try parseLoadConst(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "bin_op")) {
-        return try parseBinOp(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "unary_op")) {
-        return try parseUnaryOp(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "call")) {
-        return try parseCall(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "method_call")) {
-        return try parseMethodCall(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "if")) {
-        return try parseIf(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "loop")) {
-        return try parseLoop(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "assert")) {
-        return try parseAssert(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "update_prop")) {
-        return try parseUpdateProp(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "get_state_script")) {
-        return .{ .get_state_script = {} };
-    } else if (std.mem.eql(u8, kind, "check_preimage")) {
-        return .{ .check_preimage = .{
+        } },
+        .load_const => try parseLoadConst(allocator, obj),
+        .bin_op => try parseBinOp(allocator, obj),
+        .unary_op => try parseUnaryOp(allocator, obj),
+        .call => try parseCall(allocator, obj),
+        .method_call => try parseMethodCall(allocator, obj),
+        .@"if" => try parseIf(allocator, obj),
+        .loop => try parseLoop(allocator, obj),
+        .assert => try parseAssert(allocator, obj),
+        .update_prop => try parseUpdateProp(allocator, obj),
+        .get_state_script => .{ .get_state_script = {} },
+        .check_preimage => .{ .check_preimage = .{
             .preimage = try allocator.dupe(u8, try getString(obj, "preimage")),
-        } };
-    } else if (std.mem.eql(u8, kind, "deserialize_state")) {
-        return .{ .deserialize_state = .{
+        } },
+        .deserialize_state => .{ .deserialize_state = .{
             .preimage = try allocator.dupe(u8, try getString(obj, "preimage")),
-        } };
-    } else if (std.mem.eql(u8, kind, "add_output")) {
-        return try parseAddOutput(allocator, obj);
-    } else if (std.mem.eql(u8, kind, "add_raw_output")) {
-        return try parseAddRawOutput(allocator, obj);
-    } else {
-        return ParseError.InvalidKind;
-    }
+        } },
+        .add_output => try parseAddOutput(allocator, obj),
+        .add_raw_output => try parseAddRawOutput(allocator, obj),
+    };
 }
 
 fn parseLoadConst(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.ANFValue {
@@ -1268,7 +1277,9 @@ fn writeIndent(writer: anytype, depth: usize) !void {
     }
 }
 
-fn writeJsonString(writer: anytype, s: []const u8) !void {
+/// Write a JSON string value, escaping special characters.
+/// Public so other modules (e.g. emit.zig) can reuse it.
+pub fn writeJsonString(writer: anytype, s: []const u8) !void {
     try writer.writeByte('"');
     for (s) |c| {
         switch (c) {

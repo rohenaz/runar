@@ -18,48 +18,86 @@ const Opcode = types.Opcode;
 // ============================================================================
 
 /// StackMap tracks which named variable lives at which stack depth.
-/// Depth 0 = top of stack. Slots hold either a variable name or null (anonymous/consumed).
+/// Depth 0 = top of stack = last element in the slots array.
+/// A parallel hash map provides O(1) name-to-depth lookup.
 pub const StackMap = struct {
-    /// Stack slots from top (index 0) to bottom.
+    /// Stack slots: bottom of stack is index 0, top of stack is last element.
     slots: std.ArrayListUnmanaged(?[]const u8) = .empty,
+    /// Maps variable names to their array index in slots for O(1) findDepth.
+    name_index: std.StringHashMapUnmanaged(usize) = .empty,
 
+    /// Push a value onto the top of the stack (appends to end — O(1) amortized).
     pub fn push(self: *StackMap, allocator: Allocator, name: ?[]const u8) !void {
-        try self.slots.insert(allocator, 0, name);
+        const idx = self.slots.items.len;
+        try self.slots.append(allocator, name);
+        if (name) |n| {
+            try self.name_index.put(allocator, n, idx);
+        }
     }
 
+    /// Pop the top of the stack (removes from end — O(1)).
     pub fn pop(self: *StackMap) ?[]const u8 {
         if (self.slots.items.len == 0) return null;
-        const val = self.slots.items[0];
-        _ = self.slots.orderedRemove(0);
+        const val = self.slots.items[self.slots.items.len - 1];
+        if (val) |v| {
+            _ = self.name_index.remove(v);
+        }
+        self.slots.items.len -= 1;
         return val;
     }
 
+    /// Find the stack depth (0 = top) of a named variable — O(1) via hash map.
     pub fn findDepth(self: *const StackMap, name: []const u8) ?usize {
-        for (self.slots.items, 0..) |slot, i| {
+        const idx = self.name_index.get(name) orelse return null;
+        return self.slots.items.len - 1 - idx;
+    }
+
+    /// Remove the slot at the given depth (0 = top). Depth d maps to array
+    /// index `len - 1 - d`. Requires rebuilding affected hash map entries.
+    pub fn removeAtDepth(self: *StackMap, d: usize) void {
+        const idx = self.slots.items.len - 1 - d;
+        const removed = self.slots.items[idx];
+        if (removed) |v| {
+            _ = self.name_index.remove(v);
+        }
+        _ = self.slots.orderedRemove(idx);
+        // Update indices for all slots that shifted down (those above idx)
+        for (self.slots.items[idx..], idx..) |slot, new_idx| {
             if (slot) |s| {
-                if (std.mem.eql(u8, s, name)) return i;
+                self.name_index.putAssumeCapacity(s, new_idx);
             }
         }
-        return null;
     }
 
-    pub fn removeAtDepth(self: *StackMap, d: usize) void {
-        _ = self.slots.orderedRemove(d);
-    }
-
+    /// Rename the variable at the given depth.
     pub fn renameAtDepth(self: *StackMap, d: usize, new_name: ?[]const u8) void {
-        self.slots.items[d] = new_name;
+        const idx = self.slots.items.len - 1 - d;
+        const old_name = self.slots.items[idx];
+        if (old_name) |v| {
+            _ = self.name_index.remove(v);
+        }
+        self.slots.items[idx] = new_name;
+        if (new_name) |n| {
+            self.name_index.putAssumeCapacity(n, idx);
+        }
     }
 
+    /// Peek at the variable name at the given depth (0 = top).
     pub fn peekAtDepth(self: *const StackMap, d: usize) ?[]const u8 {
         if (d >= self.slots.items.len) return null;
-        return self.slots.items[d];
+        return self.slots.items[self.slots.items.len - 1 - d];
     }
 
     pub fn clone(self: *const StackMap, allocator: Allocator) !StackMap {
         var new_slots: std.ArrayListUnmanaged(?[]const u8) = .empty;
         try new_slots.appendSlice(allocator, self.slots.items);
-        return .{ .slots = new_slots };
+        var new_index: std.StringHashMapUnmanaged(usize) = .empty;
+        try new_index.ensureTotalCapacity(allocator, self.name_index.capacity());
+        var it = self.name_index.iterator();
+        while (it.next()) |entry| {
+            new_index.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        return .{ .slots = new_slots, .name_index = new_index };
     }
 
     pub fn depth(self: *const StackMap) usize {
@@ -78,6 +116,7 @@ pub const StackMap = struct {
 
     pub fn deinit(self: *StackMap, allocator: Allocator) void {
         self.slots.deinit(allocator);
+        self.name_index.deinit(allocator);
     }
 };
 
@@ -175,9 +214,17 @@ const LowerCtx = struct {
             switch (d) {
                 1 => {
                     try self.emitOp(.op_swap);
-                    const tmp = self.stack.slots.items[0];
-                    self.stack.slots.items[0] = self.stack.slots.items[1];
-                    self.stack.slots.items[1] = tmp;
+                    // Swap the top two elements (last two in the array)
+                    const len = self.stack.slots.items.len;
+                    const top_idx = len - 1;
+                    const next_idx = len - 2;
+                    const old_top = self.stack.slots.items[top_idx];
+                    const old_next = self.stack.slots.items[next_idx];
+                    self.stack.slots.items[top_idx] = old_next;
+                    self.stack.slots.items[next_idx] = old_top;
+                    // Update hash map for both swapped names
+                    if (old_top) |n| self.stack.name_index.putAssumeCapacity(n, next_idx);
+                    if (old_next) |n| self.stack.name_index.putAssumeCapacity(n, top_idx);
                 },
                 2 => {
                     try self.emitOp(.op_rot);
@@ -366,15 +413,12 @@ const LowerCtx = struct {
                 self.trackDepth();
             },
             .bin_op => |bop| {
-                const legacy_op = types.BinOperator.fromTsString(bop.op) orelse .add;
+                const legacy_op = types.BinOperator.fromTsString(bop.op) orelse return LowerError.UnsupportedOperation;
                 try self.lowerBinaryOp(binding.name, .{ .op = legacy_op, .left = bop.left, .right = bop.right, .result_type = bop.result_type });
             },
             .call => |c| try self.lowerBuiltinCall(binding.name, .{ .name = c.func, .args = c.args }),
             .method_call => {
-                // Method calls are not yet implemented in stack lowering
-                try self.emitPushInt(0);
-                try self.stack.push(self.allocator, binding.name);
-                self.trackDepth();
+                return LowerError.UnsupportedOperation;
             },
             .@"if" => |ie| {
                 const legacy = try self.allocator.create(types.ANFIfExpr);
@@ -460,11 +504,15 @@ const LowerCtx = struct {
         if (!self.in_branch) {
             var found_first = false;
             var old_depth: ?usize = null;
-            for (self.stack.slots.items, 0..) |slot, i| {
-                if (slot) |s| {
+            // Scan from top (end of array) to bottom, finding first then stale duplicate
+            const len = self.stack.slots.items.len;
+            var scan: usize = 0;
+            while (scan < len) : (scan += 1) {
+                const depth_idx = len - 1 - scan;
+                if (self.stack.slots.items[depth_idx]) |s| {
                     if (std.mem.eql(u8, s, pw.name)) {
                         if (found_first) {
-                            old_depth = i;
+                            old_depth = scan; // depth from top
                             break;
                         }
                         found_first = true;
@@ -539,97 +587,145 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
+    const BuiltinId = enum {
+        sha256,
+        hash160,
+        hash256,
+        ripemd160,
+        checkSig,
+        checkMultiSig,
+        len,
+        cat,
+        num2bin,
+        bin2num,
+        abs,
+        min,
+        max,
+        within,
+        assert,
+        substr,
+        reverseBytes,
+        safediv,
+        safemod,
+        pow,
+        mulDiv,
+        percentOf,
+        sqrt,
+        gcd,
+        divmod,
+        log2,
+        clamp,
+        checkPreimage,
+        deserializeState,
+        buildChangeOutput,
+        getStateScript,
+        buildStateOutput,
+        computeStateOutput,
+        // Wave 3 placeholders
+        sha256Compress,
+        blake3,
+        ecAdd,
+        ecMul,
+        ecPairing,
+        slhDsaVerify,
+        schnorrVerify,
+    };
+
+    const builtin_map = std.StaticStringMap(BuiltinId).initComptime(.{
+        .{ "sha256", .sha256 },
+        .{ "hash160", .hash160 },
+        .{ "hash256", .hash256 },
+        .{ "ripemd160", .ripemd160 },
+        .{ "checkSig", .checkSig },
+        .{ "checkMultiSig", .checkMultiSig },
+        .{ "len", .len },
+        .{ "size", .len },
+        .{ "cat", .cat },
+        .{ "num2bin", .num2bin },
+        .{ "bin2num", .bin2num },
+        .{ "abs", .abs },
+        .{ "min", .min },
+        .{ "max", .max },
+        .{ "within", .within },
+        .{ "assert", .assert },
+        .{ "substr", .substr },
+        .{ "reverseBytes", .reverseBytes },
+        .{ "safediv", .safediv },
+        .{ "safemod", .safemod },
+        .{ "pow", .pow },
+        .{ "mulDiv", .mulDiv },
+        .{ "percentOf", .percentOf },
+        .{ "sqrt", .sqrt },
+        .{ "gcd", .gcd },
+        .{ "divmod", .divmod },
+        .{ "log2", .log2 },
+        .{ "clamp", .clamp },
+        .{ "checkPreimage", .checkPreimage },
+        .{ "deserializeState", .deserializeState },
+        .{ "buildChangeOutput", .buildChangeOutput },
+        .{ "getStateScript", .getStateScript },
+        .{ "buildStateOutput", .buildStateOutput },
+        .{ "computeStateOutput", .computeStateOutput },
+        .{ "sha256Compress", .sha256Compress },
+        .{ "blake3", .blake3 },
+        .{ "ecAdd", .ecAdd },
+        .{ "ecMul", .ecMul },
+        .{ "ecPairing", .ecPairing },
+        .{ "slhDsaVerify", .slhDsaVerify },
+        .{ "schnorrVerify", .schnorrVerify },
+    });
+
     fn lowerBuiltinCall(self: *LowerCtx, bind_name: []const u8, call: types.ANFBuiltinCall) !void {
-        const name = call.name;
         const args = call.args;
 
-        if (std.mem.eql(u8, name, "sha256")) {
-            try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_sha256);
-        } else if (std.mem.eql(u8, name, "hash160")) {
-            try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_hash160);
-        } else if (std.mem.eql(u8, name, "hash256")) {
-            try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_hash256);
-        } else if (std.mem.eql(u8, name, "ripemd160")) {
-            try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_ripemd160);
-        } else if (std.mem.eql(u8, name, "checkSig")) {
-            try self.lowerCheckSig(bind_name, args);
-        } else if (std.mem.eql(u8, name, "checkMultiSig")) {
-            try self.lowerCheckMultiSig(bind_name, args);
-        } else if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "size")) {
-            try self.lowerLen(bind_name, args);
-        } else if (std.mem.eql(u8, name, "cat")) {
-            try self.lowerCat(bind_name, args);
-        } else if (std.mem.eql(u8, name, "num2bin")) {
-            try self.lowerNum2Bin(bind_name, args);
-        } else if (std.mem.eql(u8, name, "bin2num")) {
-            try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_bin2num);
-        } else if (std.mem.eql(u8, name, "abs")) {
-            try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_abs);
-        } else if (std.mem.eql(u8, name, "min")) {
-            try self.lowerSimpleBinaryBuiltin(bind_name, args, .op_min);
-        } else if (std.mem.eql(u8, name, "max")) {
-            try self.lowerSimpleBinaryBuiltin(bind_name, args, .op_max);
-        } else if (std.mem.eql(u8, name, "within")) {
-            try self.lowerWithin(bind_name, args);
-        } else if (std.mem.eql(u8, name, "assert")) {
-            try self.lowerAssertBuiltin(bind_name, args);
-        } else if (std.mem.eql(u8, name, "substr")) {
-            try self.lowerSubstr(bind_name, args);
-        } else if (std.mem.eql(u8, name, "reverseBytes")) {
-            try self.lowerReverseBytes(bind_name, args);
-        } else if (std.mem.eql(u8, name, "safediv")) {
-            try self.lowerSafeDiv(bind_name, args);
-        } else if (std.mem.eql(u8, name, "safemod")) {
-            try self.lowerSafeMod(bind_name, args);
-        } else if (std.mem.eql(u8, name, "pow")) {
-            try self.lowerPow(bind_name, args);
-        } else if (std.mem.eql(u8, name, "mulDiv")) {
-            try self.lowerMulDiv(bind_name, args);
-        } else if (std.mem.eql(u8, name, "percentOf")) {
-            try self.lowerPercentOf(bind_name, args);
-        } else if (std.mem.eql(u8, name, "sqrt")) {
-            try self.lowerSqrt(bind_name, args);
-        } else if (std.mem.eql(u8, name, "gcd")) {
-            try self.lowerGcd(bind_name, args);
-        } else if (std.mem.eql(u8, name, "divmod")) {
-            try self.lowerDivMod(bind_name, args);
-        } else if (std.mem.eql(u8, name, "log2")) {
-            try self.lowerLog2(bind_name, args);
-        } else if (std.mem.eql(u8, name, "clamp")) {
-            try self.lowerClamp(bind_name, args);
-        } else if (std.mem.eql(u8, name, "checkPreimage")) {
-            try self.lowerCheckPreimage(bind_name, args);
-        } else if (std.mem.eql(u8, name, "deserializeState")) {
-            try self.lowerDeserializeState(bind_name, args);
-        } else if (std.mem.eql(u8, name, "buildChangeOutput")) {
-            try self.lowerBuildChangeOutput(bind_name, args);
-        } else if (std.mem.eql(u8, name, "getStateScript") or
-            std.mem.eql(u8, name, "buildStateOutput") or
-            std.mem.eql(u8, name, "computeStateOutput"))
-        {
-            // No-op or handled elsewhere
-            try self.stack.push(self.allocator, bind_name);
-            self.trackDepth();
-        }
-        // --- Wave 3 placeholders for advanced crypto builtins ---
-        else if (std.mem.eql(u8, name, "sha256Compress") or
-            std.mem.eql(u8, name, "blake3") or
-            std.mem.eql(u8, name, "ecAdd") or
-            std.mem.eql(u8, name, "ecMul") or
-            std.mem.eql(u8, name, "ecPairing") or
-            std.mem.eql(u8, name, "slhDsaVerify") or
-            std.mem.eql(u8, name, "schnorrVerify"))
-        {
-            // TODO: Wave 3 — advanced crypto builtins
-            for (args) |arg| {
-                try self.bringToTopAuto(arg);
-                _ = self.stack.pop();
-            }
-            try self.emitPushInt(0);
-            try self.stack.push(self.allocator, bind_name);
-            self.trackDepth();
-        } else {
-            return LowerError.InvalidBuiltin;
+        const id = builtin_map.get(call.name) orelse return LowerError.InvalidBuiltin;
+
+        switch (id) {
+            .sha256 => try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_sha256),
+            .hash160 => try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_hash160),
+            .hash256 => try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_hash256),
+            .ripemd160 => try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_ripemd160),
+            .checkSig => try self.lowerCheckSig(bind_name, args),
+            .checkMultiSig => try self.lowerCheckMultiSig(bind_name, args),
+            .len => try self.lowerLen(bind_name, args),
+            .cat => try self.lowerCat(bind_name, args),
+            .num2bin => try self.lowerNum2Bin(bind_name, args),
+            .bin2num => try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_bin2num),
+            .abs => try self.lowerSimpleUnaryBuiltin(bind_name, args, .op_abs),
+            .min => try self.lowerSimpleBinaryBuiltin(bind_name, args, .op_min),
+            .max => try self.lowerSimpleBinaryBuiltin(bind_name, args, .op_max),
+            .within => try self.lowerWithin(bind_name, args),
+            .assert => try self.lowerAssertBuiltin(bind_name, args),
+            .substr => try self.lowerSubstr(bind_name, args),
+            .reverseBytes => try self.lowerReverseBytes(bind_name, args),
+            .safediv => try self.lowerSafeDiv(bind_name, args),
+            .safemod => try self.lowerSafeMod(bind_name, args),
+            .pow => try self.lowerPow(bind_name, args),
+            .mulDiv => try self.lowerMulDiv(bind_name, args),
+            .percentOf => try self.lowerPercentOf(bind_name, args),
+            .sqrt => try self.lowerSqrt(bind_name, args),
+            .gcd => try self.lowerGcd(bind_name, args),
+            .divmod => try self.lowerDivMod(bind_name, args),
+            .log2 => try self.lowerLog2(bind_name, args),
+            .clamp => try self.lowerClamp(bind_name, args),
+            .checkPreimage => try self.lowerCheckPreimage(bind_name, args),
+            .deserializeState => try self.lowerDeserializeState(bind_name, args),
+            .buildChangeOutput => try self.lowerBuildChangeOutput(bind_name, args),
+            .getStateScript, .buildStateOutput, .computeStateOutput => {
+                // No-op or handled elsewhere
+                try self.stack.push(self.allocator, bind_name);
+                self.trackDepth();
+            },
+            // Wave 3 placeholders — consume args and push placeholder
+            .sha256Compress, .blake3, .ecAdd, .ecMul, .ecPairing, .slhDsaVerify, .schnorrVerify => {
+                for (args) |arg| {
+                    try self.bringToTopAuto(arg);
+                    _ = self.stack.pop();
+                }
+                try self.emitPushInt(0);
+                try self.stack.push(self.allocator, bind_name);
+                self.trackDepth();
+            },
         }
     }
 
@@ -662,14 +758,7 @@ const LowerCtx = struct {
     // ========================================================================
 
     fn lowerCheckSig(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
-        if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
-        try self.emitOp(.op_checksig);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
-        try self.stack.push(self.allocator, bind_name);
-        self.trackDepth();
+        return self.lowerSimpleBinaryBuiltin(bind_name, args, .op_checksig);
     }
 
     fn lowerCheckMultiSig(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
@@ -695,25 +784,11 @@ const LowerCtx = struct {
     }
 
     fn lowerCat(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
-        if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
-        try self.emitOp(.op_cat);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
-        try self.stack.push(self.allocator, bind_name);
-        self.trackDepth();
+        return self.lowerSimpleBinaryBuiltin(bind_name, args, .op_cat);
     }
 
     fn lowerNum2Bin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
-        if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
-        try self.emitOp(.op_num2bin);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
-        try self.stack.push(self.allocator, bind_name);
-        self.trackDepth();
+        return self.lowerSimpleBinaryBuiltin(bind_name, args, .op_num2bin);
     }
 
     fn lowerWithin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
@@ -767,7 +842,7 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
-    fn lowerSafeDiv(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
+    fn lowerSafeDivMod(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, final_op: Opcode) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
         try self.bringToTopAuto(args[0]);
         try self.bringToTopAuto(args[1]);
@@ -776,27 +851,19 @@ const LowerCtx = struct {
         try self.emitOp(.op_numequal);
         try self.emitOp(.op_not);
         try self.emitOp(.op_verify);
-        try self.emitOp(.op_div);
+        try self.emitOp(final_op);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
     }
 
+    fn lowerSafeDiv(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
+        return self.lowerSafeDivMod(bind_name, args, .op_div);
+    }
+
     fn lowerSafeMod(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
-        if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
-        try self.emitOp(.op_dup);
-        try self.emitPushInt(0);
-        try self.emitOp(.op_numequal);
-        try self.emitOp(.op_not);
-        try self.emitOp(.op_verify);
-        try self.emitOp(.op_mod);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
-        try self.stack.push(self.allocator, bind_name);
-        self.trackDepth();
+        return self.lowerSafeDivMod(bind_name, args, .op_mod);
     }
 
     fn lowerPow(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {

@@ -77,6 +77,9 @@ fn optimizeMethod(allocator: Allocator, method: types.ANFMethod) !types.ANFMetho
     var body = try allocator.alloc(types.ANFBinding, method.body.len);
     @memcpy(body, method.body);
 
+    // Fresh name counter, local to this method optimization.
+    var fresh_counter: u32 = 0;
+
     // Fixed-point iteration: keep applying rules until nothing changes.
     var changed = true;
     while (changed) {
@@ -89,12 +92,12 @@ fn optimizeMethod(allocator: Allocator, method: types.ANFMethod) !types.ANFMetho
 
         for (body) |binding| {
             var current = binding;
-            if (tryOptimize(allocator, current.value, &value_map)) |optimized| {
+            if (tryOptimize(allocator, current.value, &value_map, &fresh_counter)) |optimized| {
                 current = .{ .name = binding.name, .value = optimized, .source_loc = binding.source_loc };
                 changed = true;
             }
-            value_map.put(current.name, current.value) catch {};
-            new_body.append(allocator, current) catch {};
+            try value_map.put(current.name, current.value);
+            try new_body.append(allocator, current);
         }
 
         if (changed) {
@@ -131,6 +134,7 @@ fn tryOptimize(
     allocator: Allocator,
     v: types.ANFValue,
     vm: *std.StringHashMap(types.ANFValue),
+    counter: *u32,
 ) ?types.ANFValue {
     const c = switch (v) {
         .call => |call| call,
@@ -187,7 +191,7 @@ fn tryOptimize(
                 if (eql(ic.func, "ecMul") and ic.args.len == 2) {
                     if (getConstInt(ic.args[1], vm)) |k1| {
                         const combined = mulModN(k1, k2);
-                        const fresh = freshConstName(allocator, combined, vm);
+                        const fresh = freshConstName(allocator, combined, vm, counter);
                         return makeCall(allocator, "ecMul", &.{ ic.args[0], fresh });
                     }
                 }
@@ -207,7 +211,7 @@ fn tryOptimize(
                 const k2 = getConstInt(rc.?.args[0], vm);
                 if (k1 != null and k2 != null) {
                     const combined = addModN(k1.?, k2.?);
-                    const fresh = freshConstName(allocator, combined, vm);
+                    const fresh = freshConstName(allocator, combined, vm, counter);
                     return makeCall(allocator, "ecMulGen", &.{fresh});
                 }
             }
@@ -227,7 +231,7 @@ fn tryOptimize(
                     const k2 = getConstInt(rc.?.args[1], vm);
                     if (k1 != null and k2 != null) {
                         const combined = addModN(k1.?, k2.?);
-                        const fresh = freshConstName(allocator, combined, vm);
+                        const fresh = freshConstName(allocator, combined, vm, counter);
                         return makeCall(allocator, "ecMul", &.{ lc.?.args[0], fresh });
                     }
                 }
@@ -394,14 +398,11 @@ fn makeCall(allocator: Allocator, func: []const u8, args: []const []const u8) ?t
     return .{ .call = .{ .func = func, .args = owned } };
 }
 
-/// Counter for generating fresh constant binding names.
-var fresh_counter: u32 = 0;
-
 /// Insert a fresh constant binding into the value map and return its name.
-fn freshConstName(allocator: Allocator, value: i128, vm: *std.StringHashMap(types.ANFValue)) []const u8 {
-    fresh_counter += 1;
+fn freshConstName(allocator: Allocator, value: i128, vm: *std.StringHashMap(types.ANFValue), counter: *u32) []const u8 {
+    counter.* += 1;
     const buf = allocator.alloc(u8, 24) catch return "";
-    const name = std.fmt.bufPrint(buf, "__ec_opt_{d}", .{fresh_counter}) catch return "";
+    const name = std.fmt.bufPrint(buf, "__ec_opt_{d}", .{counter.*}) catch return "";
     vm.put(name, makeConstInt(value)) catch {};
     return name;
 }
@@ -576,6 +577,31 @@ fn testProgram(methods: []const types.ANFMethod) types.ANFProgram {
     return .{ .contract_name = "Test", .properties = &.{}, .methods = @constCast(methods) };
 }
 
+/// Free all allocations from an optimize() result (methods array + per-method bodies + optimized values).
+fn freeOptimizeResult(alloc: Allocator, result: types.ANFProgram) void {
+    for (result.methods) |method| {
+        for (method.body) |binding| {
+            switch (binding.value) {
+                .load_const => |lc| switch (lc.value) {
+                    .string => |s| {
+                        // Free @ref: strings (allocated by makeRefStr)
+                        if (std.mem.startsWith(u8, s, "@ref:"))
+                            alloc.free(s);
+                    },
+                    else => {},
+                },
+                .call => |c| {
+                    // Free owned args slices (allocated by makeCall)
+                    alloc.free(c.args);
+                },
+                else => {},
+            }
+        }
+        alloc.free(method.body);
+    }
+    alloc.free(result.methods);
+}
+
 fn expectRefTo(val: types.ANFValue, target: []const u8) !void {
     switch (val) {
         .load_const => |lc| switch (lc.value) {
@@ -609,8 +635,10 @@ test "rule 1: ecAdd(x, INFINITY) -> x" {
         makeBinding("t3", .{ .assert = .{ .value = "t2" } }),
     };
     const result = try optimize(alloc, testProgram(&.{testMethod(&body)}));
-    defer alloc.free(result.methods);
-    try expectRefTo(result.methods[0].body[2].value, "t0");
+    defer freeOptimizeResult(alloc, result);
+    // After optimization t2 = @ref:t0, dead binding elimination removes unused "inf".
+    // Body: [t0, t2, t3] — t2 is at index 1.
+    try expectRefTo(result.methods[0].body[1].value, "t0");
 }
 
 // --- Rule 2: ecAdd(INFINITY, x) -> x ---
@@ -623,8 +651,10 @@ test "rule 2: ecAdd(INFINITY, x) -> x" {
         makeBinding("t3", .{ .assert = .{ .value = "t2" } }),
     };
     const result = try optimize(alloc, testProgram(&.{testMethod(&body)}));
-    defer alloc.free(result.methods);
-    try expectRefTo(result.methods[0].body[2].value, "t1");
+    defer freeOptimizeResult(alloc, result);
+    // After optimization t2 = @ref:t1, dead binding elimination removes unused "inf".
+    // Body: [t1, t2, t3] — t2 is at index 1.
+    try expectRefTo(result.methods[0].body[1].value, "t1");
 }
 
 // --- Rule 3: ecMul(x, 1) -> x ---
@@ -637,8 +667,10 @@ test "rule 3: ecMul(x, 1) -> x" {
         makeBinding("t1", .{ .assert = .{ .value = "t0" } }),
     };
     const result = try optimize(alloc, testProgram(&.{testMethod(&body)}));
-    defer alloc.free(result.methods);
-    try expectRefTo(result.methods[0].body[2].value, "p");
+    defer freeOptimizeResult(alloc, result);
+    // After optimization t0 = @ref:p, dead binding elimination removes unused "k".
+    // Body: [p, t0, t1] — t0 is at index 1.
+    try expectRefTo(result.methods[0].body[1].value, "p");
 }
 
 // --- Rule 4: ecMul(x, 0) -> INFINITY ---
@@ -651,8 +683,10 @@ test "rule 4: ecMul(x, 0) -> INFINITY" {
         makeBinding("t1", .{ .assert = .{ .value = "t0" } }),
     };
     const result = try optimize(alloc, testProgram(&.{testMethod(&body)}));
-    defer alloc.free(result.methods);
-    try expectConstStr(result.methods[0].body[2].value, INFINITY_HEX);
+    defer freeOptimizeResult(alloc, result);
+    // After optimization t0 = INFINITY_HEX, dead binding elimination removes unused "p" and "k".
+    // Body: [t0, t1] — t0 is at index 0.
+    try expectConstStr(result.methods[0].body[0].value, INFINITY_HEX);
 }
 
 // --- Rule 5: ecMulGen(0) -> INFINITY ---
@@ -664,8 +698,10 @@ test "rule 5: ecMulGen(0) -> INFINITY" {
         makeBinding("t1", .{ .assert = .{ .value = "t0" } }),
     };
     const result = try optimize(alloc, testProgram(&.{testMethod(&body)}));
-    defer alloc.free(result.methods);
-    try expectConstStr(result.methods[0].body[1].value, INFINITY_HEX);
+    defer freeOptimizeResult(alloc, result);
+    // After optimization t0 = INFINITY_HEX, dead binding elimination removes unused "k".
+    // Body: [t0, t1] — t0 is at index 0.
+    try expectConstStr(result.methods[0].body[0].value, INFINITY_HEX);
 }
 
 // --- Rule 6: ecMulGen(1) -> G ---
@@ -677,8 +713,10 @@ test "rule 6: ecMulGen(1) -> G" {
         makeBinding("t1", .{ .assert = .{ .value = "t0" } }),
     };
     const result = try optimize(alloc, testProgram(&.{testMethod(&body)}));
-    defer alloc.free(result.methods);
-    try expectConstStr(result.methods[0].body[1].value, G_HEX);
+    defer freeOptimizeResult(alloc, result);
+    // After optimization t0 = G_HEX, dead binding elimination removes unused "k".
+    // Body: [t0, t1] — t0 is at index 0.
+    try expectConstStr(result.methods[0].body[0].value, G_HEX);
 }
 
 // --- Rule 7: ecNegate(ecNegate(x)) -> x ---
@@ -691,7 +729,7 @@ test "rule 7: ecNegate(ecNegate(x)) -> x" {
         makeBinding("t2", .{ .assert = .{ .value = "t1" } }),
     };
     const result = try optimize(alloc, testProgram(&.{testMethod(&body)}));
-    defer alloc.free(result.methods);
+    defer freeOptimizeResult(alloc, result);
     try expectRefTo(result.methods[0].body[2].value, "p");
 }
 
@@ -705,7 +743,7 @@ test "rule 8: ecAdd(x, ecNegate(x)) -> INFINITY" {
         makeBinding("t1", .{ .assert = .{ .value = "t0" } }),
     };
     const result = try optimize(alloc, testProgram(&.{testMethod(&body)}));
-    defer alloc.free(result.methods);
+    defer freeOptimizeResult(alloc, result);
     try expectConstStr(result.methods[0].body[2].value, INFINITY_HEX);
 }
 
@@ -719,9 +757,10 @@ test "rule 12: ecMul(G, k) -> ecMulGen(k)" {
         makeBinding("t1", .{ .assert = .{ .value = "t0" } }),
     };
     const result = try optimize(alloc, testProgram(&.{testMethod(&body)}));
-    defer alloc.free(result.methods);
-
-    const t0 = result.methods[0].body[2].value;
+    defer freeOptimizeResult(alloc, result);
+    // After optimization t0 = ecMulGen(k), dead binding elimination removes unused "g".
+    // Body: [k, t0, t1] — t0 is at index 1.
+    const t0 = result.methods[0].body[1].value;
     switch (t0) {
         .call => |c| {
             try testing.expectEqualStrings("ecMulGen", c.func);

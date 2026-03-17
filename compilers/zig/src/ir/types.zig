@@ -333,22 +333,31 @@ pub const SourceMap = struct { mappings: []SourceMapping };
 // Utility
 // ============================================================================
 
+const runar_type_map = std.StaticStringMap(RunarType).initComptime(.{
+    // Canonical names
+    .{ "bigint", .bigint },
+    .{ "boolean", .boolean },
+    .{ "ByteString", .byte_string },
+    .{ "PubKey", .pub_key },
+    .{ "Sig", .sig },
+    .{ "Addr", .addr },
+    .{ "Ripemd160", .ripemd160 },
+    .{ "Sha256", .sha256 },
+    .{ "SigHashType", .sig_hash_type },
+    .{ "SigHashPreimage", .sig_hash_preimage },
+    .{ "RabinSig", .rabin_sig },
+    .{ "RabinPubKey", .rabin_pub_key },
+    .{ "Point", .point },
+    .{ "OpCodeType", .op_code_type },
+    .{ "void", .void },
+    // Aliases
+    .{ "int", .bigint },
+    .{ "bool", .boolean },
+    .{ "bytes", .byte_string },
+});
+
 pub fn parseRunarType(type_str: []const u8) RunarType {
-    if (std.mem.eql(u8, type_str, "bigint") or std.mem.eql(u8, type_str, "int")) return .bigint;
-    if (std.mem.eql(u8, type_str, "boolean") or std.mem.eql(u8, type_str, "bool")) return .boolean;
-    if (std.mem.eql(u8, type_str, "ByteString") or std.mem.eql(u8, type_str, "bytes")) return .byte_string;
-    if (std.mem.eql(u8, type_str, "PubKey")) return .pub_key;
-    if (std.mem.eql(u8, type_str, "Sig")) return .sig;
-    if (std.mem.eql(u8, type_str, "Addr") or std.mem.eql(u8, type_str, "Ripemd160")) return .addr;
-    if (std.mem.eql(u8, type_str, "Sha256")) return .sha256;
-    if (std.mem.eql(u8, type_str, "SigHashType")) return .sig_hash_type;
-    if (std.mem.eql(u8, type_str, "SigHashPreimage")) return .sig_hash_preimage;
-    if (std.mem.eql(u8, type_str, "RabinSig")) return .rabin_sig;
-    if (std.mem.eql(u8, type_str, "RabinPubKey")) return .rabin_pub_key;
-    if (std.mem.eql(u8, type_str, "Point")) return .point;
-    if (std.mem.eql(u8, type_str, "OpCodeType")) return .op_code_type;
-    if (std.mem.eql(u8, type_str, "void")) return .void;
-    return .unknown;
+    return runar_type_map.get(type_str) orelse .unknown;
 }
 
 pub fn runarTypeToString(t: RunarType) []const u8 {

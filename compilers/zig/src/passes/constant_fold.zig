@@ -27,49 +27,88 @@ const ANFProgram = types.ANFProgram;
 const ConstEnv = std.StringHashMap(ConstValue);
 
 // ============================================================================
-// Binary operation evaluation
+// Binary operation dispatch via StaticStringMap
 // ============================================================================
 
+const BinOpTag = enum {
+    op_add,
+    op_sub,
+    op_mul,
+    op_div,
+    op_mod,
+    op_strict_eq,
+    op_strict_neq,
+    op_lt,
+    op_gt,
+    op_lte,
+    op_gte,
+    op_bit_and,
+    op_bit_or,
+    op_bit_xor,
+    op_shl,
+    op_shr,
+    op_logical_and,
+    op_logical_or,
+};
+
+const bin_op_map = std.StaticStringMap(BinOpTag).initComptime(.{
+    .{ "+", .op_add },
+    .{ "-", .op_sub },
+    .{ "*", .op_mul },
+    .{ "/", .op_div },
+    .{ "%", .op_mod },
+    .{ "===", .op_strict_eq },
+    .{ "!==", .op_strict_neq },
+    .{ "<", .op_lt },
+    .{ ">", .op_gt },
+    .{ "<=", .op_lte },
+    .{ ">=", .op_gte },
+    .{ "&", .op_bit_and },
+    .{ "|", .op_bit_or },
+    .{ "^", .op_bit_xor },
+    .{ "<<", .op_shl },
+    .{ ">>", .op_shr },
+    .{ "&&", .op_logical_and },
+    .{ "||", .op_logical_or },
+});
+
 fn evalBinOp(op: []const u8, left: ConstValue, right: ConstValue) ?ConstValue {
+    const tag = bin_op_map.get(op) orelse return null;
+
     // Integer arithmetic / bitwise / comparison
     if (left == .integer and right == .integer) {
         const a = left.integer;
         const b = right.integer;
 
-        if (strEql(op, "+")) return .{ .integer = a +% b };
-        if (strEql(op, "-")) return .{ .integer = a -% b };
-        if (strEql(op, "*")) return .{ .integer = a *% b };
-        if (strEql(op, "/")) {
-            if (b == 0) return null;
-            return .{ .integer = @divTrunc(a, b) };
-        }
-        if (strEql(op, "%")) {
-            if (b == 0) return null;
-            // Remainder matching JS BigInt (sign follows dividend)
-            return .{ .integer = a - @divTrunc(a, b) * b };
-        }
-        if (strEql(op, "===")) return .{ .boolean = a == b };
-        if (strEql(op, "!==")) return .{ .boolean = a != b };
-        if (strEql(op, "<")) return .{ .boolean = a < b };
-        if (strEql(op, ">")) return .{ .boolean = a > b };
-        if (strEql(op, "<=")) return .{ .boolean = a <= b };
-        if (strEql(op, ">=")) return .{ .boolean = a >= b };
-        if (strEql(op, "&")) return .{ .integer = a & b };
-        if (strEql(op, "|")) return .{ .integer = a | b };
-        if (strEql(op, "^")) return .{ .integer = a ^ b };
-        if (strEql(op, "<<")) {
-            if (a < 0) return null; // BSV shifts are logical
-            if (b < 0 or b > 128) return null;
-            const shift: u7 = @intCast(@as(i128, @min(b, 127)));
-            return .{ .integer = a << shift };
-        }
-        if (strEql(op, ">>")) {
-            if (a < 0) return null; // BSV shifts are logical
-            if (b < 0 or b > 128) return null;
-            const shift: u7 = @intCast(@as(i128, @min(b, 127)));
-            return .{ .integer = a >> shift };
-        }
-        return null;
+        return switch (tag) {
+            .op_add => .{ .integer = a +% b },
+            .op_sub => .{ .integer = a -% b },
+            .op_mul => .{ .integer = a *% b },
+            .op_div => if (b == 0) null else .{ .integer = @divTrunc(a, b) },
+            .op_mod => if (b == 0) null else .{ .integer = a - @divTrunc(a, b) * b },
+            .op_strict_eq => .{ .boolean = a == b },
+            .op_strict_neq => .{ .boolean = a != b },
+            .op_lt => .{ .boolean = a < b },
+            .op_gt => .{ .boolean = a > b },
+            .op_lte => .{ .boolean = a <= b },
+            .op_gte => .{ .boolean = a >= b },
+            .op_bit_and => .{ .integer = a & b },
+            .op_bit_or => .{ .integer = a | b },
+            .op_bit_xor => .{ .integer = a ^ b },
+            .op_shl => blk: {
+                if (a < 0) break :blk null; // BSV shifts are logical
+                if (b < 0 or b > 128) break :blk null;
+                const shift: u7 = @intCast(@as(i128, @min(b, 127)));
+                break :blk .{ .integer = a << shift };
+            },
+            .op_shr => blk: {
+                if (a < 0) break :blk null; // BSV shifts are logical
+                if (b < 0 or b > 128) break :blk null;
+                const shift: u7 = @intCast(@as(i128, @min(b, 127)));
+                break :blk .{ .integer = a >> shift };
+            },
+            .op_logical_and, .op_logical_or => null,
+        };
     }
 
     // Boolean operations
@@ -77,52 +116,108 @@ fn evalBinOp(op: []const u8, left: ConstValue, right: ConstValue) ?ConstValue {
         const a = left.boolean;
         const b = right.boolean;
 
-        if (strEql(op, "&&")) return .{ .boolean = a and b };
-        if (strEql(op, "||")) return .{ .boolean = a or b };
-        if (strEql(op, "===")) return .{ .boolean = a == b };
-        if (strEql(op, "!==")) return .{ .boolean = a != b };
-        return null;
+        return switch (tag) {
+            .op_logical_and => .{ .boolean = a and b },
+            .op_logical_or => .{ .boolean = a or b },
+            .op_strict_eq => .{ .boolean = a == b },
+            .op_strict_neq => .{ .boolean = a != b },
+            else => null,
+        };
     }
 
     // String (ByteString) operations
     if (left == .string and right == .string) {
-        if (strEql(op, "===")) return .{ .boolean = std.mem.eql(u8, left.string, right.string) };
-        if (strEql(op, "!==")) return .{ .boolean = !std.mem.eql(u8, left.string, right.string) };
-        // String concatenation: we cannot allocate in a pure evaluator, skip
-        return null;
+        return switch (tag) {
+            .op_strict_eq => .{ .boolean = std.mem.eql(u8, left.string, right.string) },
+            .op_strict_neq => .{ .boolean = !std.mem.eql(u8, left.string, right.string) },
+            // String concatenation: we cannot allocate in a pure evaluator, skip
+            else => null,
+        };
     }
 
     // Cross-type equality
-    if (strEql(op, "===")) return .{ .boolean = false };
-    if (strEql(op, "!==")) return .{ .boolean = true };
-
-    return null;
+    return switch (tag) {
+        .op_strict_eq => .{ .boolean = false },
+        .op_strict_neq => .{ .boolean = true },
+        else => null,
+    };
 }
 
 // ============================================================================
-// Unary operation evaluation
+// Unary operation dispatch via StaticStringMap
 // ============================================================================
 
+const UnaryOpTag = enum { op_negate, op_bitwise_not, op_logical_not };
+
+const unary_op_map = std.StaticStringMap(UnaryOpTag).initComptime(.{
+    .{ "-", .op_negate },
+    .{ "~", .op_bitwise_not },
+    .{ "!", .op_logical_not },
+});
+
 fn evalUnaryOp(op: []const u8, operand: ConstValue) ?ConstValue {
+    const tag = unary_op_map.get(op) orelse return null;
+
     if (operand == .boolean) {
-        if (strEql(op, "!")) return .{ .boolean = !operand.boolean };
-        return null;
+        return switch (tag) {
+            .op_logical_not => .{ .boolean = !operand.boolean },
+            else => null,
+        };
     }
     if (operand == .integer) {
         const n = operand.integer;
-        if (strEql(op, "-")) return .{ .integer = -%n };
-        if (strEql(op, "~")) return .{ .integer = ~n };
-        if (strEql(op, "!")) return .{ .boolean = n == 0 };
-        return null;
+        return switch (tag) {
+            .op_negate => .{ .integer = -%n },
+            .op_bitwise_not => .{ .integer = ~n },
+            .op_logical_not => .{ .boolean = n == 0 },
+        };
     }
     return null;
 }
 
 // ============================================================================
-// Builtin call evaluation (pure math functions only)
+// Builtin call dispatch via StaticStringMap
 // ============================================================================
 
+const BuiltinTag = enum {
+    builtin_abs,
+    builtin_min,
+    builtin_max,
+    builtin_safediv,
+    builtin_safemod,
+    builtin_clamp,
+    builtin_sign,
+    builtin_pow,
+    builtin_mulDiv,
+    builtin_percentOf,
+    builtin_sqrt,
+    builtin_gcd,
+    builtin_divmod,
+    builtin_log2,
+    builtin_bool,
+};
+
+const builtin_map = std.StaticStringMap(BuiltinTag).initComptime(.{
+    .{ "abs", .builtin_abs },
+    .{ "min", .builtin_min },
+    .{ "max", .builtin_max },
+    .{ "safediv", .builtin_safediv },
+    .{ "safemod", .builtin_safemod },
+    .{ "clamp", .builtin_clamp },
+    .{ "sign", .builtin_sign },
+    .{ "pow", .builtin_pow },
+    .{ "mulDiv", .builtin_mulDiv },
+    .{ "percentOf", .builtin_percentOf },
+    .{ "sqrt", .builtin_sqrt },
+    .{ "gcd", .builtin_gcd },
+    .{ "divmod", .builtin_divmod },
+    .{ "log2", .builtin_log2 },
+    .{ "bool", .builtin_bool },
+});
+
 fn evalBuiltinCall(func_name: []const u8, args: []const []const u8, env: *const ConstEnv) ?ConstValue {
+    const tag = builtin_map.get(func_name) orelse return null;
+
     // Resolve all args to integer constants
     var int_args: [8]i128 = undefined;
     var count: usize = 0;
@@ -134,112 +229,112 @@ fn evalBuiltinCall(func_name: []const u8, args: []const []const u8, env: *const 
         count += 1;
     }
 
-    if (strEql(func_name, "abs")) {
-        if (count != 1) return null;
-        const n = int_args[0];
-        return .{ .integer = if (n < 0) -n else n };
-    }
-    if (strEql(func_name, "min")) {
-        if (count != 2) return null;
-        return .{ .integer = @min(int_args[0], int_args[1]) };
-    }
-    if (strEql(func_name, "max")) {
-        if (count != 2) return null;
-        return .{ .integer = @max(int_args[0], int_args[1]) };
-    }
-    if (strEql(func_name, "safediv")) {
-        if (count != 2 or int_args[1] == 0) return null;
-        return .{ .integer = @divTrunc(int_args[0], int_args[1]) };
-    }
-    if (strEql(func_name, "safemod")) {
-        if (count != 2 or int_args[1] == 0) return null;
-        const a = int_args[0];
-        const b = int_args[1];
-        return .{ .integer = a - @divTrunc(a, b) * b };
-    }
-    if (strEql(func_name, "clamp")) {
-        if (count != 3) return null;
-        const val = int_args[0];
-        const lo = int_args[1];
-        const hi = int_args[2];
-        return .{ .integer = @max(lo, @min(val, hi)) };
-    }
-    if (strEql(func_name, "sign")) {
-        if (count != 1) return null;
-        const n = int_args[0];
-        if (n > 0) return .{ .integer = 1 };
-        if (n < 0) return .{ .integer = -1 };
-        return .{ .integer = 0 };
-    }
-    if (strEql(func_name, "pow")) {
-        if (count != 2) return null;
-        const base = int_args[0];
-        const exp = int_args[1];
-        if (exp < 0 or exp > 256) return null;
-        var result: i128 = 1;
-        var i: i128 = 0;
-        while (i < exp) : (i += 1) {
-            result *%= base;
-        }
-        return .{ .integer = result };
-    }
-    if (strEql(func_name, "mulDiv")) {
-        if (count != 3 or int_args[2] == 0) return null;
-        const tmp = int_args[0] *% int_args[1];
-        return .{ .integer = @divTrunc(tmp, int_args[2]) };
-    }
-    if (strEql(func_name, "percentOf")) {
-        if (count != 2) return null;
-        const tmp = int_args[0] *% int_args[1];
-        return .{ .integer = @divTrunc(tmp, 10000) };
-    }
-    if (strEql(func_name, "sqrt")) {
-        if (count != 1) return null;
-        const n = int_args[0];
-        if (n < 0) return null;
-        if (n == 0) return .{ .integer = 0 };
-        // Integer square root via Newton's method
-        var x = n;
-        var y = @divTrunc(x + 1, 2);
-        while (y < x) {
-            x = y;
-            y = @divTrunc(x + @divTrunc(n, x), 2);
-        }
-        return .{ .integer = x };
-    }
-    if (strEql(func_name, "gcd")) {
-        if (count != 2) return null;
-        var a: i128 = if (int_args[0] < 0) -int_args[0] else int_args[0];
-        var b: i128 = if (int_args[1] < 0) -int_args[1] else int_args[1];
-        while (b != 0) {
-            const t = @mod(a, b);
-            a = b;
-            b = t;
-        }
-        return .{ .integer = a };
-    }
-    if (strEql(func_name, "divmod")) {
-        if (count != 2 or int_args[1] == 0) return null;
-        return .{ .integer = @divTrunc(int_args[0], int_args[1]) };
-    }
-    if (strEql(func_name, "log2")) {
-        if (count != 1) return null;
-        const n = int_args[0];
-        if (n <= 0) return .{ .integer = 0 };
-        // Bit length - 1
-        var bits: i128 = 0;
-        var v = n;
-        while (v > 1) : (v = @divTrunc(v, 2)) {
-            bits += 1;
-        }
-        return .{ .integer = bits };
-    }
-    if (strEql(func_name, "bool")) {
-        if (count != 1) return null;
-        return .{ .boolean = int_args[0] != 0 };
-    }
-
-    return null;
+    return switch (tag) {
+        .builtin_abs => {
+            if (count != 1) return null;
+            const n = int_args[0];
+            return .{ .integer = if (n < 0) -n else n };
+        },
+        .builtin_min => {
+            if (count != 2) return null;
+            return .{ .integer = @min(int_args[0], int_args[1]) };
+        },
+        .builtin_max => {
+            if (count != 2) return null;
+            return .{ .integer = @max(int_args[0], int_args[1]) };
+        },
+        .builtin_safediv => {
+            if (count != 2 or int_args[1] == 0) return null;
+            return .{ .integer = @divTrunc(int_args[0], int_args[1]) };
+        },
+        .builtin_safemod => {
+            if (count != 2 or int_args[1] == 0) return null;
+            const a = int_args[0];
+            const b = int_args[1];
+            return .{ .integer = a - @divTrunc(a, b) * b };
+        },
+        .builtin_clamp => {
+            if (count != 3) return null;
+            const val = int_args[0];
+            const lo = int_args[1];
+            const hi = int_args[2];
+            return .{ .integer = @max(lo, @min(val, hi)) };
+        },
+        .builtin_sign => {
+            if (count != 1) return null;
+            const n = int_args[0];
+            if (n > 0) return .{ .integer = 1 };
+            if (n < 0) return .{ .integer = -1 };
+            return .{ .integer = 0 };
+        },
+        .builtin_pow => {
+            if (count != 2) return null;
+            const base = int_args[0];
+            const exp = int_args[1];
+            if (exp < 0 or exp > 256) return null;
+            var result: i128 = 1;
+            var i: i128 = 0;
+            while (i < exp) : (i += 1) {
+                result *%= base;
+            }
+            return .{ .integer = result };
+        },
+        .builtin_mulDiv => {
+            if (count != 3 or int_args[2] == 0) return null;
+            const tmp = int_args[0] *% int_args[1];
+            return .{ .integer = @divTrunc(tmp, int_args[2]) };
+        },
+        .builtin_percentOf => {
+            if (count != 2) return null;
+            const tmp = int_args[0] *% int_args[1];
+            return .{ .integer = @divTrunc(tmp, 10000) };
+        },
+        .builtin_sqrt => {
+            if (count != 1) return null;
+            const n = int_args[0];
+            if (n < 0) return null;
+            if (n == 0) return .{ .integer = 0 };
+            // Integer square root via Newton's method
+            var x = n;
+            var y = @divTrunc(x + 1, 2);
+            while (y < x) {
+                x = y;
+                y = @divTrunc(x + @divTrunc(n, x), 2);
+            }
+            return .{ .integer = x };
+        },
+        .builtin_gcd => {
+            if (count != 2) return null;
+            var a: i128 = if (int_args[0] < 0) -int_args[0] else int_args[0];
+            var b: i128 = if (int_args[1] < 0) -int_args[1] else int_args[1];
+            while (b != 0) {
+                const t = @mod(a, b);
+                a = b;
+                b = t;
+            }
+            return .{ .integer = a };
+        },
+        .builtin_divmod => {
+            if (count != 2 or int_args[1] == 0) return null;
+            return .{ .integer = @divTrunc(int_args[0], int_args[1]) };
+        },
+        .builtin_log2 => {
+            if (count != 1) return null;
+            const n = int_args[0];
+            if (n <= 0) return .{ .integer = 0 };
+            // Bit length - 1
+            var bits: i128 = 0;
+            var v = n;
+            while (v > 1) : (v = @divTrunc(v, 2)) {
+                bits += 1;
+            }
+            return .{ .integer = bits };
+        },
+        .builtin_bool => {
+            if (count != 1) return null;
+            return .{ .boolean = int_args[0] != 0 };
+        },
+    };
 }
 
 // ============================================================================
