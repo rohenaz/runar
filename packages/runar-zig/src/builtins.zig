@@ -1088,7 +1088,7 @@ fn wotsAllDigits(msg_hash: *const [32]u8) [wots_len]usize {
     }
 
     var remaining = checksum;
-    var i = wots_len;
+    var i: usize = wots_len;
     while (i > wots_len1) {
         i -= 1;
         digits[i] = remaining % wots_w;

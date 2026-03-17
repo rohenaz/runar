@@ -221,7 +221,7 @@ cd compilers/zig && zig build run -- compile ../../examples/zig/p2pkh/P2PKH.runa
 
 ## Test Your Contracts
 
-The maintained frontends all have native test workflows. Go, Rust, and Python tests execute contract logic directly in the host language; Zig example tests live next to the contracts and combine compile checks with Zig-native helper/runtime tests.
+The maintained frontends all have native test workflows. Go, Rust, and Python tests execute contract logic directly in the host language; Zig example tests live next to the contracts and combine compile checks, direct contract execution where the current Zig surface supports it, and Zig-native helper/runtime tests.
 
 **TypeScript** (vitest):
 ```typescript
@@ -286,7 +286,7 @@ cd examples/zig
 zig build test
 ```
 
-Zig example tests live next to the contracts under `examples/zig/` and use `packages/runar-zig` for compile checks, fixtures, and native helper/runtime coverage.
+Zig example tests live next to the contracts under `examples/zig/` and use `packages/runar-zig` for compile checks, fixtures, direct-execution coverage on simpler contracts, and native helper/runtime coverage.
 
 ---
 

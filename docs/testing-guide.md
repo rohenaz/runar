@@ -50,7 +50,7 @@ The maintained native frontends use their own language test runners for the exam
 - Python: `cd examples/python && PYTHONPATH=../../packages/runar-py python3 -m pytest`
 - Zig: `cd examples/zig && zig build test`
 
-The Zig example suite is backed by `packages/runar-zig`, which provides the `runar` module, compile-check helpers, fixtures, and the native helper/runtime surface used by `examples/zig/*/*_test.zig`.
+The Zig example suite is backed by `packages/runar-zig`, which provides the `runar` module, compile-check helpers, fixtures, and the native helper/runtime surface used by `examples/zig/*/*_test.zig`. Some Zig examples now execute the real contract module directly; others still rely on mirror coverage where the current Zig execution model is not yet natural enough.
 
 ### Running Tests
 

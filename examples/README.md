@@ -146,7 +146,7 @@ Run the native Zig example suite:
 cd examples/zig && zig build test
 ```
 
-The Zig example runner imports `packages/runar-zig` as the `runar` module and executes the adjacent `*_test.zig` files under each example directory.
+The Zig example runner imports `packages/runar-zig` as the `runar` module and executes the adjacent `*_test.zig` files under each example directory. Today that suite mixes compile checks, direct contract execution on the simpler examples, and helper/runtime-backed tests while the more complex Zig-native execution model continues to mature.
 
 Compile a Zig example through the Zig compiler:
 
