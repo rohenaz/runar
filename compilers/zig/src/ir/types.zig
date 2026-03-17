@@ -309,12 +309,23 @@ fn freeBindings(allocator: std.mem.Allocator, bindings: []ANFBinding) void {
 pub const StackProgram = struct {
     methods: []StackMethod, contract_name: []const u8,
     properties: []ANFProperty = &.{}, constructor_params: []ParamNode = &.{},
-    pub fn deinit(self: *const StackProgram, allocator: std.mem.Allocator) void { _ = self; _ = allocator; }
+    owned_push_data: [][]u8 = &.{},
+
+    pub fn deinit(self: *const StackProgram, allocator: std.mem.Allocator) void {
+        for (self.methods) |method| {
+            if (method.instructions.len > 0) allocator.free(method.instructions);
+        }
+        if (self.methods.len > 0) allocator.free(self.methods);
+        for (self.owned_push_data) |data| allocator.free(data);
+        if (self.owned_push_data.len > 0) allocator.free(self.owned_push_data);
+    }
 };
 pub const StackMethod = struct {
     name: []const u8,
     /// Flat instruction sequence for direct emission (used by emitMethodScript).
     instructions: []StackInstruction = &.{},
+    /// Byte buffers owned by the lowering pass and referenced by `instructions`.
+    owned_push_data: [][]u8 = &.{},
     /// High-level stack operations (used by emitDispatchTable, may contain nested if).
     ops: []StackOp = &.{},
     max_stack_depth: u32 = 0,

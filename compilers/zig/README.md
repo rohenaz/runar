@@ -6,7 +6,8 @@ The 5th implementation of the Runar Bitcoin Script compiler, written in Zig 0.15
 
 ```bash
 zig build          # Compile the runar-zig binary
-zig build test     # Run all tests (~335 tests)
+zig build test     # Run unit + e2e tests
+zig build conformance # Run 27 golden-file conformance tests
 zig build run -- compile examples/P2PKH.runar.zig  # Compile a contract
 ```
 
@@ -25,6 +26,19 @@ runar-zig --source <file> --emit-ir                # Output canonical ANF IR JSO
 runar-zig --source <file> --hex                    # Output script hex only
 runar-zig --source <file> --disable-constant-folding
 ```
+
+## Benchmarking
+
+The benchmark harness for Zig vs TypeScript comparison lives outside the compiler core so it can be iterated safely while correctness is still moving.
+
+Use the benchmark runner from repo root:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py source
+python3 compilers/zig/scripts/benchmark_compare.py ir
+```
+
+For benchmark workflow details, prerequisites, JSON output, and reproducible command examples, see [benchmarks/README.md](/Users/satchmo/code/runar/compilers/zig/benchmarks/README.md).
 
 ## .runar.zig Syntax
 
@@ -91,5 +105,5 @@ Zero. Uses only Zig's standard library.
 
 - **IR consumer pipeline** (compile-ir): Fully functional. Parses ANF IR JSON, runs stack lowering + peephole + emit.
 - **Full source pipeline** (compile): Wired end-to-end. Parser, validator, typechecker, ANF lowerer all implemented. Some edge cases in Zig→ANF constructor translation still in progress.
-- **Conformance**: 27 test harness reads golden files. Full pipeline comparison activation in progress.
+- **Conformance**: 27 golden-file tests wired through `zig build conformance`.
 - **Security**: Audited for stack correctness, JSON parsing safety, integer overflow, MINIMALDATA compliance. All CRITICAL/HIGH findings fixed.

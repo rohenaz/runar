@@ -11,6 +11,7 @@
 const std = @import("std");
 const json_parser = @import("../ir/json.zig");
 const stack_lower = @import("../passes/stack_lower.zig");
+const peephole = @import("../passes/peephole.zig");
 const emit_mod = @import("../codegen/emit.zig");
 const ir_types = @import("../ir/types.zig");
 
@@ -552,16 +553,14 @@ fn countBindingsDeep(bindings: []const IRBinding) usize {
 /// the full dispatch table; for single-method contracts, it produces one method.
 /// The result matches the expected-script.hex format (no OP_CODESEPARATOR prefix).
 fn emitPipelineHex(allocator: std.mem.Allocator, stack_program: ir_types.StackProgram) ![]const u8 {
-    var ctx = emit_mod.EmitContext.init(allocator);
-    defer ctx.deinit();
-
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
     for (stack_program.methods) |method| {
-        for (method.instructions) |inst| {
-            try emit_mod.emitStackInstruction(&ctx, inst);
-        }
+        const method_hex = try emit_mod.emitMethodScript(allocator, method.instructions);
+        defer allocator.free(method_hex);
+        try out.appendSlice(allocator, method_hex);
     }
-
-    return try ctx.getHex();
+    return try out.toOwnedSlice(allocator);
 }
 
 /// Run a single conformance test: read expected-ir.json, parse it,
@@ -578,15 +577,15 @@ fn runConformanceTest(test_name: []const u8) !void {
 
     // Open expected IR JSON
     const ir_file = std.fs.cwd().openFile(ir_path, .{}) catch |err| {
-        std.debug.print("[SKIP] {s}: cannot open expected-ir.json ({s})\n", .{ test_name, @errorName(err) });
-        return;
+        std.debug.print("[FAIL] {s}: cannot open expected-ir.json ({s})\n", .{ test_name, @errorName(err) });
+        return err;
     };
     defer ir_file.close();
 
     // Open expected script hex
     const script_file = std.fs.cwd().openFile(script_path, .{}) catch |err| {
-        std.debug.print("[SKIP] {s}: cannot open expected-script.hex ({s})\n", .{ test_name, @errorName(err) });
-        return;
+        std.debug.print("[FAIL] {s}: cannot open expected-script.hex ({s})\n", .{ test_name, @errorName(err) });
+        return err;
     };
     defer script_file.close();
 
@@ -602,8 +601,8 @@ fn runConformanceTest(test_name: []const u8) !void {
     defer allocator.free(expected_hex);
 
     if (expected_hex.len == 0) {
-        std.debug.print("[SKIP] {s}: expected-script.hex is empty\n", .{test_name});
-        return;
+        std.debug.print("[FAIL] {s}: expected-script.hex is empty\n", .{test_name});
+        return error.InvalidExpectedHex;
     }
 
     // Phase 1: Parse the conformance JSON into our local IR (validation)
@@ -652,20 +651,26 @@ fn runConformanceTest(test_name: []const u8) !void {
 
     // Parse via the canonical ir/json.zig parser into ANFProgram
     const program = json_parser.parseANFProgram(pipeline_alloc, ir_source) catch |err| {
-        std.debug.print("[SKIP] {s}: IR parse failed ({s})\n", .{ test_name, @errorName(err) });
-        return;
+        std.debug.print("[FAIL] {s}: IR parse failed ({s})\n", .{ test_name, @errorName(err) });
+        return err;
     };
 
     // Pass 5: Stack lower
-    const stack_program = stack_lower.lower(pipeline_alloc, program) catch |err| {
-        std.debug.print("[SKIP] {s}: stack lower failed ({s})\n", .{ test_name, @errorName(err) });
-        return;
+    var stack_program = stack_lower.lower(pipeline_alloc, program) catch |err| {
+        std.debug.print("[FAIL] {s}: stack lower failed ({s})\n", .{ test_name, @errorName(err) });
+        return err;
     };
+
+    const optimized_methods = peephole.optimize(pipeline_alloc, stack_program.methods) catch |err| {
+        std.debug.print("[FAIL] {s}: peephole optimize failed ({s})\n", .{ test_name, @errorName(err) });
+        return err;
+    };
+    stack_program.methods = optimized_methods;
 
     // Pass 6: Emit to hex
     const output_hex = emitPipelineHex(pipeline_alloc, stack_program) catch |err| {
-        std.debug.print("[SKIP] {s}: emit failed ({s})\n", .{ test_name, @errorName(err) });
-        return;
+        std.debug.print("[FAIL] {s}: emit failed ({s})\n", .{ test_name, @errorName(err) });
+        return err;
     };
 
     // Compare against golden expected hex

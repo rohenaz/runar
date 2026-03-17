@@ -10,6 +10,13 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const opcodes = @import("../codegen/opcodes.zig");
+const stateful_templates = @import("helpers/stateful_templates.zig");
+const crypto_builtins = @import("helpers/crypto_builtins.zig");
+const crypto_emitters = @import("helpers/crypto_emitters.zig");
+const blake3_emitters = @import("helpers/blake3_emitters.zig");
+const ec_emitters = @import("helpers/ec_emitters.zig");
+const pq_emitters = @import("helpers/pq_emitters.zig");
 const Allocator = std.mem.Allocator;
 const Opcode = types.Opcode;
 
@@ -48,38 +55,39 @@ pub const StackMap = struct {
 
     /// Find the stack depth (0 = top) of a named variable — O(1) via hash map.
     pub fn findDepth(self: *const StackMap, name: []const u8) ?usize {
-        const idx = self.name_index.get(name) orelse return null;
-        return self.slots.items.len - 1 - idx;
+        var i = self.slots.items.len;
+        while (i > 0) {
+            i -= 1;
+            const slot = self.slots.items[i] orelse continue;
+            if (std.mem.eql(u8, slot, name)) {
+                return self.slots.items.len - 1 - i;
+            }
+        }
+        return null;
     }
 
-    /// Remove the slot at the given depth (0 = top). Depth d maps to array
-    /// index `len - 1 - d`. Requires rebuilding affected hash map entries.
-    pub fn removeAtDepth(self: *StackMap, d: usize) void {
-        const idx = self.slots.items.len - 1 - d;
-        const removed = self.slots.items[idx];
-        if (removed) |v| {
-            _ = self.name_index.remove(v);
-        }
-        _ = self.slots.orderedRemove(idx);
-        // Update indices for all slots that shifted down (those above idx)
-        for (self.slots.items[idx..], idx..) |slot, new_idx| {
-            if (slot) |s| {
-                self.name_index.putAssumeCapacity(s, new_idx);
+    fn rebuildNameIndex(self: *StackMap, allocator: Allocator) !void {
+        self.name_index.clearRetainingCapacity();
+        for (self.slots.items, 0..) |slot, idx| {
+            if (slot) |name| {
+                try self.name_index.put(allocator, name, idx);
             }
         }
     }
 
-    /// Rename the variable at the given depth.
-    pub fn renameAtDepth(self: *StackMap, d: usize, new_name: ?[]const u8) void {
+    /// Remove the slot at the given depth (0 = top). Depth d maps to array
+    /// index `len - 1 - d`.
+    pub fn removeAtDepth(self: *StackMap, allocator: Allocator, d: usize) !void {
         const idx = self.slots.items.len - 1 - d;
-        const old_name = self.slots.items[idx];
-        if (old_name) |v| {
-            _ = self.name_index.remove(v);
-        }
+        _ = self.slots.orderedRemove(idx);
+        try self.rebuildNameIndex(allocator);
+    }
+
+    /// Rename the variable at the given depth.
+    pub fn renameAtDepth(self: *StackMap, allocator: Allocator, d: usize, new_name: ?[]const u8) !void {
+        const idx = self.slots.items.len - 1 - d;
         self.slots.items[idx] = new_name;
-        if (new_name) |n| {
-            self.name_index.putAssumeCapacity(n, idx);
-        }
+        try self.rebuildNameIndex(allocator);
     }
 
     /// Peek at the variable name at the given depth (0 = top).
@@ -92,10 +100,11 @@ pub const StackMap = struct {
         var new_slots: std.ArrayListUnmanaged(?[]const u8) = .empty;
         try new_slots.appendSlice(allocator, self.slots.items);
         var new_index: std.StringHashMapUnmanaged(usize) = .empty;
-        try new_index.ensureTotalCapacity(allocator, self.name_index.capacity());
-        var it = self.name_index.iterator();
-        while (it.next()) |entry| {
-            new_index.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+        try new_index.ensureTotalCapacity(allocator, @intCast(self.slots.items.len));
+        for (self.slots.items, 0..) |slot, idx| {
+            if (slot) |name| {
+                try new_index.put(allocator, name, idx);
+            }
         }
         return .{ .slots = new_slots, .name_index = new_index };
     }
@@ -138,6 +147,11 @@ const LowerCtx = struct {
     stack: StackMap,
     program: types.ANFProgram,
     last_uses: std.StringHashMapUnmanaged(usize),
+    local_bindings: std.StringHashMapUnmanaged(void),
+    force_copy_bindings: std.StringHashMapUnmanaged(void),
+    owned_push_data: std.ArrayListUnmanaged([]u8),
+    scope_bindings: []const types.ANFBinding,
+    copy_ref_aliases: bool,
     current_idx: usize,
     in_branch: bool,
     updated_props: std.StringHashMapUnmanaged(void),
@@ -150,6 +164,11 @@ const LowerCtx = struct {
             .stack = .{},
             .program = program,
             .last_uses = .empty,
+            .local_bindings = .empty,
+            .force_copy_bindings = .empty,
+            .owned_push_data = .empty,
+            .scope_bindings = &.{},
+            .copy_ref_aliases = false,
             .current_idx = 0,
             .in_branch = false,
             .updated_props = .empty,
@@ -161,12 +180,26 @@ const LowerCtx = struct {
         self.instructions.deinit(self.allocator);
         self.stack.deinit(self.allocator);
         self.last_uses.deinit(self.allocator);
+        self.local_bindings.deinit(self.allocator);
+        self.force_copy_bindings.deinit(self.allocator);
+        for (self.owned_push_data.items) |data| self.allocator.free(data);
+        self.owned_push_data.deinit(self.allocator);
         self.updated_props.deinit(self.allocator);
     }
 
     fn trackDepth(self: *LowerCtx) void {
         const d: u32 = @intCast(self.stack.depth());
         if (d > self.max_depth) self.max_depth = d;
+    }
+
+    fn cleanupExcessStack(self: *LowerCtx) !void {
+        if (self.stack.depth() <= 1) return;
+        const excess = self.stack.depth() - 1;
+        var i: usize = 0;
+        while (i < excess) : (i += 1) {
+            try self.emitOp(.op_nip);
+            try self.stack.removeAtDepth(self.allocator, 1);
+        }
     }
 
     // ========================================================================
@@ -191,6 +224,80 @@ const LowerCtx = struct {
 
     fn emitPushData(self: *LowerCtx, data: []const u8) !void {
         try self.emit(.{ .push_data = data });
+    }
+
+    fn emitOwnedPushData(self: *LowerCtx, data: []u8) !void {
+        try self.owned_push_data.append(self.allocator, data);
+        try self.emitPushData(data);
+    }
+
+    fn emitPushHexString(self: *LowerCtx, hex: []const u8) !void {
+        if (hex.len % 2 != 0) return LowerError.UnsupportedOperation;
+        const decoded = try self.allocator.alloc(u8, hex.len / 2);
+        _ = std.fmt.hexToBytes(decoded, hex) catch return LowerError.UnsupportedOperation;
+        try self.emitOwnedPushData(decoded);
+    }
+
+    fn emitSwapTracked(self: *LowerCtx) !void {
+        try self.emitOp(.op_swap);
+        const top = self.stack.pop();
+        const next = self.stack.pop();
+        try self.stack.push(self.allocator, top);
+        try self.stack.push(self.allocator, next);
+    }
+
+    fn appendInstructions(self: *LowerCtx, insts: []const types.StackInstruction) !void {
+        try self.instructions.appendSlice(self.allocator, insts);
+    }
+
+    fn cloneVoidMap(
+        allocator: Allocator,
+        src: std.StringHashMapUnmanaged(void),
+    ) !std.StringHashMapUnmanaged(void) {
+        var dst: std.StringHashMapUnmanaged(void) = .empty;
+        try dst.ensureTotalCapacity(allocator, src.count());
+        var it = src.iterator();
+        while (it.next()) |entry| {
+            dst.putAssumeCapacity(entry.key_ptr.*, {});
+        }
+        return dst;
+    }
+
+    fn removeBranchValueAtDepth(ctx: *LowerCtx, depth: usize) !void {
+        if (depth == 0) {
+            try ctx.emitOp(.op_drop);
+            _ = ctx.stack.pop();
+            return;
+        }
+
+        if (depth == 1) {
+            try ctx.emitOp(.op_nip);
+            try ctx.stack.removeAtDepth(ctx.allocator, 1);
+            return;
+        }
+
+        try ctx.emitPushInt(@intCast(depth));
+        try ctx.stack.push(ctx.allocator, null);
+        try ctx.emitOp(.op_roll);
+        _ = ctx.stack.pop();
+        const rolled = ctx.stack.peekAtDepth(depth);
+        try ctx.stack.removeAtDepth(ctx.allocator, depth);
+        try ctx.stack.push(ctx.allocator, rolled);
+        try ctx.emitOp(.op_drop);
+        _ = ctx.stack.pop();
+    }
+
+    fn duplicateBranchValueAtDepth(ctx: *LowerCtx, depth: usize, name: ?[]const u8) !void {
+        if (depth == 0) {
+            try ctx.emitOp(.op_dup);
+        } else {
+            try ctx.emitPushInt(@intCast(depth));
+            try ctx.stack.push(ctx.allocator, null);
+            try ctx.emitOp(.op_pick);
+            _ = ctx.stack.pop();
+        }
+        try ctx.stack.push(ctx.allocator, name);
+        ctx.trackDepth();
     }
 
     // ========================================================================
@@ -223,19 +330,18 @@ const LowerCtx = struct {
                     const old_next = self.stack.slots.items[next_idx];
                     self.stack.slots.items[top_idx] = old_next;
                     self.stack.slots.items[next_idx] = old_top;
-                    // Update hash map for both swapped names
-                    if (old_top) |n| self.stack.name_index.putAssumeCapacity(n, next_idx);
-                    if (old_next) |n| self.stack.name_index.putAssumeCapacity(n, top_idx);
                 },
                 2 => {
                     try self.emitOp(.op_rot);
-                    self.stack.removeAtDepth(d);
+                    try self.stack.removeAtDepth(self.allocator, d);
                     try self.stack.push(self.allocator, name);
                 },
                 else => {
                     try self.emitPushInt(@intCast(d));
+                    try self.stack.push(self.allocator, null);
                     try self.emitOp(.op_roll);
-                    self.stack.removeAtDepth(d);
+                    _ = self.stack.pop();
+                    try self.stack.removeAtDepth(self.allocator, d);
                     try self.stack.push(self.allocator, name);
                 },
             }
@@ -247,7 +353,9 @@ const LowerCtx = struct {
                 },
                 else => {
                     try self.emitPushInt(@intCast(d));
+                    try self.stack.push(self.allocator, null);
                     try self.emitOp(.op_pick);
+                    _ = self.stack.pop();
                     try self.stack.push(self.allocator, name);
                 },
             }
@@ -281,7 +389,20 @@ const LowerCtx = struct {
     fn scanValueForRefs(self: *LowerCtx, value: types.ANFValue, idx: usize) void {
         switch (value) {
             .literal_int, .literal_bigint, .literal_bool, .literal_bytes, .nop => {},
-            .load_param, .load_prop, .load_const, .get_state_script => {},
+            .load_param => |lp| {
+                self.last_uses.put(self.allocator, lp.name, idx) catch return;
+            },
+            .load_prop, .get_state_script => {},
+            .load_const => |lc| {
+                switch (lc.value) {
+                    .string => |s| {
+                        if (std.mem.startsWith(u8, s, "@ref:")) {
+                            self.last_uses.put(self.allocator, s[5..], idx) catch return;
+                        }
+                    },
+                    else => {},
+                }
+            },
             .ref => |name| {
                 self.last_uses.put(self.allocator, name, idx) catch return;
             },
@@ -318,13 +439,36 @@ const LowerCtx = struct {
                     self.last_uses.put(self.allocator, arg, idx) catch return;
                 }
             },
-            .if_expr => |ie| {
-                self.last_uses.put(self.allocator, ie.condition, idx) catch return;
-            },
             .@"if" => |ie| {
                 self.last_uses.put(self.allocator, ie.cond, idx) catch return;
+                for (ie.then) |binding| {
+                    self.scanValueForRefs(binding.value, idx);
+                }
+                for (ie.@"else") |binding| {
+                    self.scanValueForRefs(binding.value, idx);
+                }
             },
-            .for_loop, .loop => {},
+            .if_expr => |ie| {
+                self.last_uses.put(self.allocator, ie.condition, idx) catch return;
+                for (ie.then_bindings) |binding| {
+                    self.scanValueForRefs(binding.value, idx);
+                }
+                if (ie.else_bindings) |else_bindings| {
+                    for (else_bindings) |binding| {
+                        self.scanValueForRefs(binding.value, idx);
+                    }
+                }
+            },
+            .for_loop => |fl| {
+                for (fl.body_bindings) |binding| {
+                    self.scanValueForRefs(binding.value, idx);
+                }
+            },
+            .loop => |lp| {
+                for (lp.body) |binding| {
+                    self.scanValueForRefs(binding.value, idx);
+                }
+            },
             .assert_op => |a| {
                 self.last_uses.put(self.allocator, a.condition, idx) catch return;
             },
@@ -378,12 +522,155 @@ const LowerCtx = struct {
     // Lower a binding sequence
     // ========================================================================
 
-    fn lowerBindings(self: *LowerCtx, bindings: []const types.ANFBinding) LowerError!void {
+    fn lowerBindings(self: *LowerCtx, bindings: []const types.ANFBinding, terminal_assert: bool) LowerError!void {
+        const saved_scope_bindings = self.scope_bindings;
+        self.scope_bindings = bindings;
+        defer self.scope_bindings = saved_scope_bindings;
+
+        self.local_bindings.clearRetainingCapacity();
+        for (bindings) |binding| {
+            try self.local_bindings.put(self.allocator, binding.name, {});
+        }
         try self.computeLastUses(bindings);
+
+        var terminal_assert_idx: ?usize = null;
+        if (terminal_assert and bindings.len > 0) {
+            const last_idx = bindings.len - 1;
+            switch (bindings[last_idx].value) {
+                .assert, .assert_op => terminal_assert_idx = last_idx,
+                else => {},
+            }
+        }
+
         for (bindings, 0..) |binding, idx| {
             self.current_idx = idx;
-            try self.lowerBinding(binding);
+            if (terminal_assert_idx != null and idx == terminal_assert_idx.?) {
+                switch (binding.value) {
+                    .assert => |a| try self.lowerAssertOp(binding.name, .{ .condition = a.value }, true),
+                    .assert_op => |a| try self.lowerAssertOp(binding.name, a, true),
+                    else => try self.lowerBinding(binding),
+                }
+            } else {
+                try self.lowerBinding(binding);
+            }
         }
+    }
+
+    fn hasLocalBinding(self: *const LowerCtx, name: []const u8) bool {
+        return self.local_bindings.contains(name);
+    }
+
+    fn isForceCopyBinding(self: *const LowerCtx, name: []const u8) bool {
+        return self.force_copy_bindings.contains(name);
+    }
+
+    fn valueReferencesName(value: types.ANFValue, name: []const u8) bool {
+        switch (value) {
+            .load_param => |lp| return std.mem.eql(u8, lp.name, name),
+            .load_const => |lc| switch (lc.value) {
+                .string => |s| return std.mem.startsWith(u8, s, "@ref:") and std.mem.eql(u8, s[5..], name),
+                else => return false,
+            },
+            .ref => |ref_name| return std.mem.eql(u8, ref_name, name),
+            .property_write => |pw| return std.mem.eql(u8, pw.value_ref, name),
+            .binary_op => |bop| return std.mem.eql(u8, bop.left, name) or std.mem.eql(u8, bop.right, name),
+            .bin_op => |bop| return std.mem.eql(u8, bop.left, name) or std.mem.eql(u8, bop.right, name),
+            .unary_op => |uop| return std.mem.eql(u8, uop.operand, name),
+            .builtin_call => |call| {
+                for (call.args) |arg| {
+                    if (std.mem.eql(u8, arg, name)) return true;
+                }
+                return false;
+            },
+            .call => |call| {
+                for (call.args) |arg| {
+                    if (std.mem.eql(u8, arg, name)) return true;
+                }
+                return false;
+            },
+            .method_call => |mc| {
+                if (mc.object.len > 0 and std.mem.eql(u8, mc.object, name)) return true;
+                for (mc.args) |arg| {
+                    if (std.mem.eql(u8, arg, name)) return true;
+                }
+                return false;
+            },
+            .assert_op => |a| return std.mem.eql(u8, a.condition, name),
+            .assert => |a| return std.mem.eql(u8, a.value, name),
+            .update_prop => |up| return std.mem.eql(u8, up.value, name),
+            .check_preimage => |cp| return std.mem.eql(u8, cp.preimage, name),
+            .deserialize_state => |ds| return std.mem.eql(u8, ds.preimage, name),
+            .add_output => |ao| {
+                if (ao.satoshis.len > 0 and std.mem.eql(u8, ao.satoshis, name)) return true;
+                if (ao.preimage.len > 0 and std.mem.eql(u8, ao.preimage, name)) return true;
+                for (ao.state_values) |sv| {
+                    if (sv.len > 0 and std.mem.eql(u8, sv, name)) return true;
+                }
+                for (ao.state_refs) |sr| {
+                    if (sr.len > 0 and std.mem.eql(u8, sr, name)) return true;
+                }
+                return false;
+            },
+            .add_raw_output => |aro| {
+                if (aro.satoshis.len > 0 and std.mem.eql(u8, aro.satoshis, name)) return true;
+                return aro.script_ref.len > 0 and std.mem.eql(u8, aro.script_ref, name);
+            },
+            .array_literal => |al| {
+                for (al.elements) |elem| {
+                    if (std.mem.eql(u8, elem, name)) return true;
+                }
+                return false;
+            },
+            .@"if", .if_expr, .for_loop, .loop, .load_prop, .property_read, .get_state_script, .literal_int, .literal_bigint, .literal_bool, .literal_bytes, .nop => return false,
+        }
+    }
+
+    fn futureUseCount(self: *const LowerCtx, name: []const u8) usize {
+        if (self.scope_bindings.len == 0 or self.current_idx + 1 >= self.scope_bindings.len) return 0;
+        var count: usize = 0;
+        for (self.scope_bindings[self.current_idx + 1 ..]) |binding| {
+            if (valueReferencesName(binding.value, name)) count += 1;
+        }
+        return count;
+    }
+
+    fn feedsLaterAliasedBinding(self: *const LowerCtx, name: []const u8) bool {
+        if (self.scope_bindings.len == 0 or self.current_idx + 1 >= self.scope_bindings.len) return false;
+        const future = self.scope_bindings[self.current_idx + 1 ..];
+        for (future, 0..) |binding, rel_idx| {
+            if (!valueReferencesName(binding.value, name)) continue;
+            for (future[rel_idx + 1 ..]) |later| {
+                switch (later.value) {
+                    .load_const => |lc| switch (lc.value) {
+                        .string => |s| {
+                            if (std.mem.startsWith(u8, s, "@ref:") and std.mem.eql(u8, s[5..], binding.name)) {
+                                return true;
+                            }
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+        }
+        return false;
+    }
+
+    fn feedsPrivateMethodCall(self: *const LowerCtx, name: []const u8) bool {
+        if (self.scope_bindings.len == 0 or self.current_idx + 1 >= self.scope_bindings.len) return false;
+        for (self.scope_bindings[self.current_idx + 1 ..]) |binding| {
+            switch (binding.value) {
+                .method_call => |mc| {
+                    if (findPrivateMethod(self.program.methods, mc.method) == null) continue;
+                    if (mc.object.len > 0 and std.mem.eql(u8, mc.object, name)) return true;
+                    for (mc.args) |arg| {
+                        if (std.mem.eql(u8, arg, name)) return true;
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn lowerBinding(self: *LowerCtx, binding: types.ANFBinding) LowerError!void {
@@ -416,30 +703,30 @@ const LowerCtx = struct {
             .builtin_call => |call| try self.lowerBuiltinCall(binding.name, call),
             .if_expr => |ie| try self.lowerIfExpr(binding.name, ie),
             .for_loop => |fl| try self.lowerForLoop(binding.name, fl),
-            .assert_op => |a| try self.lowerAssertOp(binding.name, a),
+            .assert_op => |a| try self.lowerAssertOp(binding.name, a, false),
             .add_output => |ao| try self.lowerAddOutput(binding.name, ao),
             .add_raw_output => |aro| try self.lowerAddRawOutput(binding.name, aro),
-            .nop, .get_state_script => {},
+            .nop => {},
+            .get_state_script => try self.lowerGetStateScript(binding.name),
             // TypeScript-matching variants: delegate to equivalent legacy handlers
-            .load_param => |lp| try self.lowerRef(binding.name, lp.name),
+            .load_param => |lp| try self.lowerLoadParam(binding.name, lp.name),
             .load_prop => |lp| try self.lowerPropertyRead(binding.name, lp.name),
             .load_const => |lc| {
-                switch (lc.value) {
-                    .boolean => |b| try self.emitPushBool(b),
-                    .integer => |n| try self.emitPushInt(@intCast(n)),
-                    .string => |s| try self.emitPushData(s),
-                }
-                try self.stack.push(self.allocator, binding.name);
-                self.trackDepth();
+                try self.lowerLoadConst(binding.name, lc.value);
             },
             .bin_op => |bop| {
                 const legacy_op = types.BinOperator.fromTsString(bop.op) orelse return LowerError.UnsupportedOperation;
                 try self.lowerBinaryOp(binding.name, .{ .op = legacy_op, .left = bop.left, .right = bop.right, .result_type = bop.result_type });
             },
-            .call => |c| try self.lowerBuiltinCall(binding.name, .{ .name = c.func, .args = c.args }),
-            .method_call => {
-                return LowerError.UnsupportedOperation;
+            .call => |c| {
+                if (std.mem.eql(u8, c.func, "super")) {
+                    try self.stack.push(self.allocator, binding.name);
+                    self.trackDepth();
+                } else {
+                    try self.lowerBuiltinCall(binding.name, .{ .name = c.func, .args = c.args });
+                }
             },
+            .method_call => |mc| try self.lowerMethodCall(binding.name, mc),
             .@"if" => |ie| {
                 const legacy = try self.allocator.create(types.ANFIfExpr);
                 legacy.* = .{ .condition = ie.cond, .then_bindings = ie.then, .else_bindings = if (ie.@"else".len > 0) ie.@"else" else null };
@@ -450,14 +737,10 @@ const LowerCtx = struct {
                 legacy.* = .{ .var_name = lp.iter_var, .init_val = 0, .bound = @intCast(lp.count), .body_bindings = lp.body };
                 try self.lowerForLoop(binding.name, legacy);
             },
-            .assert => |a| try self.lowerAssertOp(binding.name, .{ .condition = a.value }),
+            .assert => |a| try self.lowerAssertOp(binding.name, .{ .condition = a.value }, false),
             .update_prop => |up| try self.lowerPropertyWrite(binding.name, .{ .name = up.name, .value_ref = up.value }),
-            .check_preimage => |cp| {
-                try self.lowerRef(binding.name, cp.preimage);
-            },
-            .deserialize_state => |ds| {
-                try self.lowerRef(binding.name, ds.preimage);
-            },
+            .check_preimage => |cp| try self.lowerCheckPreimage(binding.name, &.{cp.preimage}),
+            .deserialize_state => |ds| try self.lowerDeserializeState(binding.name, &.{ds.preimage}),
             .array_literal => |al| {
                 for (al.elements) |elem| {
                     try self.bringToTopAuto(elem);
@@ -475,24 +758,168 @@ const LowerCtx = struct {
     fn lowerRef(self: *LowerCtx, bind_name: []const u8, ref_name: []const u8) !void {
         const consume = self.isLastUse(ref_name);
         try self.bringToTop(ref_name, consume);
-        self.stack.renameAtDepth(0, bind_name);
+        try self.stack.renameAtDepth(self.allocator, 0, bind_name);
+        if (self.isForceCopyBinding(ref_name)) {
+            try self.force_copy_bindings.put(self.allocator, bind_name, {});
+        }
+    }
+
+    fn lowerLoadParam(self: *LowerCtx, bind_name: []const u8, param_name: []const u8) !void {
+        if (self.stack.findDepth(param_name) != null) {
+            const consume = self.isLastUse(param_name);
+            try self.bringToTop(param_name, consume);
+            try self.stack.renameAtDepth(self.allocator, 0, bind_name);
+            return;
+        }
+
+        try self.emitPushInt(0);
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerMethodCall(self: *LowerCtx, bind_name: []const u8, mc: types.ANFMethodCall) !void {
+        if (std.mem.eql(u8, mc.method, "getStateScript")) {
+            if (self.stack.findDepth(mc.object) != null) {
+                try self.bringToTop(mc.object, true);
+                try self.emitOp(.op_drop);
+                _ = self.stack.pop();
+            }
+            try self.lowerGetStateScript(bind_name);
+            return;
+        }
+
+        if (findPrivateMethod(self.program.methods, mc.method)) |method| {
+            if (self.stack.findDepth(mc.object) != null) {
+                try self.bringToTop(mc.object, true);
+                try self.emitOp(.op_drop);
+                _ = self.stack.pop();
+            }
+            try self.inlineMethodCall(bind_name, method, mc.args);
+            return;
+        }
+
+        try self.lowerBuiltinCall(bind_name, .{ .name = mc.method, .args = mc.args });
+    }
+
+    fn inlineMethodCall(self: *LowerCtx, bind_name: []const u8, method: types.ANFMethod, args: []const []const u8) !void {
+        const ShadowedName = struct {
+            param_name: []const u8,
+            shadowed_name: []const u8,
+        };
+
+        var shadowed = std.ArrayListUnmanaged(ShadowedName).empty;
+        defer {
+            for (shadowed.items) |entry| {
+                self.allocator.free(entry.shadowed_name);
+            }
+            shadowed.deinit(self.allocator);
+        }
+
+        for (args, 0..) |arg, idx| {
+            if (idx >= method.params.len) break;
+            const param_name = method.params[idx].name;
+            const consume = self.isLastUse(arg);
+            try self.bringToTop(arg, consume);
+            _ = self.stack.pop();
+
+            if (self.stack.findDepth(param_name)) |depth| {
+                const shadowed_name = try std.fmt.allocPrint(self.allocator, "__shadowed_{d}_{s}", .{ self.current_idx, param_name });
+                try shadowed.append(self.allocator, .{ .param_name = param_name, .shadowed_name = shadowed_name });
+                try self.stack.renameAtDepth(self.allocator, depth, shadowed_name);
+            }
+
+            try self.stack.push(self.allocator, param_name);
+            self.trackDepth();
+        }
+
+        const saved_last_uses = self.last_uses;
+        const saved_local_bindings = self.local_bindings;
+        var saved_force_copy_bindings = self.force_copy_bindings;
+        const saved_copy_ref_aliases = self.copy_ref_aliases;
+        defer {
+            self.local_bindings.deinit(self.allocator);
+            self.local_bindings = saved_local_bindings;
+            self.force_copy_bindings.deinit(self.allocator);
+            self.force_copy_bindings = saved_force_copy_bindings;
+            self.last_uses.deinit(self.allocator);
+            self.last_uses = saved_last_uses;
+            self.copy_ref_aliases = saved_copy_ref_aliases;
+        }
+
+        self.last_uses = .empty;
+        self.local_bindings = .empty;
+        self.force_copy_bindings = .empty;
+        self.copy_ref_aliases = false;
+        try self.lowerBindings(method.body, false);
+
+        for (shadowed.items) |entry| {
+            if (self.stack.findDepth(entry.shadowed_name)) |depth| {
+                try self.stack.renameAtDepth(self.allocator, depth, entry.param_name);
+            }
+        }
+
+        if (method.body.len > 0 and self.stack.depth() > 0) {
+            const last_binding = method.body[method.body.len - 1];
+            const last_binding_name = last_binding.name;
+            if (self.stack.peekAtDepth(0)) |top_name| {
+                if (std.mem.eql(u8, top_name, last_binding_name)) {
+                    try self.stack.renameAtDepth(self.allocator, 0, bind_name);
+                    const should_force_copy =
+                        self.isForceCopyBinding(last_binding_name) or
+                        switch (last_binding.value) {
+                            .call, .builtin_call, .method_call => true,
+                            else => false,
+                        };
+                    if (should_force_copy) {
+                        try saved_force_copy_bindings.put(self.allocator, bind_name, {});
+                    }
+                }
+            }
+        }
+    }
+
+    fn lowerLoadConst(self: *LowerCtx, bind_name: []const u8, value: types.ConstValue) !void {
+        switch (value) {
+            .boolean => |b| try self.emitPushBool(b),
+            .integer => |n| try self.emitPushInt(@intCast(n)),
+            .string => |s| {
+                if (std.mem.startsWith(u8, s, "@ref:")) {
+                    const ref_name = s[5..];
+                    const depends_on_private_result = self.isForceCopyBinding(ref_name);
+                    const forced_copy = depends_on_private_result and (self.futureUseCount(bind_name) > 1 or self.feedsLaterAliasedBinding(bind_name) or self.feedsPrivateMethodCall(bind_name));
+                    const consume = !self.copy_ref_aliases and !forced_copy and self.hasLocalBinding(ref_name) and self.isLastUse(ref_name);
+                    try self.bringToTop(ref_name, consume);
+                    try self.stack.renameAtDepth(self.allocator, 0, bind_name);
+                    if (depends_on_private_result) {
+                        try self.force_copy_bindings.put(self.allocator, bind_name, {});
+                    }
+                    return;
+                }
+
+                if (std.mem.eql(u8, s, "@this")) {
+                    try self.emitPushInt(0);
+                } else {
+                    try self.emitPushHexString(s);
+                }
+            },
+        }
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
     }
 
     fn lowerPropertyRead(self: *LowerCtx, bind_name: []const u8, prop_name: []const u8) !void {
         // Check if property has been updated on stack
         if (self.updated_props.get(prop_name) != null) {
             if (self.stack.findDepth(prop_name)) |_| {
-                const consume = self.isLastUse(prop_name);
-                try self.bringToTop(prop_name, consume);
-                self.stack.renameAtDepth(0, bind_name);
+                try self.bringToTop(prop_name, false);
+                try self.stack.renameAtDepth(self.allocator, 0, bind_name);
                 return;
             }
         }
         // Property might be on stack from setup
         if (self.stack.findDepth(prop_name)) |_| {
-            const consume = self.isLastUse(prop_name);
-            try self.bringToTop(prop_name, consume);
-            self.stack.renameAtDepth(0, bind_name);
+            try self.bringToTop(prop_name, false);
+            try self.stack.renameAtDepth(self.allocator, 0, bind_name);
             return;
         }
         // Check if the property has an initial_value
@@ -502,7 +929,7 @@ const LowerCtx = struct {
                     switch (iv) {
                         .boolean => |b| try self.emitPushBool(b),
                         .integer => |n| try self.emitPushInt(@intCast(n)),
-                        .string => |s| try self.emitPushData(s),
+                        .string => |s| try self.emitPushHexString(s),
                     }
                     try self.stack.push(self.allocator, bind_name);
                     self.trackDepth();
@@ -511,7 +938,7 @@ const LowerCtx = struct {
             }
         }
         // Not found — push placeholder
-        try self.emitPushInt(0);
+        try self.emitPushData("");
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
     }
@@ -519,7 +946,7 @@ const LowerCtx = struct {
     fn lowerPropertyWrite(self: *LowerCtx, bind_name: []const u8, pw: types.PropertyWrite) !void {
         const consume = self.isLastUse(pw.value_ref);
         try self.bringToTop(pw.value_ref, consume);
-        self.stack.renameAtDepth(0, pw.name);
+        try self.stack.renameAtDepth(self.allocator, 0, pw.name);
         try self.updated_props.put(self.allocator, pw.name, {});
 
         // Remove stale entry via ROLL+DROP (unless inside branch)
@@ -543,17 +970,13 @@ const LowerCtx = struct {
             }
             if (old_depth) |od| {
                 if (od == 1) {
-                    try self.emitOp(.op_swap);
-                    try self.emitOp(.op_drop);
-                } else if (od == 2) {
-                    try self.emitOp(.op_rot);
-                    try self.emitOp(.op_drop);
+                    try self.emitOp(.op_nip);
                 } else {
                     try self.emitPushInt(@intCast(od));
                     try self.emitOp(.op_roll);
                     try self.emitOp(.op_drop);
                 }
-                self.stack.removeAtDepth(od);
+                try self.stack.removeAtDepth(self.allocator, od);
             }
         }
         _ = bind_name;
@@ -563,15 +986,17 @@ const LowerCtx = struct {
         try self.bringToTopAuto(bop.left);
         try self.bringToTopAuto(bop.right);
 
+        const is_bytes = if (bop.result_type) |t| std.mem.eql(u8, t, "bytes") else false;
+
         switch (bop.op) {
-            .add => try self.emitOp(.op_add),
+            .add => try self.emitOp(if (is_bytes) .op_cat else .op_add),
             .sub => try self.emitOp(.op_sub),
             .mul => try self.emitOp(.op_mul),
             .div => try self.emitOp(.op_div),
             .mod => try self.emitOp(.op_mod),
-            .eq => try self.emitOp(.op_numequal),
+            .eq => try self.emitOp(if (is_bytes) .op_equal else .op_numequal),
             .neq => {
-                try self.emitOp(.op_numequal);
+                try self.emitOp(if (is_bytes) .op_equal else .op_numequal);
                 try self.emitOp(.op_not);
             },
             .lt => try self.emitOp(.op_lessthan),
@@ -590,6 +1015,9 @@ const LowerCtx = struct {
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, bind_name);
+        if (self.isForceCopyBinding(bop.left) or self.isForceCopyBinding(bop.right)) {
+            try self.force_copy_bindings.put(self.allocator, bind_name, {});
+        }
         self.trackDepth();
     }
 
@@ -606,6 +1034,9 @@ const LowerCtx = struct {
 
         _ = self.stack.pop();
         try self.stack.push(self.allocator, bind_name);
+        if (self.isForceCopyBinding(uop.operand)) {
+            try self.force_copy_bindings.put(self.allocator, bind_name, {});
+        }
         self.trackDepth();
     }
 
@@ -639,10 +1070,26 @@ const LowerCtx = struct {
         clamp,
         checkPreimage,
         deserializeState,
+        extractHashPrevouts,
+        extractLocktime,
+        extractOutpoint,
+        extractOutputHash,
         buildChangeOutput,
         getStateScript,
         buildStateOutput,
         computeStateOutput,
+        computeStateOutputHash,
+        sign,
+        verifyRabinSig,
+        verifyWOTS,
+        ecNegate,
+        ecOnCurve,
+        ecMulGen,
+        ecModReduce,
+        ecEncodeCompressed,
+        ecMakePoint,
+        ecPointX,
+        ecPointY,
         // Wave 3 placeholders
         sha256Compress,
         blake3,
@@ -685,21 +1132,40 @@ const LowerCtx = struct {
         .{ "clamp", .clamp },
         .{ "checkPreimage", .checkPreimage },
         .{ "deserializeState", .deserializeState },
+        .{ "extractHashPrevouts", .extractHashPrevouts },
+        .{ "extractLocktime", .extractLocktime },
+        .{ "extractOutpoint", .extractOutpoint },
+        .{ "extractOutputHash", .extractOutputHash },
         .{ "buildChangeOutput", .buildChangeOutput },
         .{ "getStateScript", .getStateScript },
         .{ "buildStateOutput", .buildStateOutput },
         .{ "computeStateOutput", .computeStateOutput },
+        .{ "computeStateOutputHash", .computeStateOutputHash },
+        .{ "sign", .sign },
+        .{ "verifyRabinSig", .verifyRabinSig },
+        .{ "verifyWOTS", .verifyWOTS },
+        .{ "ecNegate", .ecNegate },
+        .{ "ecOnCurve", .ecOnCurve },
+        .{ "ecMulGen", .ecMulGen },
+        .{ "ecModReduce", .ecModReduce },
+        .{ "ecEncodeCompressed", .ecEncodeCompressed },
+        .{ "ecMakePoint", .ecMakePoint },
+        .{ "ecPointX", .ecPointX },
+        .{ "ecPointY", .ecPointY },
         .{ "sha256Compress", .sha256Compress },
+        .{ "blake3Compress", .blake3 },
+        .{ "blake3Hash", .blake3 },
         .{ "blake3", .blake3 },
         .{ "ecAdd", .ecAdd },
         .{ "ecMul", .ecMul },
         .{ "ecPairing", .ecPairing },
+        .{ "verifySLHDSA_SHA2_128s", .slhDsaVerify },
         .{ "slhDsaVerify", .slhDsaVerify },
         .{ "schnorrVerify", .schnorrVerify },
         .{ "super", .super_call },
     });
 
-    fn lowerBuiltinCall(self: *LowerCtx, bind_name: []const u8, call: types.ANFBuiltinCall) !void {
+    fn lowerBuiltinCall(self: *LowerCtx, bind_name: []const u8, call: types.ANFBuiltinCall) LowerError!void {
         const args = call.args;
 
         const id = builtin_map.get(call.name) orelse return LowerError.InvalidBuiltin;
@@ -734,11 +1200,34 @@ const LowerCtx = struct {
             .clamp => try self.lowerClamp(bind_name, args),
             .checkPreimage => try self.lowerCheckPreimage(bind_name, args),
             .deserializeState => try self.lowerDeserializeState(bind_name, args),
+            .extractHashPrevouts, .extractLocktime, .extractOutpoint, .extractOutputHash => try self.lowerExtractor(bind_name, id, args),
+            .sign => try self.lowerSign(bind_name, args),
             .buildChangeOutput => try self.lowerBuildChangeOutput(bind_name, args),
-            .getStateScript, .buildStateOutput, .computeStateOutput => {
-                // No-op or handled elsewhere
-                try self.stack.push(self.allocator, bind_name);
-                self.trackDepth();
+            .getStateScript => try self.lowerGetStateScript(bind_name),
+            .buildStateOutput, .computeStateOutput => try self.lowerComputeStateOutput(bind_name, args),
+            .computeStateOutputHash => try self.lowerComputeStateOutputHash(bind_name, args),
+            .verifyRabinSig => try self.lowerCryptoBuiltin(bind_name, args, .verify_rabin_sig),
+            .verifyWOTS => {
+                const crypto_builtin = crypto_builtins.classify(call.name) orelse return LowerError.InvalidBuiltin;
+                try self.lowerPqBuiltin(bind_name, args, crypto_builtin);
+            },
+            .ecNegate => try self.lowerEcBuiltin(bind_name, args, .ec_negate),
+            .ecOnCurve => try self.lowerEcBuiltin(bind_name, args, .ec_on_curve),
+            .ecMulGen => try self.lowerEcBuiltin(bind_name, args, .ec_mul_gen),
+            .ecModReduce => try self.lowerCryptoBuiltin(bind_name, args, .ec_mod_reduce),
+            .ecEncodeCompressed => try self.lowerCryptoBuiltin(bind_name, args, .ec_encode_compressed),
+            .ecMakePoint => try self.lowerCryptoBuiltin(bind_name, args, .ec_make_point),
+            .ecPointX => try self.lowerCryptoBuiltin(bind_name, args, .ec_point_x),
+            .ecPointY => try self.lowerCryptoBuiltin(bind_name, args, .ec_point_y),
+            .ecAdd => try self.lowerEcBuiltin(bind_name, args, .ec_add),
+            .ecMul => try self.lowerEcBuiltin(bind_name, args, .ec_mul),
+            .blake3 => {
+                const crypto_builtin = crypto_builtins.classify(call.name) orelse return LowerError.InvalidBuiltin;
+                try self.lowerBlake3Builtin(bind_name, args, crypto_builtin);
+            },
+            .slhDsaVerify => {
+                const crypto_builtin = crypto_builtins.classify(call.name) orelse return LowerError.InvalidBuiltin;
+                try self.lowerPqBuiltin(bind_name, args, crypto_builtin);
             },
             // super() is the constructor superclass call — no-op in Bitcoin Script
             .super_call => {
@@ -746,7 +1235,7 @@ const LowerCtx = struct {
                 self.trackDepth();
             },
             // Wave 3 placeholders — consume args and push placeholder
-            .sha256Compress, .blake3, .ecAdd, .ecMul, .ecPairing, .slhDsaVerify, .schnorrVerify => {
+            .sha256Compress, .ecPairing, .schnorrVerify => {
                 for (args) |arg| {
                     try self.bringToTopAuto(arg);
                     _ = self.stack.pop();
@@ -756,6 +1245,178 @@ const LowerCtx = struct {
                 self.trackDepth();
             },
         }
+    }
+
+    fn lowerCryptoBuiltin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, builtin: crypto_builtins.CryptoBuiltin) LowerError!void {
+        if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
+
+        for (args) |arg| {
+            try self.bringToTopAuto(arg);
+        }
+        for (args) |_| {
+            _ = self.stack.pop();
+        }
+
+        var emitted: std.ArrayListUnmanaged(crypto_emitters.CryptoInstruction) = .empty;
+        defer emitted.deinit(self.allocator);
+        crypto_emitters.appendBuiltinInstructions(&emitted, self.allocator, builtin) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NotImplemented => return error.InvalidBuiltin,
+        };
+
+        for (emitted.items) |inst| {
+            switch (inst) {
+                .op_name => |name| {
+                    const opcode = opcodes.byName(name) orelse return LowerError.InvalidBuiltin;
+                    try self.emitOp(opcode);
+                },
+                .push_int => |n| try self.emitPushInt(n),
+                .push_data => |data| try self.emitPushData(data),
+            }
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerBlake3Builtin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, builtin: crypto_builtins.CryptoBuiltin) LowerError!void {
+        const blake_builtin = switch (builtin) {
+            .blake3_compress => blake3_emitters.Blake3Builtin.compress,
+            .blake3_hash => blake3_emitters.Blake3Builtin.hash,
+            .blake3 => blake3_emitters.Blake3Builtin.blake3,
+            else => return LowerError.InvalidBuiltin,
+        };
+        if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
+
+        for (args) |arg| {
+            try self.bringToTopAuto(arg);
+        }
+        for (args) |_| {
+            _ = self.stack.pop();
+        }
+
+        var emitted: std.ArrayListUnmanaged(blake3_emitters.Blake3Instruction) = .empty;
+        defer emitted.deinit(self.allocator);
+        blake3_emitters.appendBuiltinInstructions(&emitted, self.allocator, blake_builtin) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidBuiltin,
+        };
+
+        for (emitted.items) |inst| {
+            switch (inst) {
+                .op_name => |name| {
+                    const opcode = opcodes.byName(name) orelse return LowerError.InvalidBuiltin;
+                    try self.emitOp(opcode);
+                },
+                .push_int => |n| try self.emitPushInt(n),
+                .push_data => |data| try self.emitPushData(data),
+            }
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerPqBuiltin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, builtin: crypto_builtins.CryptoBuiltin) LowerError!void {
+        if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
+
+        for (args) |arg| {
+            try self.bringToTopAuto(arg);
+        }
+        for (args) |_| {
+            _ = self.stack.pop();
+        }
+
+        var emitted: std.ArrayListUnmanaged(pq_emitters.CryptoInstruction) = .empty;
+        defer emitted.deinit(self.allocator);
+        pq_emitters.appendBuiltinInstructions(&emitted, self.allocator, builtin) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidBuiltin,
+        };
+
+        for (emitted.items) |inst| {
+            switch (inst) {
+                .op_name => |name| {
+                    const opcode = opcodes.byName(name) orelse return LowerError.InvalidBuiltin;
+                    try self.emitOp(opcode);
+                },
+                .push_int => |n| try self.emitPushInt(n),
+                .push_data => |data| try self.emitPushData(data),
+            }
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn emitEcStackOp(self: *LowerCtx, op: ec_emitters.StackOp) LowerError!void {
+        switch (op) {
+            .push => |value| switch (value) {
+                .bytes => |bytes| {
+                    const owned = try self.allocator.dupe(u8, bytes);
+                    try self.emitOwnedPushData(owned);
+                },
+                .integer => |n| try self.emitPushInt(n),
+                .boolean => |b| try self.emitPushBool(b),
+            },
+            .dup => try self.emitOp(.op_dup),
+            .swap => try self.emitOp(.op_swap),
+            .drop => try self.emitOp(.op_drop),
+            .nip => try self.emitOp(.op_nip),
+            .over => try self.emitOp(.op_over),
+            .rot => try self.emitOp(.op_rot),
+            .tuck => try self.emitOp(.op_tuck),
+            .roll => |depth| {
+                try self.emitPushInt(@intCast(depth));
+                try self.emitOp(.op_roll);
+            },
+            .pick => |depth| {
+                try self.emitPushInt(@intCast(depth));
+                try self.emitOp(.op_pick);
+            },
+            .opcode => |name| {
+                const opcode = opcodes.byName(name) orelse return LowerError.InvalidBuiltin;
+                try self.emitOp(opcode);
+            },
+            .@"if" => |stack_if| {
+                try self.emitOp(.op_if);
+                for (stack_if.then) |then_op| {
+                    try self.emitEcStackOp(then_op);
+                }
+                if (stack_if.@"else") |else_ops| {
+                    try self.emitOp(.op_else);
+                    for (else_ops) |else_op| {
+                        try self.emitEcStackOp(else_op);
+                    }
+                }
+                try self.emitOp(.op_endif);
+            },
+        }
+    }
+
+    fn lowerEcBuiltin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, builtin: crypto_builtins.CryptoBuiltin) LowerError!void {
+        if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
+
+        for (args) |arg| {
+            try self.bringToTopAuto(arg);
+        }
+        for (args) |_| {
+            _ = self.stack.pop();
+        }
+
+        var bundle = ec_emitters.buildBuiltinOps(self.allocator, builtin) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedBuiltin => return error.InvalidBuiltin,
+            else => return error.UnsupportedOperation,
+        };
+        defer bundle.deinit();
+
+        for (bundle.ops) |op| {
+            try self.emitEcStackOp(op);
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
     }
 
     // ========================================================================
@@ -876,13 +1537,11 @@ const LowerCtx = struct {
         try self.bringToTopAuto(args[0]);
         try self.bringToTopAuto(args[1]);
         try self.emitOp(.op_dup);
-        try self.emitPushInt(0);
-        try self.emitOp(.op_numequal);
-        try self.emitOp(.op_not);
+        try self.emitOp(.op_0notequal);
         try self.emitOp(.op_verify);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
         try self.emitOp(final_op);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
     }
@@ -897,72 +1556,27 @@ const LowerCtx = struct {
 
     fn lowerPow(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]); // base
-        try self.bringToTopAuto(args[1]); // exp
+        try self.bringToTopAuto(args[0]);
+        try self.bringToTopAuto(args[1]);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
 
-        // Handle exp==0 => 1, exp==1 => base, else binary exponentiation (30 iterations)
-        try self.emitOp(.op_dup);
-        try self.emitPushInt(0);
-        try self.emitOp(.op_numequal);
-        try self.emitOp(.op_if);
-        try self.emitOp(.op_2drop);
+        try self.emitOp(.op_swap);
         try self.emitPushInt(1);
-        try self.emitOp(.op_else);
-        try self.emitOp(.op_dup);
-        try self.emitPushInt(1);
-        try self.emitOp(.op_numequal);
-        try self.emitOp(.op_if);
-        try self.emitOp(.op_drop); // drop exp, leave base
-        try self.emitOp(.op_else);
-        // General case: stack is base exp. Set up acc=1 base exp
-        try self.emitOp(.op_swap); // exp base
-        try self.emitPushInt(1); // exp base 1
-        try self.emitOp(.op_swap); // exp 1 base
-        try self.emitOp(.op_rot); // 1 base exp
-
-        // 30 iterations of binary exponentiation
-        // Each iter: stack = acc base exp
         var iter: u32 = 0;
-        while (iter < 30) : (iter += 1) {
-            // acc base exp
-            try self.emitOp(.op_dup); // acc base exp exp
-            try self.emitPushInt(1);
-            try self.emitOp(.op_and); // acc base exp (exp&1)
-            try self.emitOp(.op_if);
-            // exp is odd: acc *= base
-            // Stack: acc base exp
-            try self.emitOp(.op_rot); // base exp acc
-            try self.emitOp(.op_rot); // exp acc base
-            try self.emitOp(.op_dup); // exp acc base base
-            try self.emitOp(.op_rot); // exp base base acc
-            try self.emitOp(.op_mul); // exp base (base*acc)
-            try self.emitOp(.op_rot); // base (base*acc) exp
-            try self.emitOp(.op_rot); // (base*acc) exp base
-            try self.emitOp(.op_swap); // (base*acc) base exp
-            try self.emitOp(.op_else);
-            try self.emitOp(.op_endif);
-            // Stack: acc base exp
-            // base = base * base
-            try self.emitOp(.op_swap); // acc exp base
-            try self.emitOp(.op_dup);
-            try self.emitOp(.op_mul); // acc exp (base^2)
-            try self.emitOp(.op_swap); // acc (base^2) exp
-            // exp >>= 1
+        while (iter < 32) : (iter += 1) {
             try self.emitPushInt(2);
-            try self.emitOp(.op_div); // acc (base^2) (exp/2)
-            // Reorder to acc base exp
-            try self.emitOp(.op_rot); // (base^2) (exp/2) acc
-            try self.emitOp(.op_rot); // (exp/2) acc (base^2)
-            try self.emitOp(.op_rot); // acc (base^2) (exp/2)
+            try self.emitOp(.op_pick);
+            try self.emitPushInt(iter);
+            try self.emitOp(.op_greaterthan);
+            try self.emitOp(.op_if);
+            try self.emitOp(.op_over);
+            try self.emitOp(.op_mul);
+            try self.emitOp(.op_endif);
         }
-        // Stack: acc base exp (exp should be 0)
-        try self.emitOp(.op_drop);
-        try self.emitOp(.op_drop);
-        try self.emitOp(.op_endif);
-        try self.emitOp(.op_endif);
+        try self.emitOp(.op_nip);
+        try self.emitOp(.op_nip);
 
-        _ = self.stack.pop();
-        _ = self.stack.pop();
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
     }
@@ -988,12 +1602,11 @@ const LowerCtx = struct {
         if (args.len < 2) return LowerError.InvalidBuiltin;
         try self.bringToTopAuto(args[0]);
         try self.bringToTopAuto(args[1]);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
         try self.emitOp(.op_mul);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
+        try self.emitPushInt(10000);
         try self.stack.push(self.allocator, null);
-        self.trackDepth();
-        try self.emitPushInt(100);
         try self.emitOp(.op_div);
         _ = self.stack.pop();
         try self.stack.push(self.allocator, bind_name);
@@ -1003,9 +1616,12 @@ const LowerCtx = struct {
     fn lowerSqrt(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 1) return LowerError.InvalidBuiltin;
         try self.bringToTopAuto(args[0]);
+        _ = self.stack.pop();
+        try self.emitOp(.op_dup);
+        try self.emitOp(.op_if);
         try self.emitOp(.op_dup);
         var iter: u32 = 0;
-        while (iter < 20) : (iter += 1) {
+        while (iter < 16) : (iter += 1) {
             try self.emitOp(.op_over);
             try self.emitOp(.op_over);
             try self.emitOp(.op_div);
@@ -1014,7 +1630,7 @@ const LowerCtx = struct {
             try self.emitOp(.op_div);
         }
         try self.emitOp(.op_nip);
-        _ = self.stack.pop();
+        try self.emitOp(.op_endif);
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
     }
@@ -1023,21 +1639,22 @@ const LowerCtx = struct {
         if (args.len < 2) return LowerError.InvalidBuiltin;
         try self.bringToTopAuto(args[0]);
         try self.bringToTopAuto(args[1]);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.emitOp(.op_abs);
+        try self.emitOp(.op_swap);
+        try self.emitOp(.op_abs);
+        try self.emitOp(.op_swap);
         var iter: u32 = 0;
-        while (iter < 30) : (iter += 1) {
+        while (iter < 256) : (iter += 1) {
             try self.emitOp(.op_dup);
+            try self.emitOp(.op_0notequal);
             try self.emitOp(.op_if);
-            try self.emitOp(.op_swap);
-            try self.emitOp(.op_over);
+            try self.emitOp(.op_tuck);
             try self.emitOp(.op_mod);
-            try self.emitOp(.op_else);
-            try self.emitOp(.op_drop);
-            try self.emitPushInt(0);
             try self.emitOp(.op_endif);
         }
         try self.emitOp(.op_drop);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
     }
@@ -1062,23 +1679,24 @@ const LowerCtx = struct {
     fn lowerLog2(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 1) return LowerError.InvalidBuiltin;
         try self.bringToTopAuto(args[0]);
+        _ = self.stack.pop();
         try self.emitPushInt(0);
-        try self.emitOp(.op_swap);
         var iter: u32 = 0;
-        while (iter < 32) : (iter += 1) {
+        while (iter < 64) : (iter += 1) {
+            try self.emitOp(.op_swap);
             try self.emitOp(.op_dup);
+            try self.emitPushInt(1);
+            try self.emitOp(.op_greaterthan);
             try self.emitOp(.op_if);
             try self.emitPushInt(2);
             try self.emitOp(.op_div);
             try self.emitOp(.op_swap);
             try self.emitOp(.op_1add);
             try self.emitOp(.op_swap);
-            try self.emitOp(.op_else);
             try self.emitOp(.op_endif);
+            try self.emitOp(.op_swap);
         }
-        try self.emitOp(.op_drop);
-        try self.emitOp(.op_1sub);
-        _ = self.stack.pop();
+        try self.emitOp(.op_nip);
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
     }
@@ -1100,14 +1718,27 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
+    fn lowerSign(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
+        if (args.len < 1) return LowerError.InvalidBuiltin;
+        try self.bringToTopAuto(args[0]);
+        _ = self.stack.pop();
+        try self.emitOp(.op_dup);
+        try self.emitOp(.op_if);
+        try self.emitOp(.op_dup);
+        try self.emitOp(.op_abs);
+        try self.emitOp(.op_swap);
+        try self.emitOp(.op_div);
+        try self.emitOp(.op_endif);
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
     fn lowerCheckPreimage(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 1) return LowerError.InvalidBuiltin;
         try self.emitOp(.op_codeseparator);
         try self.bringToTopAuto(args[0]);
-        const has_sig = self.stack.findDepth("_opPushTxSig") != null;
-        if (has_sig) {
-            try self.bringToTop("_opPushTxSig", true);
-        }
+        if (self.stack.findDepth("_opPushTxSig") == null) return LowerError.VariableNotFound;
+        try self.bringToTop("_opPushTxSig", true);
         try self.emitPushData(&generator_point_g);
         // Track the generator point in the stack map so pop accounting is correct
         try self.stack.push(self.allocator, null);
@@ -1115,56 +1746,589 @@ const LowerCtx = struct {
         // OP_CHECKSIGVERIFY consumes top 2 items (sig/txsig + pubkey/G)
         try self.emitOp(.op_checksigverify);
         _ = self.stack.pop(); // G (generator point)
-        if (has_sig) {
-            _ = self.stack.pop(); // _opPushTxSig
-            // preimage (args[0]) remains on stack — consumed by caller or used downstream
-        } else {
-            _ = self.stack.pop(); // args[0] consumed as sig when no _opPushTxSig
-        }
-        _ = bind_name;
+        _ = self.stack.pop(); // _opPushTxSig
+        // preimage (args[0]) remains on stack — consumed by caller or used downstream
+        try self.stack.renameAtDepth(self.allocator, 0, bind_name);
+        self.trackDepth();
     }
 
     fn lowerDeserializeState(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 1) return LowerError.InvalidBuiltin;
+        _ = bind_name;
+
+        var state_prop_count: usize = 0;
+        for (self.program.properties) |prop| {
+            if (!prop.readonly) state_prop_count += 1;
+        }
+        if (state_prop_count == 0) return;
+
+        var prop_sizes = std.ArrayListUnmanaged(i64).empty;
+        defer prop_sizes.deinit(self.allocator);
+        var total_state_len: i64 = 0;
+        for (self.program.properties) |prop| {
+            if (prop.readonly) continue;
+            const size = try statePropSize(prop);
+            try prop_sizes.append(self.allocator, size);
+            total_state_len += size;
+        }
+
         try self.bringToTopAuto(args[0]);
+
+        try self.emitPushInt(104);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_split);
         _ = self.stack.pop();
-        try self.stack.push(self.allocator, bind_name);
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_nip);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitOp(.op_size);
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(44);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_sub);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_split);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_drop);
+        _ = self.stack.pop();
+
+        try self.emitOp(.op_size);
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(8);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_sub);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_split);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_drop);
+        _ = self.stack.pop();
+
+        try self.emitOp(.op_size);
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(total_state_len);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_sub);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_split);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_nip);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        if (state_prop_count == 1) {
+            for (self.program.properties) |prop| {
+                if (prop.readonly) continue;
+                switch (prop.type_info) {
+                    .bigint, .boolean => try self.emitOp(.op_bin2num),
+                    else => {},
+                }
+                try self.stack.renameAtDepth(self.allocator, 0, prop.name);
+                self.trackDepth();
+                break;
+            }
+            return;
+        }
+
+        var state_index: usize = 0;
+        for (self.program.properties) |prop| {
+            if (prop.readonly) continue;
+            const size = prop_sizes.items[state_index];
+            const is_last_prop = state_index + 1 == state_prop_count;
+            state_index += 1;
+
+            if (!is_last_prop) {
+                try self.emitPushInt(size);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+
+                try self.emitOp(.op_swap);
+                const rest = self.stack.pop();
+                const prop_bytes = self.stack.pop();
+                try self.stack.push(self.allocator, rest);
+                try self.stack.push(self.allocator, prop_bytes);
+
+                switch (prop.type_info) {
+                    .bigint, .boolean => try self.emitOp(.op_bin2num),
+                    else => {},
+                }
+
+                try self.emitOp(.op_swap);
+                const prop_value = self.stack.pop();
+                const remainder = self.stack.pop();
+                try self.stack.push(self.allocator, prop_value);
+                try self.stack.push(self.allocator, remainder);
+                try self.stack.renameAtDepth(self.allocator, 1, prop.name);
+            } else {
+                switch (prop.type_info) {
+                    .bigint, .boolean => try self.emitOp(.op_bin2num),
+                    else => {},
+                }
+                try self.stack.renameAtDepth(self.allocator, 0, prop.name);
+            }
+        }
         self.trackDepth();
     }
 
     fn lowerBuildChangeOutput(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        // args: [changePKH, changeAmount]
-        try self.bringToTopAuto(args[1]); // changeAmount
+        try self.emitPushData(&stateful_templates.p2pkh_prefix_with_len);
+        try self.stack.push(self.allocator, null);
+        try self.bringToTopAuto(args[0]);
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitPushData(&stateful_templates.p2pkh_suffix);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.bringToTopAuto(args[1]);
         try self.emitPushInt(8);
+        try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
-        // Build P2PKH script: 76 a9 14 <pkh> 88 ac
-        try self.emitPushData(&.{ 0x76, 0xa9, 0x14 });
-        try self.bringToTopAuto(args[0]); // changePKH
-        try self.emitOp(.op_cat);
-        try self.emitPushData(&.{ 0x88, 0xac });
-        try self.emitOp(.op_cat);
-        // Varint prefix for 25-byte P2PKH script
-        try self.emitPushData(&.{0x19});
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
         try self.emitOp(.op_swap);
-        try self.emitOp(.op_cat);
-        // Combine satoshis + script
-        try self.emitOp(.op_swap);
+        const amount = self.stack.pop();
+        const script = self.stack.pop();
+        try self.stack.push(self.allocator, amount);
+        try self.stack.push(self.allocator, script);
         try self.emitOp(.op_cat);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
+    }
+
+    fn lowerGetStateScript(self: *LowerCtx, bind_name: []const u8) !void {
+        var state_prop_count: usize = 0;
+        for (self.program.properties) |prop| {
+            if (!prop.readonly) state_prop_count += 1;
+        }
+
+        if (state_prop_count == 0) {
+            try self.emitPushData("");
+            try self.stack.push(self.allocator, bind_name);
+            self.trackDepth();
+            return;
+        }
+
+        var first = true;
+        for (self.program.properties) |prop| {
+            if (prop.readonly) continue;
+
+            if (self.stack.findDepth(prop.name) != null) {
+                try self.bringToTop(prop.name, true);
+            } else if (prop.initial_value) |iv| {
+                switch (iv) {
+                    .boolean => |b| try self.emitPushBool(b),
+                    .integer => |n| try self.emitPushInt(@intCast(n)),
+                    .string => |s| try self.emitPushData(s),
+                }
+                try self.stack.push(self.allocator, null);
+            } else {
+                try self.emitPushInt(0);
+                try self.stack.push(self.allocator, null);
+            }
+
+            switch (prop.type_info) {
+                .bigint => {
+                    try self.emitPushInt(8);
+                    try self.stack.push(self.allocator, null);
+                    try self.emitOp(.op_num2bin);
+                    _ = self.stack.pop();
+                    _ = self.stack.pop();
+                    try self.stack.push(self.allocator, null);
+                },
+                .boolean => {
+                    try self.emitPushInt(1);
+                    try self.stack.push(self.allocator, null);
+                    try self.emitOp(.op_num2bin);
+                    _ = self.stack.pop();
+                    _ = self.stack.pop();
+                    try self.stack.push(self.allocator, null);
+                },
+                else => {},
+            }
+
+            if (!first) {
+                try self.emitOp(.op_cat);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+            }
+            first = false;
+        }
+
+        try self.stack.renameAtDepth(self.allocator, 0, bind_name);
+        self.trackDepth();
+    }
+
+    fn statePropSize(prop: types.ANFProperty) LowerError!i64 {
+        return switch (prop.type_info) {
+            .bigint => 8,
+            .boolean => 1,
+            .pub_key => 33,
+            .addr, .ripemd160 => 20,
+            .sha256 => 32,
+            .point => 64,
+            else => LowerError.UnsupportedOperation,
+        };
+    }
+
+    fn lowerComputeStateOutput(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
+        if (args.len < 3) return LowerError.InvalidBuiltin;
+
+        try self.bringToTopAuto(args[0]);
+        try self.emitOp(.op_drop);
+        _ = self.stack.pop();
+
+        try self.bringToTopAuto(args[2]);
+        try self.emitPushInt(8);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_num2bin);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_toaltstack);
+        _ = self.stack.pop();
+
+        try self.bringToTopAuto(args[1]);
+        try self.bringToTop("_codePart", false);
+
+        try self.emitPushData(&stateful_templates.op_return_byte);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitOp(.op_swap);
+        const code_part_with_op_return = self.stack.pop();
+        const state_bytes = self.stack.pop();
+        try self.stack.push(self.allocator, code_part_with_op_return);
+        try self.stack.push(self.allocator, state_bytes);
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitOp(.op_size);
+        try self.stack.push(self.allocator, null);
+        try self.emitVarintEncoding();
+
+        try self.emitOp(.op_swap);
+        const varint = self.stack.pop();
+        const script = self.stack.pop();
+        try self.stack.push(self.allocator, varint);
+        try self.stack.push(self.allocator, script);
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitOp(.op_fromaltstack);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_swap);
+        const script_with_len = self.stack.pop();
+        const new_amount = self.stack.pop();
+        try self.stack.push(self.allocator, new_amount);
+        try self.stack.push(self.allocator, script_with_len);
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerComputeStateOutputHash(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
+        if (args.len < 2) return LowerError.InvalidBuiltin;
+
+        try self.bringToTopAuto(args[1]);
+        try self.bringToTopAuto(args[0]);
+
+        try self.emitOp(.op_size);
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(52);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_sub);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_split);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_nip);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(8);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_split);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_drop);
+        _ = self.stack.pop();
+
+        try self.emitOp(.op_toaltstack);
+        _ = self.stack.pop();
+
+        try self.bringToTop("_codePart", false);
+        try self.emitPushData(&stateful_templates.op_return_byte);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitSwapTracked();
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitOp(.op_size);
+        try self.stack.push(self.allocator, null);
+        try self.emitVarintEncoding();
+
+        try self.emitSwapTracked();
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitOp(.op_fromaltstack);
+        try self.stack.push(self.allocator, null);
+        try self.emitSwapTracked();
+        try self.emitOp(.op_cat);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitOp(.op_hash256);
+        try self.stack.renameAtDepth(self.allocator, 0, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerExtractor(self: *LowerCtx, bind_name: []const u8, id: BuiltinId, args: []const []const u8) !void {
+        if (args.len < 1) return LowerError.InvalidBuiltin;
+        try self.bringToTopAuto(args[0]);
+        _ = self.stack.pop();
+
+        switch (id) {
+            .extractHashPrevouts => {
+                try self.emitPushInt(4);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_nip);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.emitPushInt(32);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_drop);
+                _ = self.stack.pop();
+            },
+            .extractOutpoint => {
+                try self.emitPushInt(68);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_nip);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.emitPushInt(36);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_drop);
+                _ = self.stack.pop();
+            },
+            .extractLocktime => {
+                try self.emitOp(.op_size);
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitPushInt(8);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_sub);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_nip);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.emitPushInt(4);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_drop);
+                _ = self.stack.pop();
+                try self.emitOp(.op_bin2num);
+            },
+            .extractOutputHash => {
+                try self.emitOp(.op_size);
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitPushInt(40);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_sub);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_nip);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.emitPushInt(32);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_drop);
+                _ = self.stack.pop();
+            },
+            else => return LowerError.InvalidBuiltin,
+        }
+
+        try self.stack.renameAtDepth(self.allocator, 0, bind_name);
+        self.trackDepth();
+    }
+
+    fn emitVarintEncoding(self: *LowerCtx) !void {
+        try self.emitOp(.op_dup);
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(253);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_lessthan);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+
+        try self.emitOp(.op_if);
+        _ = self.stack.pop();
+
+        try self.emitPushInt(2);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_num2bin);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(1);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_split);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_drop);
+        _ = self.stack.pop();
+
+        try self.emitOp(.op_else);
+
+        try self.emitPushInt(4);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_num2bin);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(2);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_split);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_drop);
+        _ = self.stack.pop();
+        try self.emitPushData(&.{0xfd});
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_swap);
+        const top = self.stack.pop();
+        const next = self.stack.pop();
+        try self.stack.push(self.allocator, top);
+        try self.stack.push(self.allocator, next);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.emitOp(.op_cat);
+        try self.stack.push(self.allocator, null);
+
+        try self.emitOp(.op_endif);
     }
 
     // ========================================================================
     // assert_op
     // ========================================================================
 
-    fn lowerAssertOp(self: *LowerCtx, bind_name: []const u8, a: types.ANFLegacyAssert) !void {
+    fn lowerAssertOp(self: *LowerCtx, bind_name: []const u8, a: types.ANFLegacyAssert, terminal: bool) !void {
         try self.bringToTopAuto(a.condition);
-        try self.emitOp(.op_verify);
-        _ = self.stack.pop();
+        if (!terminal) {
+            try self.emitOp(.op_verify);
+            _ = self.stack.pop();
+        }
         _ = bind_name;
     }
 
@@ -1175,81 +2339,188 @@ const LowerCtx = struct {
     fn lowerIfExpr(self: *LowerCtx, bind_name: []const u8, ie: *const types.ANFIfExpr) !void {
         try self.bringToTopAuto(ie.condition);
         _ = self.stack.pop();
-        try self.emitOp(.op_if);
-
-        // Save base stack for else branch
         var base_stack = try self.stack.clone(self.allocator);
         defer base_stack.deinit(self.allocator);
+        var pre_if_names = try self.stack.namedSlots(self.allocator);
+        defer pre_if_names.deinit(self.allocator);
 
-        const saved_in_branch = self.in_branch;
-        self.in_branch = true;
-
-        // -- Then branch --
-        if (ie.then_bindings.len > 0) {
-            const saved_lu = self.last_uses;
-            self.last_uses = .empty;
-            try self.computeLastUses(ie.then_bindings);
-            for (ie.then_bindings, 0..) |binding, idx| {
-                self.current_idx = idx;
-                try self.lowerBinding(binding);
+        var protected_refs: std.StringHashMapUnmanaged(void) = .empty;
+        defer protected_refs.deinit(self.allocator);
+        var last_use_it = self.last_uses.iterator();
+        while (last_use_it.next()) |entry| {
+            if (entry.value_ptr.* > self.current_idx and self.stack.findDepth(entry.key_ptr.*) != null) {
+                try protected_refs.put(self.allocator, entry.key_ptr.*, {});
             }
-            self.last_uses.deinit(self.allocator);
-            self.last_uses = saved_lu;
         }
 
-        // Save then stack state for reconciliation
-        const then_depth = self.stack.depth();
-        const then_top_name = if (then_depth > 0) self.stack.peekAtDepth(0) else null;
+        var then_ctx = LowerCtx.init(self.allocator, self.program);
+        defer then_ctx.deinit();
+        then_ctx.stack = try base_stack.clone(self.allocator);
+        then_ctx.updated_props = try cloneVoidMap(self.allocator, self.updated_props);
+        then_ctx.force_copy_bindings = try cloneVoidMap(self.allocator, self.force_copy_bindings);
+        then_ctx.in_branch = true;
+        then_ctx.copy_ref_aliases = self.copy_ref_aliases;
+        then_ctx.max_depth = self.max_depth;
+        for (ie.then_bindings) |binding| {
+            try then_ctx.local_bindings.put(self.allocator, binding.name, {});
+        }
+        try then_ctx.computeLastUses(ie.then_bindings);
+        var protected_then = protected_refs.iterator();
+        while (protected_then.next()) |entry| {
+            try then_ctx.last_uses.put(self.allocator, entry.key_ptr.*, ie.then_bindings.len);
+        }
+        for (ie.then_bindings, 0..) |binding, idx| {
+            then_ctx.current_idx = idx;
+            try then_ctx.lowerBinding(binding);
+        }
 
-        try self.emitOp(.op_else);
+        var else_ctx = LowerCtx.init(self.allocator, self.program);
+        defer else_ctx.deinit();
+        else_ctx.stack = try base_stack.clone(self.allocator);
+        else_ctx.updated_props = try cloneVoidMap(self.allocator, self.updated_props);
+        else_ctx.force_copy_bindings = try cloneVoidMap(self.allocator, self.force_copy_bindings);
+        else_ctx.in_branch = true;
+        else_ctx.copy_ref_aliases = self.copy_ref_aliases;
+        else_ctx.max_depth = self.max_depth;
+        const else_bindings = ie.else_bindings orelse &.{};
+        for (else_bindings) |binding| {
+            try else_ctx.local_bindings.put(self.allocator, binding.name, {});
+        }
+        try else_ctx.computeLastUses(else_bindings);
+        var protected_else = protected_refs.iterator();
+        while (protected_else.next()) |entry| {
+            try else_ctx.last_uses.put(self.allocator, entry.key_ptr.*, else_bindings.len);
+        }
+        for (else_bindings, 0..) |binding, idx| {
+            else_ctx.current_idx = idx;
+            try else_ctx.lowerBinding(binding);
+        }
 
-        // -- Else branch: restore base stack --
-        self.stack.deinit(self.allocator);
-        self.stack = try base_stack.clone(self.allocator);
+        var post_then_names = try then_ctx.stack.namedSlots(self.allocator);
+        defer post_then_names.deinit(self.allocator);
+        var post_else_names = try else_ctx.stack.namedSlots(self.allocator);
+        defer post_else_names.deinit(self.allocator);
 
-        if (ie.else_bindings) |else_bindings| {
-            if (else_bindings.len > 0) {
-                const saved_lu2 = self.last_uses;
-                self.last_uses = .empty;
-                try self.computeLastUses(else_bindings);
-                for (else_bindings, 0..) |binding, idx| {
-                    self.current_idx = idx;
-                    try self.lowerBinding(binding);
+        var consumed_depths = std.ArrayListUnmanaged(usize).empty;
+        defer consumed_depths.deinit(self.allocator);
+        var pre_it = pre_if_names.iterator();
+        while (pre_it.next()) |entry| {
+            if (post_then_names.get(entry.key_ptr.*) == null) {
+                if (else_ctx.stack.findDepth(entry.key_ptr.*)) |depth| {
+                    try consumed_depths.append(self.allocator, depth);
                 }
-                self.last_uses.deinit(self.allocator);
-                self.last_uses = saved_lu2;
             }
         }
 
-        const else_depth = self.stack.depth();
-        const else_top_name = if (else_depth > 0) self.stack.peekAtDepth(0) else null;
+        var else_consumed_depths = std.ArrayListUnmanaged(usize).empty;
+        defer else_consumed_depths.deinit(self.allocator);
+        pre_it = pre_if_names.iterator();
+        while (pre_it.next()) |entry| {
+            if (post_else_names.get(entry.key_ptr.*) == null) {
+                if (then_ctx.stack.findDepth(entry.key_ptr.*)) |depth| {
+                    try else_consumed_depths.append(self.allocator, depth);
+                }
+            }
+        }
 
-        // Phase 3: Balance stack depth between branches.
-        // Bitcoin Script requires identical stack state after OP_IF/OP_ELSE/OP_ENDIF
-        // regardless of which branch executes. A mismatch means one path leaves
-        // extra items (or too few) — the script will fail at runtime or, worse,
-        // silently misinterpret stack positions, risking fund loss.
-        if (then_depth != else_depth) {
+        std.mem.sort(usize, consumed_depths.items, {}, comptime std.sort.desc(usize));
+        for (consumed_depths.items) |depth| {
+            try removeBranchValueAtDepth(&else_ctx, depth);
+        }
+        std.mem.sort(usize, else_consumed_depths.items, {}, comptime std.sort.desc(usize));
+        for (else_consumed_depths.items) |depth| {
+            try removeBranchValueAtDepth(&then_ctx, depth);
+        }
+
+        if (then_ctx.stack.depth() > else_ctx.stack.depth()) {
+            const then_top = then_ctx.stack.peekAtDepth(0);
+            if (else_bindings.len == 0 and then_top != null) {
+                if (else_ctx.stack.findDepth(then_top.?)) |var_depth| {
+                    try duplicateBranchValueAtDepth(&else_ctx, var_depth, then_top);
+                } else {
+                    try else_ctx.emitPushData("");
+                    try else_ctx.stack.push(self.allocator, null);
+                    else_ctx.trackDepth();
+                }
+            } else {
+                try else_ctx.emitPushData("");
+                try else_ctx.stack.push(self.allocator, null);
+                else_ctx.trackDepth();
+            }
+        } else if (else_ctx.stack.depth() > then_ctx.stack.depth()) {
+            try then_ctx.emitPushData("");
+            try then_ctx.stack.push(self.allocator, null);
+            then_ctx.trackDepth();
+        }
+
+        if (then_ctx.stack.depth() != else_ctx.stack.depth()) {
             return LowerError.BranchStackMismatch;
         }
 
-        // Verify top-of-stack names are consistent between branches.
-        // Both branches should produce compatible named results.
-        if (then_top_name != null and else_top_name != null) {
-            // Both branches have named tops — they should match for the binding
-            // to be meaningful. We don't error here because the rename below
-            // will unify them under bind_name anyway.
-        } else if (then_top_name == null and else_top_name == null) {
-            // Both anonymous — fine
+        try self.emitOp(.op_if);
+        try self.appendInstructions(then_ctx.instructions.items);
+        if (else_ctx.instructions.items.len > 0) {
+            try self.emitOp(.op_else);
+            try self.appendInstructions(else_ctx.instructions.items);
         }
-        // Mixed named/null is acceptable: the rename below normalizes it.
-
-        self.in_branch = saved_in_branch;
         try self.emitOp(.op_endif);
 
-        if (self.stack.depth() > 0) {
-            self.stack.renameAtDepth(0, bind_name);
+        var post_branch_names = try then_ctx.stack.namedSlots(self.allocator);
+        defer post_branch_names.deinit(self.allocator);
+        pre_it = pre_if_names.iterator();
+        while (pre_it.next()) |entry| {
+            if (post_branch_names.get(entry.key_ptr.*) == null) {
+                if (self.stack.findDepth(entry.key_ptr.*)) |depth| {
+                    try self.stack.removeAtDepth(self.allocator, depth);
+                }
+            }
         }
+
+        if (then_ctx.stack.depth() > self.stack.depth()) {
+            const then_top = then_ctx.stack.peekAtDepth(0);
+            const else_top = else_ctx.stack.peekAtDepth(0);
+            var is_property = false;
+            if (then_top) |top_name| {
+                for (self.program.properties) |prop| {
+                    if (std.mem.eql(u8, prop.name, top_name)) {
+                        is_property = true;
+                        break;
+                    }
+                }
+            }
+
+            if (then_top != null and is_property and else_top != null and std.mem.eql(u8, then_top.?, else_top.?) and !std.mem.eql(u8, then_top.?, bind_name) and self.stack.findDepth(then_top.?) != null) {
+                try self.stack.push(self.allocator, then_top.?);
+                var d: usize = 1;
+                while (d < self.stack.depth()) : (d += 1) {
+                    if (self.stack.peekAtDepth(d)) |name| {
+                        if (std.mem.eql(u8, name, then_top.?)) {
+                            try removeBranchValueAtDepth(self, d);
+                            break;
+                        }
+                    }
+                }
+            } else if (then_top != null and !is_property and else_bindings.len == 0 and !std.mem.eql(u8, then_top.?, bind_name) and self.stack.findDepth(then_top.?) != null) {
+                try self.stack.push(self.allocator, then_top.?);
+                var d: usize = 1;
+                while (d < self.stack.depth()) : (d += 1) {
+                    if (self.stack.peekAtDepth(d)) |name| {
+                        if (std.mem.eql(u8, name, then_top.?)) {
+                            try removeBranchValueAtDepth(self, d);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                try self.stack.push(self.allocator, bind_name);
+            }
+        } else if (else_ctx.stack.depth() > self.stack.depth()) {
+            try self.stack.push(self.allocator, bind_name);
+        }
+        self.trackDepth();
+
+        if (then_ctx.max_depth > self.max_depth) self.max_depth = then_ctx.max_depth;
+        if (else_ctx.max_depth > self.max_depth) self.max_depth = else_ctx.max_depth;
     }
 
     // ========================================================================
@@ -1257,6 +2528,53 @@ const LowerCtx = struct {
     // ========================================================================
 
     fn lowerForLoop(self: *LowerCtx, bind_name: []const u8, fl: *const types.ANFForLoop) !void {
+        var body_binding_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer body_binding_names.deinit(self.allocator);
+        for (fl.body_bindings) |binding| {
+            try body_binding_names.put(self.allocator, binding.name, {});
+        }
+
+        var outer_refs: std.StringHashMapUnmanaged(void) = .empty;
+        defer outer_refs.deinit(self.allocator);
+        for (fl.body_bindings) |binding| {
+            switch (binding.value) {
+                .load_param => |lp| {
+                    if (!std.mem.eql(u8, lp.name, fl.var_name)) {
+                        try outer_refs.put(self.allocator, lp.name, {});
+                    }
+                },
+                .load_const => |lc| {
+                    switch (lc.value) {
+                        .string => |s| {
+                            if (std.mem.startsWith(u8, s, "@ref:")) {
+                                const ref_name = s[5..];
+                                if (!body_binding_names.contains(ref_name)) {
+                                    try outer_refs.put(self.allocator, ref_name, {});
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                },
+                else => {},
+            }
+        }
+
+        const saved_local_bindings = self.local_bindings;
+        const saved_force_copy_bindings = self.force_copy_bindings;
+        self.local_bindings = try cloneVoidMap(self.allocator, saved_local_bindings);
+        self.force_copy_bindings = try cloneVoidMap(self.allocator, saved_force_copy_bindings);
+        defer {
+            self.local_bindings.deinit(self.allocator);
+            self.local_bindings = saved_local_bindings;
+            self.force_copy_bindings.deinit(self.allocator);
+            self.force_copy_bindings = saved_force_copy_bindings;
+        }
+        var body_name_it = body_binding_names.iterator();
+        while (body_name_it.next()) |entry| {
+            try self.local_bindings.put(self.allocator, entry.key_ptr.*, {});
+        }
+
         var i: i64 = fl.init_val;
         while (i < fl.bound) : (i += 1) {
             try self.emitPushInt(i);
@@ -1266,6 +2584,12 @@ const LowerCtx = struct {
             const saved_lu = self.last_uses;
             self.last_uses = .empty;
             try self.computeLastUses(fl.body_bindings);
+            if (i < fl.bound - 1) {
+                var outer_it = outer_refs.iterator();
+                while (outer_it.next()) |entry| {
+                    try self.last_uses.put(self.allocator, entry.key_ptr.*, fl.body_bindings.len);
+                }
+            }
             for (fl.body_bindings, 0..) |binding, idx| {
                 self.current_idx = idx;
                 try self.lowerBinding(binding);
@@ -1278,18 +2602,11 @@ const LowerCtx = struct {
                 if (d == 0) {
                     try self.emitOp(.op_drop);
                     _ = self.stack.pop();
-                } else {
-                    try self.emitPushInt(@intCast(d));
-                    try self.emitOp(.op_roll);
-                    try self.emitOp(.op_drop);
-                    self.stack.removeAtDepth(d);
                 }
             }
         }
 
-        if (self.stack.depth() > 0) {
-            self.stack.renameAtDepth(0, bind_name);
-        }
+        _ = bind_name;
     }
 
     // ========================================================================
@@ -1297,48 +2614,74 @@ const LowerCtx = struct {
     // ========================================================================
 
     fn lowerAddOutput(self: *LowerCtx, bind_name: []const u8, ao: types.ANFAddOutput) !void {
-        // Get _codePart
-        if (self.stack.findDepth("_codePart")) |_| {
-            try self.bringToTop("_codePart", false);
-        } else {
-            try self.emitPushData(&.{});
-            try self.stack.push(self.allocator, null);
-            self.trackDepth();
+        var state_prop_count: usize = 0;
+        for (self.program.properties) |prop| {
+            if (!prop.readonly) state_prop_count += 1;
         }
 
-        // CAT each state reference
-        for (ao.state_refs) |state_ref| {
-            try self.bringToTopAuto(state_ref);
-            try self.emitOp(.op_cat);
-            _ = self.stack.pop();
-            _ = self.stack.pop();
-            try self.stack.push(self.allocator, null);
-            self.trackDepth();
-        }
-
-        // OP_RETURN separator
+        try self.bringToTop("_codePart", false);
         try self.emitPushData(&.{0x6a});
+        try self.stack.push(self.allocator, null);
         try self.emitOp(.op_cat);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
         self.trackDepth();
 
-        // Script length varint
-        try self.emitOp(.op_dup);
+        var state_index: usize = 0;
+        for (self.program.properties) |prop| {
+            if (prop.readonly) continue;
+            if (state_index >= ao.state_values.len or state_index >= state_prop_count) break;
+            const value_ref = ao.state_values[state_index];
+            state_index += 1;
+
+            try self.bringToTopAuto(value_ref);
+            switch (prop.type_info) {
+                .bigint => {
+                    try self.emitPushInt(8);
+                    try self.stack.push(self.allocator, null);
+                    try self.emitOp(.op_num2bin);
+                    _ = self.stack.pop();
+                },
+                .boolean => {
+                    try self.emitPushInt(1);
+                    try self.stack.push(self.allocator, null);
+                    try self.emitOp(.op_num2bin);
+                    _ = self.stack.pop();
+                },
+                else => {},
+            }
+
+            _ = self.stack.pop();
+            _ = self.stack.pop();
+            try self.emitOp(.op_cat);
+            try self.stack.push(self.allocator, null);
+        }
+
         try self.emitOp(.op_size);
-        try self.emitOp(.op_nip);
+        try self.stack.push(self.allocator, null);
+        try self.emitVarintEncoding();
         try self.emitOp(.op_swap);
+        const script_len = self.stack.pop();
+        const script = self.stack.pop();
+        try self.stack.push(self.allocator, script_len);
+        try self.stack.push(self.allocator, script);
         try self.emitOp(.op_cat);
+        _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
         self.trackDepth();
 
-        // Satoshis as 8-byte LE
         try self.bringToTopAuto(ao.satoshis);
         try self.emitPushInt(8);
+        try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
+        _ = self.stack.pop();
         try self.emitOp(.op_swap);
+        const satoshis = self.stack.pop();
+        const script_with_len = self.stack.pop();
+        try self.stack.push(self.allocator, satoshis);
+        try self.stack.push(self.allocator, script_with_len);
         try self.emitOp(.op_cat);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -1348,19 +2691,30 @@ const LowerCtx = struct {
 
     fn lowerAddRawOutput(self: *LowerCtx, bind_name: []const u8, aro: types.ANFAddRawOutput) !void {
         try self.bringToTopAuto(aro.script_ref);
-        try self.emitOp(.op_dup);
         try self.emitOp(.op_size);
-        try self.emitOp(.op_nip);
+        try self.stack.push(self.allocator, null);
+        try self.emitVarintEncoding();
         try self.emitOp(.op_swap);
+        const script_len = self.stack.pop();
+        const script = self.stack.pop();
+        try self.stack.push(self.allocator, script_len);
+        try self.stack.push(self.allocator, script);
         try self.emitOp(.op_cat);
+        _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
         self.trackDepth();
 
         try self.bringToTopAuto(aro.satoshis);
         try self.emitPushInt(8);
+        try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
+        _ = self.stack.pop();
         try self.emitOp(.op_swap);
+        const satoshis = self.stack.pop();
+        const script_with_len = self.stack.pop();
+        try self.stack.push(self.allocator, satoshis);
+        try self.stack.push(self.allocator, script_with_len);
         try self.emitOp(.op_cat);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -1392,12 +2746,13 @@ pub fn lower(allocator: Allocator, program: types.ANFProgram) !types.StackProgra
 
     var methods = std.ArrayListUnmanaged(types.StackMethod).empty;
     defer methods.deinit(allocator);
+    var owned_push_data = std.ArrayListUnmanaged([]u8).empty;
+    defer owned_push_data.deinit(allocator);
 
     if (needs_dispatch) {
         var ctx = LowerCtx.init(allocator, program);
         defer ctx.deinit();
 
-        try setupPropertyStack(&ctx, program);
         try emitDispatchTable(&ctx, program);
 
         const instructions = try allocator.dupe(types.StackInstruction, ctx.instructions.items);
@@ -1406,18 +2761,28 @@ pub fn lower(allocator: Allocator, program: types.ANFProgram) !types.StackProgra
             .instructions = instructions,
             .max_stack_depth = ctx.max_depth,
         });
+        try owned_push_data.appendSlice(allocator, ctx.owned_push_data.items);
+        ctx.owned_push_data.deinit(allocator);
+        ctx.owned_push_data = .empty;
     } else {
         for (program.methods) |method| {
+            if (!method.is_public) continue;
+
             var ctx = LowerCtx.init(allocator, program);
             defer ctx.deinit();
 
             try setupMethodStack(&ctx, program, method);
+            ctx.copy_ref_aliases = false;
 
             // Use body or bindings (whichever is populated)
             const bindings = if (method.body.len > 0) method.body else method.bindings;
-            try ctx.lowerBindings(bindings);
-
-            try ctx.emitOp(.op_1); // OP_TRUE
+            try ctx.lowerBindings(bindings, method.is_public);
+            if (method.is_public and methodUsesDeserializeState(bindings)) {
+                try ctx.cleanupExcessStack();
+            }
+            if (!method.is_public or !endsWithAssert(bindings)) {
+                try ctx.emitOp(.op_1);
+            }
 
             const instructions = try allocator.dupe(types.StackInstruction, ctx.instructions.items);
             try methods.append(allocator, .{
@@ -1425,6 +2790,9 @@ pub fn lower(allocator: Allocator, program: types.ANFProgram) !types.StackProgra
                 .instructions = instructions,
                 .max_stack_depth = ctx.max_depth,
             });
+            try owned_push_data.appendSlice(allocator, ctx.owned_push_data.items);
+            ctx.owned_push_data.deinit(allocator);
+            ctx.owned_push_data = .empty;
         }
     }
 
@@ -1433,6 +2801,7 @@ pub fn lower(allocator: Allocator, program: types.ANFProgram) !types.StackProgra
         .contract_name = program.contract_name,
         .properties = program.properties,
         .constructor_params = program.constructor.params,
+        .owned_push_data = try allocator.dupe([]u8, owned_push_data.items),
     };
 }
 
@@ -1446,21 +2815,7 @@ fn countPublicMethods(methods: []const types.ANFMethod) usize {
 
 fn usesOutputBuiltins(methods: []const types.ANFMethod) bool {
     for (methods) |method| {
-        const bindings = if (method.body.len > 0) method.body else method.bindings;
-        for (bindings) |binding| {
-            switch (binding.value) {
-                .add_output, .add_raw_output => return true,
-                .builtin_call => |call| {
-                    if (std.mem.eql(u8, call.name, "buildChangeOutput") or
-                        std.mem.eql(u8, call.name, "computeStateOutput") or
-                        std.mem.eql(u8, call.name, "buildStateOutput"))
-                    {
-                        return true;
-                    }
-                },
-                else => {},
-            }
-        }
+        if (methodUsesCodePart(methodBindings(method))) return true;
     }
     return false;
 }
@@ -1469,49 +2824,156 @@ fn isStateful(program: types.ANFProgram) bool {
     return program.parent_class == .stateful_smart_contract;
 }
 
-fn setupMethodStack(ctx: *LowerCtx, program: types.ANFProgram, method: types.ANFMethod) !void {
-    // Constructor params at the bottom (reverse order so first param is deepest)
-    var i: usize = program.constructor.params.len;
-    while (i > 0) {
-        i -= 1;
-        try ctx.stack.push(ctx.allocator, program.constructor.params[i].name);
-    }
-    ctx.trackDepth();
+fn setupMethodStack(ctx: *LowerCtx, _: types.ANFProgram, method: types.ANFMethod) !void {
+    const bindings = methodBindings(method);
 
-    if (isStateful(program)) {
+    if (methodUsesCodePart(bindings)) {
+        try ctx.stack.push(ctx.allocator, "_codePart");
+        ctx.trackDepth();
+    }
+
+    if (methodUsesCheckPreimage(bindings)) {
         try ctx.stack.push(ctx.allocator, "_opPushTxSig");
         ctx.trackDepth();
-        if (usesOutputBuiltins(program.methods)) {
-            try ctx.stack.push(ctx.allocator, "_codePart");
-            ctx.trackDepth();
-        }
     }
 
-    // Method parameters
-    i = method.params.len;
-    while (i > 0) {
-        i -= 1;
-        try ctx.stack.push(ctx.allocator, method.params[i].name);
+    for (method.params) |param| {
+        try ctx.stack.push(ctx.allocator, param.name);
     }
     ctx.trackDepth();
 }
 
 fn setupPropertyStack(ctx: *LowerCtx, program: types.ANFProgram) !void {
-    var i: usize = program.constructor.params.len;
-    while (i > 0) {
-        i -= 1;
-        try ctx.stack.push(ctx.allocator, program.constructor.params[i].name);
-    }
-    ctx.trackDepth();
+    _ = ctx;
+    _ = program;
+}
 
-    if (isStateful(program)) {
-        try ctx.stack.push(ctx.allocator, "_opPushTxSig");
-        ctx.trackDepth();
-        if (usesOutputBuiltins(program.methods)) {
-            try ctx.stack.push(ctx.allocator, "_codePart");
-            ctx.trackDepth();
+fn methodBindings(method: types.ANFMethod) []const types.ANFBinding {
+    return if (method.body.len > 0) method.body else method.bindings;
+}
+
+fn endsWithAssert(bindings: []const types.ANFBinding) bool {
+    if (bindings.len == 0) return false;
+    return switch (bindings[bindings.len - 1].value) {
+        .assert, .assert_op => true,
+        else => false,
+    };
+}
+
+fn anyMethodUsesCheckPreimage(methods: []const types.ANFMethod) bool {
+    for (methods) |method| {
+        if (method.is_public and methodUsesCheckPreimage(methodBindings(method))) return true;
+    }
+    return false;
+}
+
+fn anyMethodUsesCodePart(methods: []const types.ANFMethod) bool {
+    for (methods) |method| {
+        if (method.is_public and methodUsesCodePart(methodBindings(method))) return true;
+    }
+    return false;
+}
+
+fn methodUsesCheckPreimage(bindings: []const types.ANFBinding) bool {
+    for (bindings) |binding| {
+        switch (binding.value) {
+            .check_preimage => return true,
+            .@"if" => |ie| {
+                if (methodUsesCheckPreimage(ie.then) or methodUsesCheckPreimage(ie.@"else")) return true;
+            },
+            .if_expr => |ie| {
+                if (methodUsesCheckPreimage(ie.then_bindings)) return true;
+                if (ie.else_bindings) |else_bindings| {
+                    if (methodUsesCheckPreimage(else_bindings)) return true;
+                }
+            },
+            .loop => |loop| {
+                if (methodUsesCheckPreimage(loop.body)) return true;
+            },
+            .for_loop => |loop| {
+                if (methodUsesCheckPreimage(loop.body_bindings)) return true;
+            },
+            else => {},
         }
     }
+    return false;
+}
+
+fn methodUsesCodePart(bindings: []const types.ANFBinding) bool {
+    for (bindings) |binding| {
+        switch (binding.value) {
+            .add_output, .add_raw_output => return true,
+            .call => |call| {
+                if (std.mem.eql(u8, call.func, "computeStateOutput") or
+                    std.mem.eql(u8, call.func, "computeStateOutputHash") or
+                    std.mem.eql(u8, call.func, "buildChangeOutput") or
+                    std.mem.eql(u8, call.func, "buildStateOutput"))
+                {
+                    return true;
+                }
+            },
+            .builtin_call => |call| {
+                if (std.mem.eql(u8, call.name, "computeStateOutput") or
+                    std.mem.eql(u8, call.name, "computeStateOutputHash") or
+                    std.mem.eql(u8, call.name, "buildChangeOutput") or
+                    std.mem.eql(u8, call.name, "buildStateOutput"))
+                {
+                    return true;
+                }
+            },
+            .@"if" => |ie| {
+                if (methodUsesCodePart(ie.then) or methodUsesCodePart(ie.@"else")) return true;
+            },
+            .if_expr => |ie| {
+                if (methodUsesCodePart(ie.then_bindings)) return true;
+                if (ie.else_bindings) |else_bindings| {
+                    if (methodUsesCodePart(else_bindings)) return true;
+                }
+            },
+            .loop => |loop| {
+                if (methodUsesCodePart(loop.body)) return true;
+            },
+            .for_loop => |loop| {
+                if (methodUsesCodePart(loop.body_bindings)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn findPrivateMethod(methods: []const types.ANFMethod, name: []const u8) ?types.ANFMethod {
+    for (methods) |method| {
+        if (method.is_public or std.mem.eql(u8, method.name, "constructor")) continue;
+        if (std.mem.eql(u8, method.name, name)) return method;
+    }
+    return null;
+}
+
+fn methodUsesDeserializeState(bindings: []const types.ANFBinding) bool {
+    for (bindings) |binding| {
+        switch (binding.value) {
+            .deserialize_state => return true,
+            .@"if" => |ie| {
+                if (methodUsesDeserializeState(ie.then)) return true;
+                if (methodUsesDeserializeState(ie.@"else")) return true;
+            },
+            .if_expr => |ie| {
+                if (methodUsesDeserializeState(ie.then_bindings)) return true;
+                if (ie.else_bindings) |else_bindings| {
+                    if (methodUsesDeserializeState(else_bindings)) return true;
+                }
+            },
+            .loop => |loop| {
+                if (methodUsesDeserializeState(loop.body)) return true;
+            },
+            .for_loop => |loop| {
+                if (methodUsesDeserializeState(loop.body_bindings)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn emitDispatchTable(ctx: *LowerCtx, program: types.ANFProgram) !void {
@@ -1532,6 +2994,23 @@ fn emitDispatchTable(ctx: *LowerCtx, program: types.ANFProgram) !void {
         const method = program.methods[method_idx];
         const bindings = if (method.body.len > 0) method.body else method.bindings;
 
+        const ensureMethodPrelude = struct {
+            fn apply(inner_ctx: *LowerCtx, inner_bindings: []const types.ANFBinding, inner_method: types.ANFMethod) !void {
+                if (methodUsesCodePart(inner_bindings) and inner_ctx.stack.findDepth("_codePart") == null) {
+                    try inner_ctx.stack.push(inner_ctx.allocator, "_codePart");
+                    inner_ctx.trackDepth();
+                }
+                if (methodUsesCheckPreimage(inner_bindings) and inner_ctx.stack.findDepth("_opPushTxSig") == null) {
+                    try inner_ctx.stack.push(inner_ctx.allocator, "_opPushTxSig");
+                    inner_ctx.trackDepth();
+                }
+                for (inner_method.params) |param| {
+                    try inner_ctx.stack.push(inner_ctx.allocator, param.name);
+                }
+                inner_ctx.trackDepth();
+            }
+        };
+
         if (pub_idx < last_pub) {
             try ctx.emitOp(.op_dup);
             try ctx.emitPushInt(@intCast(pub_idx));
@@ -1541,36 +3020,38 @@ fn emitDispatchTable(ctx: *LowerCtx, program: types.ANFProgram) !void {
 
             var branch_stack = try ctx.stack.clone(ctx.allocator);
             const saved_stack = ctx.stack;
+            const saved_force_copy_bindings = ctx.force_copy_bindings;
             ctx.stack = branch_stack;
+            ctx.force_copy_bindings = .empty;
+            try ensureMethodPrelude.apply(ctx, bindings, method);
 
-            var pi: usize = method.params.len;
-            while (pi > 0) {
-                pi -= 1;
-                try ctx.stack.push(ctx.allocator, method.params[pi].name);
+            try ctx.lowerBindings(bindings, method.is_public);
+            if (method.is_public and methodUsesDeserializeState(bindings)) {
+                try ctx.cleanupExcessStack();
             }
-            ctx.trackDepth();
-
-            try ctx.lowerBindings(bindings);
-            try ctx.emitOp(.op_1);
+            if (!endsWithAssert(bindings)) {
+                try ctx.emitOp(.op_1);
+            }
 
             branch_stack = ctx.stack;
             branch_stack.deinit(ctx.allocator);
             ctx.stack = saved_stack;
+            ctx.force_copy_bindings.deinit(ctx.allocator);
+            ctx.force_copy_bindings = saved_force_copy_bindings;
 
             try ctx.emitOp(.op_else);
         } else {
             try ctx.emitPushInt(@intCast(pub_idx));
             try ctx.emitOp(.op_numequalverify);
+            try ensureMethodPrelude.apply(ctx, bindings, method);
 
-            var pi: usize = method.params.len;
-            while (pi > 0) {
-                pi -= 1;
-                try ctx.stack.push(ctx.allocator, method.params[pi].name);
+            try ctx.lowerBindings(bindings, method.is_public);
+            if (method.is_public and methodUsesDeserializeState(bindings)) {
+                try ctx.cleanupExcessStack();
             }
-            ctx.trackDepth();
-
-            try ctx.lowerBindings(bindings);
-            try ctx.emitOp(.op_1);
+            if (!endsWithAssert(bindings)) {
+                try ctx.emitOp(.op_1);
+            }
         }
     }
 
@@ -1642,7 +3123,7 @@ test "stack map removeAtDepth" {
     try map.push(allocator, "b");
     try map.push(allocator, "c");
 
-    map.removeAtDepth(1);
+    try map.removeAtDepth(allocator, 1);
     try std.testing.expectEqual(@as(usize, 2), map.depth());
     try std.testing.expectEqual(@as(?usize, 0), map.findDepth("c"));
     try std.testing.expectEqual(@as(?usize, 1), map.findDepth("a"));
@@ -1655,7 +3136,7 @@ test "stack map renameAtDepth" {
     defer map.deinit(allocator);
 
     try map.push(allocator, "old");
-    map.renameAtDepth(0, "new");
+    try map.renameAtDepth(allocator, 0, "new");
     try std.testing.expectEqual(@as(?usize, null), map.findDepth("old"));
     try std.testing.expectEqual(@as(?usize, 0), map.findDepth("new"));
 }
@@ -1855,7 +3336,7 @@ test "lower simple P2PKH contract" {
         }
     }
     try std.testing.expect(found_checksig);
-    try std.testing.expect(found_verify);
+    try std.testing.expect(!found_verify);
 }
 
 test "lower arithmetic bindings" {
@@ -2148,6 +3629,58 @@ test "lower multi-method dispatch" {
     }
     try std.testing.expect(found_numequal);
     try std.testing.expect(found_numequalverify);
+}
+
+test "lower ecOnCurve preserves field prime pushdata" {
+    const allocator = std.testing.allocator;
+
+    const bindings = [_]types.ANFBinding{
+        .{
+            .name = "t0",
+            .value = .{ .call = .{
+                .func = "ecOnCurve",
+                .args = @constCast(&[_][]const u8{"pt"}),
+            } },
+        },
+        .{
+            .name = "t1",
+            .value = .{ .assert = .{ .value = "t0" } },
+        },
+    };
+
+    const method = types.ANFMethod{
+        .name = "check",
+        .is_public = true,
+        .params = @constCast(&[_]types.ANFParam{
+            .{ .name = "pt", .type_name = "Point" },
+        }),
+        .bindings = @constCast(&bindings),
+    };
+
+    const program = types.ANFProgram{
+        .contract_name = "ECTest",
+        .properties = &.{},
+        .methods = @constCast(&[_]types.ANFMethod{method}),
+    };
+
+    const result = try lower(allocator, program);
+    defer result.deinit(allocator);
+
+    var found = false;
+    for (result.methods[0].instructions) |inst| {
+        switch (inst) {
+            .push_data => |data| {
+                if (data.len != 33) continue;
+                if (data[0] != 0x2f or data[1] != 0xfc or data[2] != 0xff or data[3] != 0xff or data[4] != 0xfe) continue;
+                if (data[32] != 0x00) continue;
+                found = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(found);
 }
 
 // ============================================================================

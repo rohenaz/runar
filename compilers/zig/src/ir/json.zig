@@ -89,11 +89,24 @@ fn parseProperties(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]typ
     for (props_arr.items, 0..) |prop_val, i| {
         const prop_obj = prop_val.object;
         const type_str = try getString(prop_obj, "type");
+        const initial_value = if (prop_obj.get("initialValue")) |initial| switch (initial) {
+            .integer => |v| @as(?types.ConstValue, .{ .integer = v }),
+            .float => |f| blk: {
+                const int_val: i128 = @intFromFloat(f);
+                const roundtrip: f64 = @floatFromInt(int_val);
+                if (roundtrip != f) return ParseError.InvalidConstValue;
+                break :blk @as(?types.ConstValue, .{ .integer = int_val });
+            },
+            .bool => |b| @as(?types.ConstValue, .{ .boolean = b }),
+            .string => |s| @as(?types.ConstValue, .{ .string = try allocator.dupe(u8, s) }),
+            else => return ParseError.InvalidConstValue,
+        } else null;
         result[i] = .{
             .name = try allocator.dupe(u8, try getString(prop_obj, "name")),
             .type_name = try allocator.dupe(u8, type_str),
             .type_info = types.parseRunarType(type_str),
             .readonly = try getBool(prop_obj, "readonly"),
+            .initial_value = initial_value,
         };
     }
     return result;
@@ -536,7 +549,15 @@ fn writePropertiesArray(writer: anytype, properties: []const types.ANFProperty, 
         try writeIndent(writer, depth + 1);
         try writer.writeAll("{\n");
 
-        // Sorted keys: name, readonly, type
+        // Sorted keys: initialValue, name, readonly, type
+        if (prop.initial_value) |initial_value| {
+            try writeIndent(writer, depth + 2);
+            try writeJsonString(writer, "initialValue");
+            try writer.writeAll(": ");
+            try writeConstValue(writer, initial_value);
+            try writer.writeAll(",\n");
+        }
+
         try writeIndent(writer, depth + 2);
         try writeJsonString(writer, "name");
         try writer.writeAll(": ");

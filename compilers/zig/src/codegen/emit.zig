@@ -66,21 +66,33 @@ pub const EmitContext = struct {
         try self.emitOpcode(op);
     }
 
-    /// Emit raw bytes (push data) with proper encoding and ASM representation.
+    /// Emit raw bytes (push data) with TS-compatible minimal encoding for single-byte values.
     pub fn emitPushData(self: *EmitContext, data: []const u8) !void {
+        if (data.len == 0) {
+            try self.emitOpcode(.op_0);
+            return;
+        }
+
+        if (data.len == 1) {
+            const byte = data[0];
+            if (byte >= 1 and byte <= 16) {
+                try self.emitOpcode(@enumFromInt(@as(u8, 0x50 + byte)));
+                return;
+            }
+            if (byte == 0x81) {
+                try self.emitOpcode(.op_1negate);
+                return;
+            }
+        }
+
         const start = self.script_bytes.items.len;
         try opcodes.encodePushData(self.script_bytes.writer(self.allocator), data);
         const bytes_written: u32 = @intCast(self.script_bytes.items.len - start);
         self.byte_offset += bytes_written;
 
-        // ASM: show the data as hex
-        if (data.len == 0) {
-            try self.asm_parts.append(self.allocator, "OP_0");
-        } else {
-            const hex = try opcodes.bytesToHex(self.allocator, data);
-            try self.owned_asm_parts.append(self.allocator, hex);
-            try self.asm_parts.append(self.allocator, hex);
-        }
+        const hex = try opcodes.bytesToHex(self.allocator, data);
+        try self.owned_asm_parts.append(self.allocator, hex);
+        try self.asm_parts.append(self.allocator, hex);
     }
 
     /// Emit a script number with proper encoding and ASM representation.
@@ -240,6 +252,19 @@ pub fn emitMethodOps(allocator: std.mem.Allocator, ops: []const types.StackOp) !
     return try ctx.getHex();
 }
 
+fn emitMethodBody(ctx: *EmitContext, method: types.StackMethod) !void {
+    if (method.instructions.len > 0) {
+        for (method.instructions) |inst| {
+            try emitStackInstruction(ctx, inst);
+        }
+        return;
+    }
+
+    for (method.ops) |op| {
+        try emitStackOp(ctx, op);
+    }
+}
+
 // ============================================================================
 // Multi-Method Dispatch Table
 // ============================================================================
@@ -252,9 +277,7 @@ fn emitDispatchTable(ctx: *EmitContext, methods: []const types.StackMethod) !voi
 
     if (methods.len == 1) {
         // Single method: no dispatch needed, just emit the body
-        for (methods[0].ops) |op| {
-            try emitStackOp(ctx, op);
-        }
+        try emitMethodBody(ctx, methods[0]);
         return;
     }
 
@@ -275,9 +298,7 @@ fn emitDispatchTable(ctx: *EmitContext, methods: []const types.StackMethod) !voi
         try ctx.emitOpcode(.op_drop); // consume the method index
 
         // Emit method body
-        for (method.ops) |op| {
-            try emitStackOp(ctx, op);
-        }
+        try emitMethodBody(ctx, method);
 
         if (i < methods.len - 1) {
             try ctx.emitOpcode(.op_else);
@@ -542,6 +563,32 @@ test "emitStackInstruction — push_data" {
     try emitStackInstruction(&ctx, .{ .push_data = &.{ 0xaa, 0xbb, 0xcc } });
     try std.testing.expectEqualSlices(u8, &.{ 0x03, 0xaa, 0xbb, 0xcc }, ctx.script_bytes.items);
     try std.testing.expectEqualStrings("aabbcc", ctx.asm_parts.items[0]);
+}
+
+test "emitStackInstruction — push_data uses OP_N for single-byte 1 through 16" {
+    const allocator = std.testing.allocator;
+
+    var value: u8 = 1;
+    while (value <= 16) : (value += 1) {
+        var ctx = EmitContext.init(allocator);
+        defer ctx.deinit();
+
+        try emitStackInstruction(&ctx, .{ .push_data = &.{value} });
+        try std.testing.expectEqualSlices(u8, &.{@as(u8, 0x50 + value)}, ctx.script_bytes.items);
+        const expected = try std.fmt.allocPrint(allocator, "OP_{d}", .{value});
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, ctx.asm_parts.items[0]);
+    }
+}
+
+test "emitStackInstruction — push_data uses OP_1NEGATE for 0x81" {
+    const allocator = std.testing.allocator;
+    var ctx = EmitContext.init(allocator);
+    defer ctx.deinit();
+
+    try emitStackInstruction(&ctx, .{ .push_data = &.{0x81} });
+    try std.testing.expectEqualSlices(u8, &.{0x4f}, ctx.script_bytes.items);
+    try std.testing.expectEqualStrings("OP_1NEGATE", ctx.asm_parts.items[0]);
 }
 
 test "emitStackOp — dup/swap/drop/nip/over/rot/tuck" {

@@ -53,9 +53,7 @@ pub fn main() !void {
         var opts = CompileOptions{};
         var i: usize = 3;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--emit-ir")) opts.emit_ir = true
-            else if (std.mem.eql(u8, args[i], "--hex")) opts.hex_only = true
-            else if (std.mem.eql(u8, args[i], "--disable-constant-folding")) opts.disable_constant_folding = true;
+            if (std.mem.eql(u8, args[i], "--emit-ir")) opts.emit_ir = true else if (std.mem.eql(u8, args[i], "--hex")) opts.hex_only = true else if (std.mem.eql(u8, args[i], "--disable-constant-folding")) opts.disable_constant_folding = true;
         }
         compileFromSource(allocator, args[2], opts) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
@@ -78,9 +76,7 @@ pub fn main() !void {
         var opts = CompileOptions{};
         var i: usize = 3;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--emit-ir")) opts.emit_ir = true
-            else if (std.mem.eql(u8, args[i], "--hex")) opts.hex_only = true
-            else if (std.mem.eql(u8, args[i], "--disable-constant-folding")) opts.disable_constant_folding = true;
+            if (std.mem.eql(u8, args[i], "--emit-ir")) opts.emit_ir = true else if (std.mem.eql(u8, args[i], "--hex")) opts.hex_only = true else if (std.mem.eql(u8, args[i], "--disable-constant-folding")) opts.disable_constant_folding = true;
         }
         const format = detectFormat(file_path);
         const result = if (format == .anf_json)
@@ -148,10 +144,17 @@ fn compileFromIR(allocator: std.mem.Allocator, path: []const u8, opts: CompileOp
 
     const stack_program = try stack_lower.lower(allocator, program);
     defer stack_program.deinit(allocator);
+    const optimized_methods = try peephole.optimize(allocator, stack_program.methods);
+    const optimized_stack_program = types.StackProgram{
+        .methods = optimized_methods,
+        .contract_name = stack_program.contract_name,
+        .properties = stack_program.properties,
+        .constructor_params = stack_program.constructor_params,
+    };
 
     if (opts.hex_only) {
         const stdout = std.fs.File.stdout();
-        for (stack_program.methods) |method| {
+        for (optimized_stack_program.methods) |method| {
             const hex = try emit.emitMethodScript(allocator, method.instructions);
             defer allocator.free(hex);
             try stdout.writeAll(hex);
@@ -160,7 +163,7 @@ fn compileFromIR(allocator: std.mem.Allocator, path: []const u8, opts: CompileOp
         return;
     }
 
-    const artifact = try emit.emitArtifact(allocator, stack_program, program);
+    const artifact = try emit.emitArtifact(allocator, optimized_stack_program, program);
     defer allocator.free(artifact);
     const stdout = std.fs.File.stdout();
     try stdout.writeAll(artifact);
@@ -238,11 +241,18 @@ fn compileFromSource(allocator: std.mem.Allocator, path: []const u8, opts: Compi
     // Pass 5: Stack Lower
     const stack_program = try stack_lower.lower(allocator, program);
     defer stack_program.deinit(allocator);
+    const optimized_methods = try peephole.optimize(allocator, stack_program.methods);
+    const optimized_stack_program = types.StackProgram{
+        .methods = optimized_methods,
+        .contract_name = stack_program.contract_name,
+        .properties = stack_program.properties,
+        .constructor_params = stack_program.constructor_params,
+    };
 
     // --hex: output hex script only
     if (opts.hex_only) {
         const stdout = std.fs.File.stdout();
-        for (stack_program.methods) |method| {
+        for (optimized_stack_program.methods) |method| {
             const hex = try emit.emitMethodScript(allocator, method.instructions);
             defer allocator.free(hex);
             try stdout.writeAll(hex);
@@ -252,7 +262,7 @@ fn compileFromSource(allocator: std.mem.Allocator, path: []const u8, opts: Compi
     }
 
     // Pass 6: Emit full artifact
-    const artifact = try emit.emitArtifact(allocator, stack_program, program);
+    const artifact = try emit.emitArtifact(allocator, optimized_stack_program, program);
     defer allocator.free(artifact);
 
     const stdout = std.fs.File.stdout();
@@ -266,20 +276,3 @@ const UnsupportedFormat = error{UnsupportedFormat};
 const ParseFailed = error{ParseFailed};
 const ValidationFailed = error{ValidationFailed};
 const TypeCheckFailed = error{TypeCheckFailed};
-
-test {
-    _ = @import("ir/types.zig");
-    _ = @import("ir/json.zig");
-    _ = @import("codegen/opcodes.zig");
-    _ = @import("codegen/emit.zig");
-    _ = @import("passes/stack_lower.zig");
-    _ = @import("passes/peephole.zig");
-    _ = @import("passes/parse_zig.zig");
-    _ = @import("passes/parse_ts.zig");
-    _ = @import("passes/validate.zig");
-    _ = @import("passes/typecheck.zig");
-    _ = @import("passes/anf_lower.zig");
-    _ = @import("passes/constant_fold.zig");
-    _ = @import("passes/ec_optimizer.zig");
-    _ = @import("tests/e2e.zig");
-}

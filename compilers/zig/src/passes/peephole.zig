@@ -84,6 +84,8 @@ pub fn optimize(allocator: Allocator, methods: []const types.StackMethod) ![]typ
         result[i] = .{
             .name = method.name,
             .instructions = optimized_insts,
+            .ops = method.ops,
+            .max_stack_depth = method.max_stack_depth,
         };
     }
     return result;
@@ -232,12 +234,6 @@ fn tryWindow2(w: *const [2]Inst) ?Replacement2 {
     // Rule 17: PUSH(0) + ROLL -> (removed, roll 0 = no-op)
     if (isPushInt(a, 0) and isOp(b, .op_roll)) return .{ null, null };
 
-    // Rule 18: PUSH(1) + ROLL -> SWAP
-    if (isPushInt(a, 1) and isOp(b, .op_roll)) return .{ Inst{ .op = .op_swap }, null };
-
-    // Rule 19: PUSH(2) + ROLL -> ROT
-    if (isPushInt(a, 2) and isOp(b, .op_roll)) return .{ Inst{ .op = .op_rot }, null };
-
     // Rule 20: PUSH(0) + PICK -> DUP
     if (isPushInt(a, 0) and isOp(b, .op_pick)) return .{ Inst{ .op = .op_dup }, null };
 
@@ -246,9 +242,6 @@ fn tryWindow2(w: *const [2]Inst) ?Replacement2 {
 
     // Rule 22: OP_SHA256 + OP_SHA256 -> OP_HASH256
     if (isOp(a, .op_sha256) and isOp(b, .op_sha256)) return .{ Inst{ .op = .op_hash256 }, null };
-
-    // Rule 23: PUSH(0) + OP_NUMEQUAL -> OP_NOT
-    if (isPushInt(a, 0) and isOp(b, .op_numequal)) return .{ Inst{ .op = .op_not }, null };
 
     return null;
 }
@@ -496,24 +489,6 @@ test "rule 17: push 0 + roll eliminated" {
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
-// --- Rule 18: PUSH(1) + ROLL -> SWAP ---
-test "rule 18: push 1 + roll -> swap" {
-    const alloc = testing.allocator;
-    const input = [_]Inst{ .{ .push_int = 1 }, .{ .op = .op_roll } };
-    const result = try optimizeOps(alloc, &input);
-    defer alloc.free(result);
-    try expectOps(&.{.{ .op = .op_swap }}, result);
-}
-
-// --- Rule 19: PUSH(2) + ROLL -> ROT ---
-test "rule 19: push 2 + roll -> rot" {
-    const alloc = testing.allocator;
-    const input = [_]Inst{ .{ .push_int = 2 }, .{ .op = .op_roll } };
-    const result = try optimizeOps(alloc, &input);
-    defer alloc.free(result);
-    try expectOps(&.{.{ .op = .op_rot }}, result);
-}
-
 // --- Rule 20: PUSH(0) + PICK -> DUP ---
 test "rule 20: push 0 + pick -> dup" {
     const alloc = testing.allocator;
@@ -539,15 +514,6 @@ test "rule 22: sha256 + sha256 -> hash256" {
     const result = try optimizeOps(alloc, &input);
     defer alloc.free(result);
     try expectOps(&.{.{ .op = .op_hash256 }}, result);
-}
-
-// --- Rule 23: PUSH(0) + OP_NUMEQUAL -> OP_NOT ---
-test "rule 23: push 0 + numequal -> not" {
-    const alloc = testing.allocator;
-    const input = [_]Inst{ .{ .push_int = 0 }, .{ .op = .op_numequal } };
-    const result = try optimizeOps(alloc, &input);
-    defer alloc.free(result);
-    try expectOps(&.{.{ .op = .op_not }}, result);
 }
 
 // --- Rule 24: PUSH(a) + PUSH(b) + OP_ADD -> PUSH(a+b) ---

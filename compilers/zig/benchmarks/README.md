@@ -1,0 +1,187 @@
+# Zig Benchmark Scaffolding
+
+This directory contains the isolated benchmark inputs for the Zig compiler work.
+
+The harness is intentionally low-risk:
+
+- It does not touch `build.zig`, `src/**`, or `tests/**`.
+- It compares the Zig compiler against the TypeScript reference compiler using existing repo artifacts.
+- It keeps the default suites conservative so benchmark runs do not depend on still-failing conformance cases.
+- It supports two modes:
+  - `source`: full source compile, `.runar.ts -> hex`
+  - `ir`: backend-only compile, `expected-ir.json -> hex`
+
+## Files
+
+- `contracts-source.txt`: default contracts for full source benchmarks
+- `contracts-ir.txt`: default contracts for backend-only benchmarks
+- [`../scripts/benchmark_compare.py`](/Users/satchmo/code/runar/compilers/zig/scripts/benchmark_compare.py): main benchmark runner
+- [`../scripts/ts_compile_source_hex.mjs`](/Users/satchmo/code/runar/compilers/zig/scripts/ts_compile_source_hex.mjs): TS full-source helper
+- [`../scripts/ts_compile_ir_hex.mjs`](/Users/satchmo/code/runar/compilers/zig/scripts/ts_compile_ir_hex.mjs): TS backend-only helper
+
+## What It Benchmarks
+
+`source` mode compares:
+
+- Zig: `runar-zig --source <file> --hex`
+- TypeScript: `runar-compiler` `compile(source, { fileName })`
+
+`ir` mode compares:
+
+- Zig: `runar-zig compile-ir <expected-ir.json>`
+- TypeScript: `lowerToStack(anf)` + `emit(stack)`
+
+## Prerequisites
+
+Build the Zig binary in release mode first:
+
+```bash
+cd /Users/satchmo/code/runar/compilers/zig
+zig build -Doptimize=ReleaseFast
+```
+
+The TypeScript side uses `packages/runar-compiler/dist`. If that build is stale, rebuild it once from repo root:
+
+```bash
+pnpm --filter runar-compiler build
+```
+
+## Run Instructions
+
+Run the default full-source comparison suite:
+
+```bash
+cd /Users/satchmo/code/runar
+python3 compilers/zig/scripts/benchmark_compare.py source
+```
+
+Run the default backend-only comparison suite:
+
+```bash
+cd /Users/satchmo/code/runar
+python3 compilers/zig/scripts/benchmark_compare.py ir
+```
+
+Use a specific Node binary:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py source --node-bin node
+```
+
+Benchmark a specific contract without editing the list files:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py source --contract basic-p2pkh
+```
+
+Print the resolved default contract list:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py ir --list-contracts
+```
+
+Use more iterations:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py source --iterations 20 --warmup 3
+```
+
+Tag a run and increase the per-process timeout:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py source --label m2-releasefast --timeout-sec 180
+```
+
+Use a custom contract list:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py source --contracts-file compilers/zig/benchmarks/contracts-source.txt
+```
+
+Write machine-readable results:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py ir --json-out /tmp/runar-zig-bench.json
+```
+
+Print only the suite summary:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py source --summary-only
+```
+
+Show the fully resolved Zig and TypeScript commands:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py source --show-commands
+```
+
+Keep going across failures while collecting a broad report:
+
+```bash
+python3 compilers/zig/scripts/benchmark_compare.py source --keep-going --allow-failures
+```
+
+Show helper usage:
+
+```bash
+node compilers/zig/scripts/ts_compile_source_hex.mjs --help
+node compilers/zig/scripts/ts_compile_ir_hex.mjs --help
+```
+
+The helper CLIs also accept a positional file path:
+
+```bash
+node compilers/zig/scripts/ts_compile_source_hex.mjs conformance/tests/basic-p2pkh/basic-p2pkh.runar.ts
+node compilers/zig/scripts/ts_compile_ir_hex.mjs conformance/tests/basic-p2pkh/expected-ir.json
+```
+
+## Reproducible Runs
+
+For a compact, repeatable run that is easy to share in a PR or issue:
+
+```bash
+cd /Users/satchmo/code/runar
+python3 compilers/zig/scripts/benchmark_compare.py source \
+  --contract basic-p2pkh \
+  --warmup 2 \
+  --iterations 10 \
+  --summary-only \
+  --json-out /tmp/runar-zig-source-basic-p2pkh.json
+```
+
+For a broader sweep while correctness is still settling:
+
+```bash
+cd /Users/satchmo/code/runar
+python3 compilers/zig/scripts/benchmark_compare.py source \
+  --keep-going \
+  --allow-failures \
+  --json-out /tmp/runar-zig-source-suite.json
+```
+
+## Report Shape
+
+The Python runner now:
+
+- normalizes Zig and TypeScript hex before comparing
+- measures Zig and TypeScript in paired, alternating order to reduce run-order bias
+- prints a run header, a per-contract table, and an aggregate summary
+- reports `p90`/`p95` latency alongside mean timing so startup jitter is visible
+- reports per-contract errors without losing already collected results
+- exits non-zero on mismatches or benchmark errors by default
+- writes structured JSON with `schema_version`, `config`, `environment`, `summary`, and `results`
+- supports `--summary-only` for CI logs or quick spot checks
+- supports `--show-commands` so the exact command pair for each contract is visible
+- stores per-sample timings, workload size (`input_bytes`), per-tool variability (`cv_pct`), and first-difference metadata for hex mismatches
+
+## Notes
+
+- The default lists avoid the currently unstable stateful and post-quantum cases.
+- The runner verifies hex equality between Zig and TypeScript for each contract and reports mismatches.
+- The reported geomean speedup only includes parity-matched rows. Do not make performance claims from mismatched contracts.
+- JSON output includes the git commit, dirty-state flag, host/platform details, Python version, Node version, Zig version, selected helper paths, contract-list hash, and measurement order so runs can be compared later with less guesswork.
+- Use `--keep-going --allow-failures` while parity is still moving. Once correctness is green, the default strict exit behavior is the right CI-friendly mode.
+- On the current branch, `source` mode is the safer benchmark to trust first. `ir` mode is wired and useful, but if it reports a hex mismatch, treat that as backend parity debt rather than a harness bug.
+- Once conformance is fully green, expand the contract lists to include the larger stateful and crypto-heavy cases.
+- Compare runs only on the same machine, same build mode, and same Node/Zig toolchain versions. These numbers are cold CLI subprocess timings, not in-process compiler microbenchmarks.

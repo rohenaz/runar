@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
     // Unit tests
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/test_main.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
     // Conformance tests
     const conformance_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests/conformance.zig"),
+            .root_source_file = b.path("src/test_conformance.zig"),
             .target = target,
             .optimize = optimize,
         }),
