@@ -103,4 +103,5 @@ test {
     _ = @import("builtins.zig");
     _ = @import("compile_check.zig");
     _ = @import("testing_helpers.zig");
+    _ = @import("script_integration_test.zig");
 }
