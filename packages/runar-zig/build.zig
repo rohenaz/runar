@@ -9,12 +9,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const bsvz_dep = b.dependency("bsvz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const bsvz_module = bsvz_dep.module("bsvz");
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     root_module.addImport("runar_frontend", frontend_module);
+    root_module.addImport("bsvz", bsvz_module);
 
     const runar_module = b.addModule("runar", .{
         .root_source_file = b.path("src/root.zig"),
@@ -22,6 +29,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     runar_module.addImport("runar_frontend", frontend_module);
+    runar_module.addImport("bsvz", bsvz_module);
 
     const tests = b.addTest(.{
         .root_module = root_module,
