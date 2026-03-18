@@ -118,3 +118,33 @@ describe('parseZigSource bytes equality lowering', () => {
     }
   });
 });
+
+describe('parseZigSource bigint surface', () => {
+  it('parses runar.Bigint as the normal bigint contract type', () => {
+    const source = `
+      const runar = @import("runar");
+
+      pub const SchnorrZKP = struct {
+        pub const Contract = runar.SmartContract;
+
+        pubKey: runar.Point,
+
+        pub fn verify(self: *const SchnorrZKP, rPoint: runar.Point, s: runar.Bigint) void {
+          _ = self;
+          _ = rPoint;
+          _ = s;
+        }
+      };
+    `;
+
+    const { direct, dispatch } = parseContract(source);
+
+    for (const contract of [direct, dispatch]) {
+      const verify = contract.methods.find(method => method.name === 'verify');
+      expect(verify?.params.map(param => [param.name, param.type])).toEqual([
+        ['rPoint', { kind: 'primitive_type', name: 'Point' }],
+        ['s', { kind: 'primitive_type', name: 'bigint' }],
+      ]);
+    }
+  });
+});

@@ -1263,6 +1263,7 @@ test "method calls and property access" {
 }
 
 test "type resolution" {
+    try std.testing.expectEqual(RunarType.bigint, typeNodeToRunarType(Parser.resolveRunarTypeNode("Bigint")));
     try std.testing.expectEqual(RunarType.pub_key, typeNodeToRunarType(Parser.resolveRunarTypeNode("PubKey")));
     try std.testing.expectEqual(RunarType.sig, typeNodeToRunarType(Parser.resolveRunarTypeNode("Sig")));
     try std.testing.expectEqual(RunarType.addr, typeNodeToRunarType(Parser.resolveRunarTypeNode("Addr")));

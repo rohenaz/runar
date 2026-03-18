@@ -33,13 +33,19 @@ pub const OutputValue = union(enum) {
 pub const OutputSnapshot = struct {
     satoshis: Bigint,
     values: []OutputValue,
+    stateScript: ByteString,
+    continuationScript: ByteString,
 
     pub fn deinit(self: *OutputSnapshot, allocator: std.mem.Allocator) void {
         for (self.values) |value| value.deinit(allocator);
         allocator.free(self.values);
+        if (self.stateScript.len != 0) allocator.free(self.stateScript);
+        if (self.continuationScript.len != 0) allocator.free(self.continuationScript);
         self.* = .{
             .satoshis = 0,
             .values = &.{},
+            .stateScript = &.{},
+            .continuationScript = &.{},
         };
     }
 };
@@ -56,17 +62,25 @@ pub const StatefulSmartContract = struct {
     allocator: std.mem.Allocator,
     txPreimage: SigHashPreimage,
     _outputs: std.ArrayListUnmanaged(OutputSnapshot),
+    _current_state_script: ByteString,
+    _continuation_prefix: ByteString,
+    _continuation_suffix: ByteString,
 
     pub fn init(allocator: std.mem.Allocator) StatefulSmartContract {
         return .{
             .allocator = allocator,
             .txPreimage = &.{},
             ._outputs = .empty,
+            ._current_state_script = &.{},
+            ._continuation_prefix = &.{},
+            ._continuation_suffix = &.{},
         };
     }
 
     pub fn deinit(self: *StatefulSmartContract) void {
         self.resetOutputs();
+        self.clearCurrentStateScript();
+        self.clearContinuationEnvelope();
     }
 
     pub fn outputs(self: *const StatefulSmartContract) []const OutputSnapshot {
@@ -87,17 +101,72 @@ pub const StatefulSmartContract = struct {
         self._outputs = .empty;
     }
 
+    pub fn setCurrentStateScript(self: *StatefulSmartContract, state_script: ByteString) StatefulRuntimeError!void {
+        self.clearCurrentStateScript();
+        self._current_state_script = try self.allocator.dupe(u8, state_script);
+    }
+
+    pub fn setCurrentStateValues(self: *StatefulSmartContract, values: anytype) StatefulRuntimeError!void {
+        const serialized = try serializeTestStateValues(self.allocator, values);
+        errdefer self.allocator.free(serialized);
+        try self.setCurrentStateScript(serialized);
+        self.allocator.free(serialized);
+    }
+
+    pub fn clearCurrentStateScript(self: *StatefulSmartContract) void {
+        if (self._current_state_script.len != 0) {
+            self.allocator.free(self._current_state_script);
+            self._current_state_script = &.{};
+        }
+    }
+
+    pub fn setContinuationEnvelope(
+        self: *StatefulSmartContract,
+        prefix: ByteString,
+        suffix: ByteString,
+    ) StatefulRuntimeError!void {
+        self.clearContinuationEnvelope();
+        self._continuation_prefix = try self.allocator.dupe(u8, prefix);
+        errdefer {
+            self.allocator.free(self._continuation_prefix);
+            self._continuation_prefix = &.{};
+        }
+        self._continuation_suffix = try self.allocator.dupe(u8, suffix);
+    }
+
+    pub fn clearContinuationEnvelope(self: *StatefulSmartContract) void {
+        if (self._continuation_prefix.len != 0) {
+            self.allocator.free(self._continuation_prefix);
+            self._continuation_prefix = &.{};
+        }
+        if (self._continuation_suffix.len != 0) {
+            self.allocator.free(self._continuation_suffix);
+            self._continuation_suffix = &.{};
+        }
+    }
+
     pub fn addOutput(self: *StatefulSmartContract, satoshis: Bigint, values: anytype) StatefulRuntimeError!void {
         const copied_values = try duplicateTupleValues(self.allocator, values);
+        errdefer freeOutputValues(self.allocator, copied_values);
+        const state_script = try serializeOutputValueSlice(self.allocator, copied_values);
+        errdefer self.allocator.free(state_script);
+        const continuation_script = try wrapContinuationScript(
+            self.allocator,
+            self._continuation_prefix,
+            state_script,
+            self._continuation_suffix,
+        );
+        errdefer self.allocator.free(continuation_script);
         try self._outputs.append(self.allocator, .{
             .satoshis = satoshis,
             .values = copied_values,
+            .stateScript = state_script,
+            .continuationScript = continuation_script,
         });
     }
 
     pub fn getStateScript(self: *const StatefulSmartContract) ByteString {
-        _ = self;
-        return &.{};
+        return self._current_state_script;
     }
 };
 
@@ -142,6 +211,23 @@ fn duplicateTupleValues(allocator: std.mem.Allocator, values: anytype) StatefulR
     return copied;
 }
 
+pub fn serializeTestStateValues(allocator: std.mem.Allocator, values: anytype) StatefulRuntimeError![]u8 {
+    const copied = try duplicateTupleValues(allocator, values);
+    defer freeOutputValues(allocator, copied);
+    return serializeOutputValueSlice(allocator, copied);
+}
+
+pub fn wrapTestContinuationScript(
+    allocator: std.mem.Allocator,
+    prefix: ByteString,
+    values: anytype,
+    suffix: ByteString,
+) StatefulRuntimeError![]u8 {
+    const state_script = try serializeTestStateValues(allocator, values);
+    defer allocator.free(state_script);
+    return wrapContinuationScript(allocator, prefix, state_script, suffix);
+}
+
 fn outputValueFrom(allocator: std.mem.Allocator, value: anytype) StatefulRuntimeError!OutputValue {
     const Value = @TypeOf(value);
     return switch (@typeInfo(Value)) {
@@ -168,6 +254,64 @@ fn asByteSlice(value: anytype) ?[]const u8 {
     };
 }
 
+fn freeOutputValues(allocator: std.mem.Allocator, values: []OutputValue) void {
+    for (values) |value| value.deinit(allocator);
+    allocator.free(values);
+}
+
+const test_state_magic = "rnrt";
+
+fn serializeOutputValueSlice(allocator: std.mem.Allocator, values: []const OutputValue) StatefulRuntimeError![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, test_state_magic);
+    try appendU32(&out, allocator, @intCast(values.len));
+    for (values) |value| {
+        switch (value) {
+            .bigint => |bigint| {
+                try out.append(allocator, 0x01);
+                var encoded: [8]u8 = undefined;
+                std.mem.writeInt(i64, encoded[0..], bigint, .big);
+                try out.appendSlice(allocator, &encoded);
+            },
+            .boolean => |boolean| {
+                try out.append(allocator, 0x02);
+                try out.append(allocator, if (boolean) 1 else 0);
+            },
+            .bytes => |bytes| {
+                try out.append(allocator, 0x03);
+                try appendU32(&out, allocator, @intCast(bytes.len));
+                try out.appendSlice(allocator, bytes);
+            },
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn wrapContinuationScript(
+    allocator: std.mem.Allocator,
+    prefix: ByteString,
+    state_script: ByteString,
+    suffix: ByteString,
+) StatefulRuntimeError![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, prefix);
+    try out.appendSlice(allocator, state_script);
+    try out.appendSlice(allocator, suffix);
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendU32(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32) !void {
+    var encoded: [4]u8 = undefined;
+    std.mem.writeInt(u32, encoded[0..], value, .big);
+    try out.appendSlice(allocator, &encoded);
+}
+
 test "stateful runtime records and resets outputs" {
     var runtime = StatefulSmartContract.init(std.testing.allocator);
     defer runtime.deinit();
@@ -175,6 +319,8 @@ test "stateful runtime records and resets outputs" {
     try runtime.addOutput(10, .{ "alice", @as(i64, 7), true });
     try std.testing.expectEqual(@as(usize, 1), runtime.outputs().len);
     try std.testing.expectEqual(@as(i64, 10), runtime.outputs()[0].satoshis);
+    try std.testing.expect(runtime.outputs()[0].stateScript.len != 0);
+    try std.testing.expectEqualSlices(u8, runtime.outputs()[0].stateScript, runtime.outputs()[0].continuationScript);
     try std.testing.expectEqualStrings("alice", switch (runtime.outputs()[0].values[0]) {
         .bytes => |bytes| bytes,
         else => return error.TestUnexpectedResult,
@@ -198,4 +344,34 @@ test "StatefulContext exposes txPreimage and mutating output helpers" {
     ctx.addOutput(21, .{ "alice", @as(i64, 7) });
     try std.testing.expectEqual(@as(usize, 1), ctx.outputs().len);
     try std.testing.expectEqual(@as(i64, 21), ctx.outputs()[0].satoshis);
+}
+
+test "stateful runtime supports explicit current-state and continuation envelopes" {
+    var runtime = StatefulSmartContract.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    try runtime.setCurrentStateValues(.{ "owner", @as(i64, 25), false });
+    try std.testing.expect(runtime.getStateScript().len != 0);
+
+    try runtime.setContinuationEnvelope("code-prefix:", ":code-suffix");
+    try runtime.addOutput(1, .{ "bob", @as(i64, 30), @as(i64, 0) });
+
+    const output = runtime.outputs()[0];
+    try std.testing.expect(output.stateScript.len != 0);
+    try std.testing.expect(std.mem.startsWith(u8, output.continuationScript, "code-prefix:"));
+    try std.testing.expect(std.mem.endsWith(u8, output.continuationScript, ":code-suffix"));
+    try std.testing.expect(std.mem.indexOf(u8, output.continuationScript, output.stateScript) != null);
+}
+
+test "serialize helpers produce explicit deterministic test state bytes" {
+    const serialized = try serializeTestStateValues(std.testing.allocator, .{ "bob", @as(i64, -2), true });
+    defer std.testing.allocator.free(serialized);
+
+    try std.testing.expect(std.mem.startsWith(u8, serialized, test_state_magic));
+
+    const continuation = try wrapTestContinuationScript(std.testing.allocator, "prefix:", .{ "bob" }, ":suffix");
+    defer std.testing.allocator.free(continuation);
+
+    try std.testing.expect(std.mem.startsWith(u8, continuation, "prefix:"));
+    try std.testing.expect(std.mem.endsWith(u8, continuation, ":suffix"));
 }

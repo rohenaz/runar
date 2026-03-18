@@ -32,9 +32,25 @@ fn expectBigint(value: runar.OutputValue, expected: i64) !void {
     }
 }
 
+fn expectContinuationOutput(
+    output: runar.OutputSnapshot,
+    prefix: []const u8,
+    values: anytype,
+    suffix: []const u8,
+) !void {
+    const expected_state = try runar.serializeTestStateValues(std.testing.allocator, values);
+    defer std.testing.allocator.free(expected_state);
+    const expected_continuation = try runar.wrapTestContinuationScript(std.testing.allocator, prefix, values, suffix);
+    defer std.testing.allocator.free(expected_continuation);
+
+    try std.testing.expectEqualSlices(u8, expected_state, output.stateScript);
+    try std.testing.expectEqualSlices(u8, expected_continuation, output.continuationScript);
+}
+
 test "fungible token transfer records recipient and change outputs" {
     var runtime = runar.StatefulSmartContract.init(std.testing.allocator);
     defer runtime.deinit();
+    try runtime.setContinuationEnvelope("ft:", ":script");
     var token = FungibleTokenExample.init(runar.ALICE.pubKey, 40, 10, "token");
     const ctx = try runar.StatefulContext.init(&runtime, runar.mockPreimage(.{}));
 
@@ -45,14 +61,17 @@ test "fungible token transfer records recipient and change outputs" {
     try expectBytes(ctx.outputs()[0].values[0], runar.BOB.pubKey);
     try expectBigint(ctx.outputs()[0].values[1], 30);
     try expectBigint(ctx.outputs()[0].values[2], 0);
+    try expectContinuationOutput(ctx.outputs()[0], "ft:", .{ runar.BOB.pubKey, @as(i64, 30), @as(i64, 0) }, ":script");
     try expectBytes(ctx.outputs()[1].values[0], runar.ALICE.pubKey);
     try expectBigint(ctx.outputs()[1].values[1], 20);
     try expectBigint(ctx.outputs()[1].values[2], 0);
+    try expectContinuationOutput(ctx.outputs()[1], "ft:", .{ runar.ALICE.pubKey, @as(i64, 20), @as(i64, 0) }, ":script");
 }
 
 test "fungible token send records a single full-balance output" {
     var runtime = runar.StatefulSmartContract.init(std.testing.allocator);
     defer runtime.deinit();
+    try runtime.setContinuationEnvelope("ft:", ":script");
     var token = FungibleTokenExample.init(runar.ALICE.pubKey, 25, 5, "token");
     const ctx = try runar.StatefulContext.init(&runtime, runar.mockPreimage(.{}));
 
@@ -62,11 +81,13 @@ test "fungible token send records a single full-balance output" {
     try expectBytes(ctx.outputs()[0].values[0], runar.BOB.pubKey);
     try expectBigint(ctx.outputs()[0].values[1], 30);
     try expectBigint(ctx.outputs()[0].values[2], 0);
+    try expectContinuationOutput(ctx.outputs()[0], "ft:", .{ runar.BOB.pubKey, @as(i64, 30), @as(i64, 0) }, ":script");
 }
 
 test "fungible token merge preserves first-input ordering through the real contract" {
     var runtime = runar.StatefulSmartContract.init(std.testing.allocator);
     defer runtime.deinit();
+    try runtime.setContinuationEnvelope("ft:", ":script");
     var token = FungibleTokenExample.init(runar.ALICE.pubKey, 25, 5, "token");
     const first = [_]u8{'a'} ** 36;
     const second = [_]u8{'b'} ** 36;
@@ -82,6 +103,7 @@ test "fungible token merge preserves first-input ordering through the real contr
     try expectBytes(ctx.outputs()[0].values[0], runar.ALICE.pubKey);
     try expectBigint(ctx.outputs()[0].values[1], 30);
     try expectBigint(ctx.outputs()[0].values[2], 12);
+    try expectContinuationOutput(ctx.outputs()[0], "ft:", .{ runar.ALICE.pubKey, @as(i64, 30), @as(i64, 12) }, ":script");
 }
 
 test "fungible token rejects invalid transfers and prevout mismatches" {

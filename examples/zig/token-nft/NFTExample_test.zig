@@ -25,9 +25,25 @@ fn expectBytes(value: runar.OutputValue, expected: []const u8) !void {
     }
 }
 
+fn expectContinuationOutput(
+    output: runar.OutputSnapshot,
+    prefix: []const u8,
+    values: anytype,
+    suffix: []const u8,
+) !void {
+    const expected_state = try runar.serializeTestStateValues(std.testing.allocator, values);
+    defer std.testing.allocator.free(expected_state);
+    const expected_continuation = try runar.wrapTestContinuationScript(std.testing.allocator, prefix, values, suffix);
+    defer std.testing.allocator.free(expected_continuation);
+
+    try std.testing.expectEqualSlices(u8, expected_state, output.stateScript);
+    try std.testing.expectEqualSlices(u8, expected_continuation, output.continuationScript);
+}
+
 test "nft transfer records a single new-owner output through the real contract" {
     var runtime = runar.StatefulSmartContract.init(std.testing.allocator);
     defer runtime.deinit();
+    try runtime.setContinuationEnvelope("nft:", ":script");
     var nft = NFTExample.init(runar.ALICE.pubKey, "token", "metadata");
     const ctx = try runar.StatefulContext.init(&runtime, runar.mockPreimage(.{}));
 
@@ -36,6 +52,7 @@ test "nft transfer records a single new-owner output through the real contract" 
     try std.testing.expectEqual(@as(usize, 1), ctx.outputs().len);
     try std.testing.expectEqual(@as(i64, 1), ctx.outputs()[0].satoshis);
     try expectBytes(ctx.outputs()[0].values[0], runar.BOB.pubKey);
+    try expectContinuationOutput(ctx.outputs()[0], "nft:", .{runar.BOB.pubKey}, ":script");
 }
 
 test "nft burn authorizes the owner through the real contract" {

@@ -25,6 +25,8 @@ pub const SmartContract = base.SmartContract;
 pub const StatefulSmartContract = base.StatefulSmartContract;
 pub const StatefulContext = base.StatefulContext;
 pub const StatefulSmartContractError = base.StatefulSmartContractError;
+pub const serializeTestStateValues = base.serializeTestStateValues;
+pub const wrapTestContinuationScript = base.wrapTestContinuationScript;
 
 pub const TestKeyPair = test_keys.TestKeyPair;
 pub const ALICE = test_keys.ALICE;
