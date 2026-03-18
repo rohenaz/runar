@@ -4,121 +4,53 @@ const test_keys = @import("test_keys.zig");
 const frontend = @import("runar_frontend");
 const bsvz = @import("bsvz");
 
-// Integration tests: compile Runar contracts through the Zig compiler
-// frontend, then verify Bitcoin Script output in bsvz's script engine.
+const Script = bsvz.script.Script;
 
-test "bsvz engine executes arithmetic script (2 + 3 = 5)" {
-    const allocator = std.testing.allocator;
-    const script_bytes = [_]u8{ 0x52, 0x53, 0x93, 0x55, 0x9c };
-    const script = bsvz.script.Script.init(&script_bytes);
-    var result = try bsvz.script.engine.executeScript(.{ .allocator = allocator }, script);
-    defer result.deinit(allocator);
-    try std.testing.expect(result.success);
-}
+// Integration tests: compile Runar contracts via the Zig compiler,
+// then verify the compiled Bitcoin Script in bsvz's engine with
+// real transaction context and ECDSA signatures.
 
-test "bsvz engine rejects failing arithmetic (2 + 3 != 6)" {
-    const allocator = std.testing.allocator;
-    const script_bytes = [_]u8{ 0x52, 0x53, 0x93, 0x56, 0x9c };
-    const script = bsvz.script.Script.init(&script_bytes);
-    var result = try bsvz.script.engine.executeScript(.{ .allocator = allocator }, script);
-    defer result.deinit(allocator);
-    try std.testing.expect(!result.success);
-}
-
-test "bsvz engine handles OP_IF branching" {
-    const allocator = std.testing.allocator;
-    const script_bytes = [_]u8{ 0x51, 0x63, 0x52, 0x67, 0x53, 0x68, 0x52, 0x9c };
-    const script = bsvz.script.Script.init(&script_bytes);
-    var result = try bsvz.script.engine.executeScript(.{ .allocator = allocator }, script);
-    defer result.deinit(allocator);
-    try std.testing.expect(result.success);
-}
-
-test "bsvz engine verifies OP_HASH160" {
-    const allocator = std.testing.allocator;
-    const msg = "hello";
-    const expected_hash = builtins.hash160(msg);
-
-    var script_buf: [256]u8 = undefined;
-    var pos: usize = 0;
-    script_buf[pos] = @intCast(msg.len);
-    pos += 1;
-    @memcpy(script_buf[pos..][0..msg.len], msg);
-    pos += msg.len;
-    script_buf[pos] = 0xa9;
-    pos += 1;
-    script_buf[pos] = @intCast(expected_hash.len);
-    pos += 1;
-    @memcpy(script_buf[pos..][0..expected_hash.len], expected_hash);
-    pos += expected_hash.len;
-    script_buf[pos] = 0x87;
-    pos += 1;
-
-    const script = bsvz.script.Script.init(script_buf[0..pos]);
-    var result = try bsvz.script.engine.executeScript(.{ .allocator = allocator }, script);
-    defer result.deinit(allocator);
-    try std.testing.expect(result.success);
-}
-
-// ---------------------------------------------------------------------------
-// End-to-end: .runar.zig → frontend parse/validate/typecheck → bsvz verify
-// ---------------------------------------------------------------------------
-
-fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
-    if (hex.len % 2 != 0) return error.InvalidHexLength;
-    const out = try allocator.alloc(u8, hex.len / 2);
+fn hexToBytes(allocator: std.mem.Allocator, hex_str: []const u8) ![]u8 {
+    if (hex_str.len % 2 != 0) return error.InvalidHexLength;
+    const out = try allocator.alloc(u8, hex_str.len / 2);
     errdefer allocator.free(out);
-    _ = try std.fmt.hexToBytes(out, hex);
+    _ = try std.fmt.hexToBytes(out, hex_str);
     return out;
 }
 
-test "end-to-end: compile P2PKH to hex and execute locking script in bsvz" {
-    const allocator = std.testing.allocator;
-
-    const source =
-        \\const runar = @import("runar");
-        \\
-        \\pub const P2PKH = struct {
-        \\    pub const Contract = runar.SmartContract;
-        \\
-        \\    pubKeyHash: runar.Addr,
-        \\
-        \\    pub fn init(pubKeyHash: runar.Addr) P2PKH {
-        \\        return .{ .pubKeyHash = pubKeyHash };
-        \\    }
-        \\
-        \\    pub fn unlock(self: *const P2PKH, sig: runar.Sig, pubKey: runar.PubKey) void {
-        \\        runar.assert(runar.hash160(pubKey) == self.pubKeyHash);
-        \\        runar.assert(runar.checkSig(sig, pubKey));
-        \\    }
-        \\};
-    ;
-
-    // Compile through the full Zig compiler pipeline
-    const hex = try frontend.compileSourceToHex(allocator, source, "P2PKH.runar.zig");
-    defer allocator.free(hex);
-
-    // Should produce non-empty hex script
-    try std.testing.expect(hex.len > 0);
-
-    // Decode hex to bytes and feed to bsvz engine
-    const script_bytes = try hexToBytes(allocator, hex);
-    defer allocator.free(script_bytes);
-
-    // The compiled P2PKH locking script expects stack inputs from the
-    // unlocking script. We can't run CHECKSIG without a transaction context,
-    // but we can verify the script parses and the opcodes are recognized
-    // by bsvz's engine by checking it doesn't error on parse.
-    const chunks = try bsvz.script.engine.parseScript(allocator, script_bytes);
-    defer allocator.free(chunks);
-    try std.testing.expect(chunks.len > 0);
+fn appendScriptNumberPush(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: i64) !void {
+    const encoded = try bsvz.script.ScriptNum.encode(allocator, value);
+    if (encoded.len == 0) {
+        try buf.append(allocator, 0x00);
+    } else if (encoded.len <= 75) {
+        try buf.append(allocator, @intCast(encoded.len));
+        try buf.appendSlice(allocator, encoded);
+    } else {
+        try buf.append(allocator, 0x4c);
+        try buf.append(allocator, @intCast(encoded.len));
+        try buf.appendSlice(allocator, encoded);
+    }
 }
 
-test "end-to-end: Arithmetic contract passes frontend pipeline" {
+fn appendPushData(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, data: []const u8) !void {
+    if (data.len == 0) {
+        try buf.append(allocator, 0x00);
+    } else if (data.len <= 75) {
+        try buf.append(allocator, @intCast(data.len));
+        try buf.appendSlice(allocator, data);
+    } else {
+        try buf.append(allocator, 0x4c);
+        try buf.append(allocator, @intCast(data.len));
+        try buf.appendSlice(allocator, data);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile + verify: full pipeline
+// ---------------------------------------------------------------------------
+
+test "compile arithmetic, verify in bsvz engine (pure, no CHECKSIG)" {
     const allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const work = arena.allocator();
 
     const source =
         \\const runar = @import("runar");
@@ -142,92 +74,231 @@ test "end-to-end: Arithmetic contract passes frontend pipeline" {
         \\};
     ;
 
-    const parse_result = frontend.parseZig(work, source, "Arithmetic.runar.zig");
-    try std.testing.expectEqual(@as(usize, 0), parse_result.errors.len);
-    try std.testing.expect(parse_result.contract != null);
+    // Compile through full Zig compiler pipeline
+    const script_hex = try frontend.compileSourceToHex(allocator, source, "Arithmetic.runar.zig");
+    defer allocator.free(script_hex);
+    try std.testing.expect(script_hex.len > 0);
 
-    const contract = parse_result.contract.?;
-    const val_result = try frontend.validateContract(work, contract);
-    try std.testing.expectEqual(@as(usize, 0), val_result.errors.len);
+    // Decode compiled locking script
+    const locking_bytes = try hexToBytes(allocator, script_hex);
+    defer allocator.free(locking_bytes);
+    const locking_script = Script.init(locking_bytes);
 
-    const tc_result = try frontend.typeCheck(work, contract);
-    try std.testing.expectEqual(@as(usize, 0), tc_result.errors.len);
+    // Build unlocking script: <a=3> <b=7> (target=27 baked into locking script via constructor)
+    // a=3, b=7 → sum=10, diff=-4, prod=21 → result=27
+    var unlock_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer unlock_buf.deinit(allocator);
+    try appendScriptNumberPush(&unlock_buf, allocator, 3);
+    try appendScriptNumberPush(&unlock_buf, allocator, 7);
+    const unlocking_script = Script.init(unlock_buf.items);
+
+    // Verify through bsvz engine
+    const success = try bsvz.script.engine.verifyScripts(.{
+        .allocator = allocator,
+    }, unlocking_script, locking_script);
+    try std.testing.expect(success);
 }
 
-test "end-to-end: P2PKH hash check runs in bsvz engine" {
-    // Construct the hash-check portion of what Runar compiles for P2PKH:
-    // <pubkey> OP_DUP OP_HASH160 <pkh> OP_EQUALVERIFY OP_1
-    //
-    // This is the non-CHECKSIG part of the P2PKH locking script. CHECKSIG
-    // requires a full transaction context (sighash), so we verify the hash
-    // check independently. This proves bsvz can execute the stack operations
-    // and hash opcodes that Runar contracts compile to.
+test "compile arithmetic, wrong args rejected by bsvz engine" {
     const allocator = std.testing.allocator;
 
-    const alice_pubkey = test_keys.ALICE.pubKey;
-    const pkh = builtins.hash160(alice_pubkey);
+    const source =
+        \\const runar = @import("runar");
+        \\
+        \\pub const Arithmetic = struct {
+        \\    pub const Contract = runar.SmartContract;
+        \\
+        \\    target: i64,
+        \\
+        \\    pub fn init(target: i64) Arithmetic {
+        \\        return .{ .target = target };
+        \\    }
+        \\
+        \\    pub fn verify(self: *const Arithmetic, a: i64, b: i64) void {
+        \\        const sum = a + b;
+        \\        const diff = a - b;
+        \\        const prod = a * b;
+        \\        const result = sum + diff + prod;
+        \\        runar.assert(result == self.target);
+        \\    }
+        \\};
+    ;
 
-    var script_buf: [256]u8 = undefined;
-    var pos: usize = 0;
+    const script_hex = try frontend.compileSourceToHex(allocator, source, "Arithmetic.runar.zig");
+    defer allocator.free(script_hex);
 
-    // Push pubkey
-    script_buf[pos] = @intCast(alice_pubkey.len);
-    pos += 1;
-    @memcpy(script_buf[pos..][0..alice_pubkey.len], alice_pubkey);
-    pos += alice_pubkey.len;
+    const locking_bytes = try hexToBytes(allocator, script_hex);
+    defer allocator.free(locking_bytes);
+    const locking_script = Script.init(locking_bytes);
 
-    // OP_DUP OP_HASH160 <20-byte pkh> OP_EQUALVERIFY OP_1
-    script_buf[pos] = 0x76;
-    pos += 1;
-    script_buf[pos] = 0xa9;
-    pos += 1;
-    script_buf[pos] = 0x14;
-    pos += 1;
-    @memcpy(script_buf[pos..][0..pkh.len], pkh);
-    pos += pkh.len;
-    script_buf[pos] = 0x88;
-    pos += 1;
-    script_buf[pos] = 0x51; // OP_1 — truthy top after EQUALVERIFY consumes
-    pos += 1;
+    // Wrong args: a=1, b=1 → sum=2, diff=0, prod=1 → result=3, target=27 → fail
+    var unlock_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer unlock_buf.deinit(allocator);
+    try appendScriptNumberPush(&unlock_buf, allocator, 1);
+    try appendScriptNumberPush(&unlock_buf, allocator, 1);
+    const unlocking_script = Script.init(unlock_buf.items);
 
-    const script = bsvz.script.Script.init(script_buf[0..pos]);
-    var result = try bsvz.script.engine.executeScript(.{ .allocator = allocator }, script);
-    defer result.deinit(allocator);
-
-    try std.testing.expect(result.success);
+    const success = try bsvz.script.engine.verifyScripts(.{
+        .allocator = allocator,
+    }, unlocking_script, locking_script);
+    try std.testing.expect(!success);
 }
 
-test "end-to-end: P2PKH hash check rejects wrong pubkey" {
+test "compile P2PKH, verify with real ECDSA in bsvz engine" {
     const allocator = std.testing.allocator;
 
-    const alice_pubkey = test_keys.ALICE.pubKey;
-    const pkh = builtins.hash160(alice_pubkey);
+    const source =
+        \\const runar = @import("runar");
+        \\
+        \\pub const P2PKH = struct {
+        \\    pub const Contract = runar.SmartContract;
+        \\
+        \\    pubKeyHash: runar.Addr,
+        \\
+        \\    pub fn init(pubKeyHash: runar.Addr) P2PKH {
+        \\        return .{ .pubKeyHash = pubKeyHash };
+        \\    }
+        \\
+        \\    pub fn unlock(self: *const P2PKH, sig: runar.Sig, pubKey: runar.PubKey) void {
+        \\        runar.assert(runar.hash160(pubKey) == self.pubKeyHash);
+        \\        runar.assert(runar.checkSig(sig, pubKey));
+        \\    }
+        \\};
+    ;
 
-    // Use BOB's pubkey but ALICE's hash — should fail EQUALVERIFY
-    const bob_pubkey = test_keys.BOB.pubKey;
+    const script_hex = try frontend.compileSourceToHex(allocator, source, "P2PKH.runar.zig");
+    defer allocator.free(script_hex);
 
-    var script_buf: [256]u8 = undefined;
-    var pos: usize = 0;
+    const locking_bytes = try hexToBytes(allocator, script_hex);
+    defer allocator.free(locking_bytes);
+    const locking_script = Script.init(locking_bytes);
 
-    script_buf[pos] = @intCast(bob_pubkey.len);
-    pos += 1;
-    @memcpy(script_buf[pos..][0..bob_pubkey.len], bob_pubkey);
-    pos += bob_pubkey.len;
+    // Build a real transaction for CHECKSIG
+    const key_one_private = [_]u8{0} ** 31 ++ [_]u8{1};
+    const private_key = try bsvz.crypto.PrivateKey.fromBytes(key_one_private);
+    const previous_satoshis: i64 = 100_000;
 
-    script_buf[pos] = 0x76;
-    pos += 1;
-    script_buf[pos] = 0xa9;
-    pos += 1;
-    script_buf[pos] = 0x14;
-    pos += 1;
-    @memcpy(script_buf[pos..][0..pkh.len], pkh);
-    pos += pkh.len;
-    script_buf[pos] = 0x88;
-    pos += 1;
-    script_buf[pos] = 0x51;
-    pos += 1;
+    var inputs = [_]bsvz.transaction.Input{.{
+        .previous_outpoint = .{
+            .txid = .{ .bytes = [_]u8{0xaa} ** 32 },
+            .index = 0,
+        },
+        .unlocking_script = Script.init(""),
+        .sequence = 0xffff_ffff,
+    }};
+    var outputs = [_]bsvz.transaction.Output{.{
+        .satoshis = 99_000,
+        .locking_script = Script.init(&[_]u8{0x6a}),
+    }};
+    var tx = bsvz.transaction.Transaction{
+        .version = 2,
+        .inputs = &inputs,
+        .outputs = &outputs,
+        .lock_time = 0,
+    };
 
-    const script = bsvz.script.Script.init(script_buf[0..pos]);
-    const result = bsvz.script.engine.executeScript(.{ .allocator = allocator }, script);
-    try std.testing.expectError(error.VerifyFailed, result);
+    // Sign the input
+    const tx_signature = try bsvz.transaction.templates.p2pkh_spend.signInput(
+        allocator,
+        &tx,
+        0,
+        locking_script,
+        previous_satoshis,
+        private_key,
+        bsvz.transaction.templates.p2pkh_spend.default_scope,
+    );
+    const sig_bytes = try tx_signature.toChecksigFormat(allocator);
+    defer allocator.free(sig_bytes);
+
+    // Build unlocking script: <sig> <pubkey>
+    const pubkey = try private_key.publicKey();
+    var unlock_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer unlock_buf.deinit(allocator);
+    try appendPushData(&unlock_buf, allocator, sig_bytes);
+    try appendPushData(&unlock_buf, allocator, &pubkey.bytes);
+    const unlocking_script = Script.init(unlock_buf.items);
+
+    // Verify through bsvz with full transaction context
+    const success = try bsvz.script.engine.verifyScripts(.{
+        .allocator = allocator,
+        .tx = &tx,
+        .input_index = 0,
+        .previous_locking_script = locking_script,
+        .previous_satoshis = previous_satoshis,
+    }, unlocking_script, locking_script);
+    try std.testing.expect(success);
+}
+
+test "compile P2PKH, wrong key rejected by bsvz engine" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\const runar = @import("runar");
+        \\
+        \\pub const P2PKH = struct {
+        \\    pub const Contract = runar.SmartContract;
+        \\
+        \\    pubKeyHash: runar.Addr,
+        \\
+        \\    pub fn init(pubKeyHash: runar.Addr) P2PKH {
+        \\        return .{ .pubKeyHash = pubKeyHash };
+        \\    }
+        \\
+        \\    pub fn unlock(self: *const P2PKH, sig: runar.Sig, pubKey: runar.PubKey) void {
+        \\        runar.assert(runar.hash160(pubKey) == self.pubKeyHash);
+        \\        runar.assert(runar.checkSig(sig, pubKey));
+        \\    }
+        \\};
+    ;
+
+    const script_hex = try frontend.compileSourceToHex(allocator, source, "P2PKH.runar.zig");
+    defer allocator.free(script_hex);
+
+    const locking_bytes = try hexToBytes(allocator, script_hex);
+    defer allocator.free(locking_bytes);
+    const locking_script = Script.init(locking_bytes);
+
+    // Sign with key_two but locking script has key_one's pubkeyhash
+    const key_two_private = [_]u8{0} ** 31 ++ [_]u8{2};
+    const wrong_key = try bsvz.crypto.PrivateKey.fromBytes(key_two_private);
+    const previous_satoshis: i64 = 100_000;
+
+    var inputs = [_]bsvz.transaction.Input{.{
+        .previous_outpoint = .{ .txid = .{ .bytes = [_]u8{0xaa} ** 32 }, .index = 0 },
+        .unlocking_script = Script.init(""),
+        .sequence = 0xffff_ffff,
+    }};
+    var outputs = [_]bsvz.transaction.Output{.{
+        .satoshis = 99_000,
+        .locking_script = Script.init(&[_]u8{0x6a}),
+    }};
+    var tx = bsvz.transaction.Transaction{
+        .version = 2,
+        .inputs = &inputs,
+        .outputs = &outputs,
+        .lock_time = 0,
+    };
+
+    const tx_signature = try bsvz.transaction.templates.p2pkh_spend.signInput(
+        allocator, &tx, 0, locking_script, previous_satoshis, wrong_key,
+        bsvz.transaction.templates.p2pkh_spend.default_scope,
+    );
+    const sig_bytes = try tx_signature.toChecksigFormat(allocator);
+    defer allocator.free(sig_bytes);
+
+    const wrong_pubkey = try wrong_key.publicKey();
+    var unlock_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer unlock_buf.deinit(allocator);
+    try appendPushData(&unlock_buf, allocator, sig_bytes);
+    try appendPushData(&unlock_buf, allocator, &wrong_pubkey.bytes);
+    const unlocking_script = Script.init(unlock_buf.items);
+
+    const success = try bsvz.script.engine.verifyScripts(.{
+        .allocator = allocator,
+        .tx = &tx,
+        .input_index = 0,
+        .previous_locking_script = locking_script,
+        .previous_satoshis = previous_satoshis,
+    }, unlocking_script, locking_script);
+    try std.testing.expect(!success);
 }
