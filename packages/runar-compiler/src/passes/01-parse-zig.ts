@@ -271,6 +271,7 @@ class ZigParser extends ParserCore<ZigToken> {
   private methods: MethodNode[] = [];
   private constructorNode: MethodNode | null = null;
   private selfNames = new Set<string>();
+  private statefulContextNames = new Set<string>();
 
   parse(): ParseResult {
     this.skipRunarImport();
@@ -399,6 +400,12 @@ class ZigParser extends ParserCore<ZigToken> {
       readonly: this.parentClass === 'SmartContract' || property.readonly || property.initializer === undefined,
     }));
 
+    const methodNames = new Set(this.methods.map(method => method.name));
+    this.methods = this.methods.map(method => this.rewriteBareMethodCalls(method, methodNames));
+    if (this.constructorNode) {
+      this.constructorNode = this.rewriteBareMethodCalls(this.constructorNode, methodNames);
+    }
+
     const contract: ContractNode = {
       kind: 'contract',
       name: this.contractName,
@@ -459,23 +466,27 @@ class ZigParser extends ParserCore<ZigToken> {
     if (isPublic) this.expect('pub');
     this.expect('fn');
     const name = this.expect('ident').value;
-    const { params, receiverName } = this.parseParamList();
+    const { params, receiverName, statefulContextNames } = this.parseParamList();
 
     if (this.current().type !== '{') {
       this.parseType();
     }
 
     const previousSelfNames = this.selfNames;
+    const previousStatefulContextNames = this.statefulContextNames;
     this.selfNames = receiverName ? new Set([receiverName]) : new Set();
+    this.statefulContextNames = new Set(statefulContextNames);
 
     if (name === 'init') {
       this.constructorNode = this.parseConstructor(sourceLocation, params);
       this.selfNames = previousSelfNames;
+      this.statefulContextNames = previousStatefulContextNames;
       return null;
     }
 
     const body = this.parseBlockStatements();
     this.selfNames = previousSelfNames;
+    this.statefulContextNames = previousStatefulContextNames;
 
     return {
       kind: 'method',
@@ -499,10 +510,15 @@ class ZigParser extends ParserCore<ZigToken> {
     };
   }
 
-  private parseParamList(): { params: ParamNode[]; receiverName: string | null } {
+  private parseParamList(): {
+    params: ParamNode[];
+    receiverName: string | null;
+    statefulContextNames: Set<string>;
+  } {
     this.expect('(');
     const params: ParamNode[] = [];
     let receiverName: string | null = null;
+    const statefulContextNames = new Set<string>();
     let index = 0;
 
     while (this.current().type !== ')' && this.current().type !== 'eof') {
@@ -514,6 +530,9 @@ class ZigParser extends ParserCore<ZigToken> {
       if (isReceiver) {
         receiverName = paramName;
       } else {
+        if (parsedType.rawName === 'StatefulContext') {
+          statefulContextNames.add(paramName);
+        }
         params.push({
           kind: 'param',
           name: paramName,
@@ -526,7 +545,7 @@ class ZigParser extends ParserCore<ZigToken> {
     }
 
     this.expect(')');
-    return { params, receiverName };
+    return { params, receiverName, statefulContextNames };
   }
 
   private parseParamType(): ParsedType {
@@ -588,9 +607,13 @@ class ZigParser extends ParserCore<ZigToken> {
       if (statement) {
         // Merge `var i = 0; while (i < N) : (i += 1) { ... }` into a single ForStatement
         const lastStmt = body.length > 0 ? body[body.length - 1] : undefined;
+        const loopInitName = statement.kind === 'for_statement'
+          ? this.getLoopUpdateTargetName(statement)
+          : null;
         if (statement.kind === 'for_statement' &&
             (statement as ForStatement).init.name === '__while_no_init' &&
-            lastStmt?.kind === 'variable_decl') {
+            lastStmt?.kind === 'variable_decl' &&
+            loopInitName === lastStmt.name) {
           body.pop();
           (statement as ForStatement).init = lastStmt as any;
         }
@@ -599,6 +622,16 @@ class ZigParser extends ParserCore<ZigToken> {
     }
     this.expect('}');
     return body;
+  }
+
+  private getLoopUpdateTargetName(stmt: ForStatement): string | null {
+    if (stmt.update.kind === 'assignment' && stmt.update.target.kind === 'identifier') {
+      return stmt.update.target.name;
+    }
+    if (stmt.update.kind === 'expression_statement' && stmt.update.expression.kind === 'identifier') {
+      return stmt.update.expression.name;
+    }
+    return null;
   }
 
   private parseConstructorBody(params: ParamNode[]): Statement[] {
@@ -988,18 +1021,29 @@ class ZigParser extends ParserCore<ZigToken> {
       return { kind: 'array_literal', elements };
     }
 
-    // Zig @builtins: @divTrunc(a, b), @mod(a, b), @intCast(expr), @truncate(expr)
+    // Zig @builtins: @divTrunc(a, b), @mod(a, b), @shlExact(a, b), @shrExact(a, b), @intCast(expr), @truncate(expr)
     if (token.type === '@') {
       this.advance();
       const builtinName = this.expect('ident').value;
 
-      if (builtinName === 'divTrunc' || builtinName === 'mod') {
+      if (
+        builtinName === 'divTrunc' ||
+        builtinName === 'mod' ||
+        builtinName === 'shlExact' ||
+        builtinName === 'shrExact'
+      ) {
         this.expect('(');
         const left = this.parseExpression();
         this.expect(',');
         const right = this.parseExpression();
         this.expect(')');
-        const op: BinaryOp = builtinName === 'divTrunc' ? '/' : '%';
+        const op: BinaryOp = builtinName === 'divTrunc'
+          ? '/'
+          : builtinName === 'mod'
+            ? '%'
+            : builtinName === 'shlExact'
+              ? '<<'
+              : '>>';
         return { kind: 'binary_expr', op, left, right };
       }
 
@@ -1032,18 +1076,33 @@ class ZigParser extends ParserCore<ZigToken> {
         return arg;
       }
 
-      // Unknown @builtin — return as identifier
+      // Unknown @builtin — preserve call shape but reject it explicitly.
       if (this.current().type === '(') {
         this.advance();
-        const arg = this.parseExpression();
+        const args: Expression[] = [];
+        args.push(this.parseExpression());
         while (this.current().type === ',') {
           this.advance();
-          this.parseExpression();
+          args.push(this.parseExpression());
         }
         this.expect(')');
-        return arg;
+        this.errors.push(makeDiagnostic(
+          `Unsupported Zig builtin '@${builtinName}'`,
+          'error',
+          { file: this.file, line: token.line, column: token.column },
+        ));
+        return {
+          kind: 'call_expr',
+          callee: { kind: 'identifier', name: builtinName },
+          args,
+        };
       }
 
+      this.errors.push(makeDiagnostic(
+        `Unsupported Zig builtin '@${builtinName}'`,
+        'error',
+        { file: this.file, line: token.line, column: token.column },
+      ));
       return { kind: 'identifier', name: builtinName };
     }
 
@@ -1069,6 +1128,191 @@ class ZigParser extends ParserCore<ZigToken> {
 
     this.advance();
     return { kind: 'identifier', name: token.value || 'unknown' };
+  }
+
+  private rewriteBareMethodCalls(method: MethodNode, methodNames: Set<string>): MethodNode {
+    const scope = new Set(method.params.map(param => param.name));
+    return {
+      ...method,
+      body: this.rewriteStatements(method.body, methodNames, scope),
+    };
+  }
+
+  private rewriteStatements(
+    statements: Statement[],
+    methodNames: Set<string>,
+    scope: Set<string>,
+  ): Statement[] {
+    const rewritten: Statement[] = [];
+    const currentScope = new Set(scope);
+
+    for (const statement of statements) {
+      const next = this.rewriteStatement(statement, methodNames, currentScope);
+      rewritten.push(next);
+      if (next.kind === 'variable_decl') {
+        currentScope.add(next.name);
+      }
+    }
+
+    return rewritten;
+  }
+
+  private rewriteStatement(
+    statement: Statement,
+    methodNames: Set<string>,
+    scope: Set<string>,
+  ): Statement {
+    switch (statement.kind) {
+      case 'variable_decl':
+        return {
+          ...statement,
+          init: this.rewriteExpression(statement.init, methodNames, scope),
+        };
+      case 'assignment':
+        return {
+          ...statement,
+          target: this.rewriteExpression(statement.target, methodNames, scope),
+          value: this.rewriteExpression(statement.value, methodNames, scope),
+        };
+      case 'if_statement':
+        return {
+          ...statement,
+          condition: this.rewriteExpression(statement.condition, methodNames, scope),
+          then: this.rewriteStatements(statement.then, methodNames, new Set(scope)),
+          else: statement.else
+            ? this.rewriteStatements(statement.else, methodNames, new Set(scope))
+            : undefined,
+        };
+      case 'for_statement': {
+        const loopScope = new Set(scope);
+        const init = this.rewriteStatement(statement.init, methodNames, loopScope) as Extract<Statement, { kind: 'variable_decl' }>;
+        loopScope.add(init.name);
+        return {
+          ...statement,
+          init,
+          condition: this.rewriteExpression(statement.condition, methodNames, loopScope),
+          update: this.rewriteStatement(statement.update, methodNames, loopScope),
+          body: this.rewriteStatements(statement.body, methodNames, loopScope),
+        };
+      }
+      case 'return_statement':
+        return {
+          ...statement,
+          value: statement.value
+            ? this.rewriteExpression(statement.value, methodNames, scope)
+            : undefined,
+        };
+      case 'expression_statement':
+        return {
+          ...statement,
+          expression: this.rewriteExpression(statement.expression, methodNames, scope),
+        };
+    }
+  }
+
+  private rewriteExpression(
+    expression: Expression,
+    methodNames: Set<string>,
+    scope: Set<string>,
+  ): Expression {
+    switch (expression.kind) {
+      case 'call_expr': {
+        const callee = expression.callee.kind === 'identifier' &&
+            methodNames.has(expression.callee.name) &&
+            !scope.has(expression.callee.name)
+          ? { kind: 'property_access', property: expression.callee.name } as const
+          : this.rewriteExpression(expression.callee, methodNames, scope);
+        return {
+          ...expression,
+          callee,
+          args: expression.args.map(arg => this.rewriteExpression(arg, methodNames, scope)),
+        };
+      }
+      case 'binary_expr':
+        return {
+          ...expression,
+          left: this.rewriteExpression(expression.left, methodNames, scope),
+          right: this.rewriteExpression(expression.right, methodNames, scope),
+        };
+      case 'unary_expr':
+        return {
+          ...expression,
+          operand: this.rewriteExpression(expression.operand, methodNames, scope),
+        };
+      case 'ternary_expr':
+        return {
+          ...expression,
+          condition: this.rewriteExpression(expression.condition, methodNames, scope),
+          consequent: this.rewriteExpression(expression.consequent, methodNames, scope),
+          alternate: this.rewriteExpression(expression.alternate, methodNames, scope),
+        };
+      case 'member_expr':
+        return {
+          ...expression,
+          object: this.rewriteExpression(expression.object, methodNames, scope),
+        };
+      case 'index_access':
+        return {
+          ...expression,
+          object: this.rewriteExpression(expression.object, methodNames, scope),
+          index: this.rewriteExpression(expression.index, methodNames, scope),
+        };
+      case 'increment_expr':
+      case 'decrement_expr':
+        return {
+          ...expression,
+          operand: this.rewriteExpression(expression.operand, methodNames, scope),
+        };
+      case 'array_literal':
+        return {
+          ...expression,
+          elements: expression.elements.map(element => this.rewriteExpression(element, methodNames, scope)),
+        };
+      case 'identifier':
+      case 'property_access':
+      case 'bigint_literal':
+      case 'bool_literal':
+      case 'bytestring_literal':
+        return expression;
+    }
+  }
+
+  protected parsePostfixChain(expr: Expression, selfNames: Set<string>): Expression {
+    while (true) {
+      if (this.current().type === '(') {
+        this.advance();
+        const args: Expression[] = [];
+        while (this.current().type !== ')' && this.current().type !== 'eof') {
+          args.push(this.parseExpression());
+          if (this.current().type === ',') this.advance();
+        }
+        this.expect(')');
+        expr = { kind: 'call_expr', callee: expr, args };
+      } else if (this.current().type === '.') {
+        this.advance();
+        const prop = this.current().value;
+        this.advance();
+        if (expr.kind === 'identifier' && selfNames.has(expr.name)) {
+          expr = { kind: 'property_access', property: prop };
+        } else if (
+          expr.kind === 'identifier' &&
+          this.statefulContextNames.has(expr.name) &&
+          (prop === 'txPreimage' || prop === 'getStateScript' || prop === 'addOutput' || prop === 'addRawOutput')
+        ) {
+          expr = { kind: 'property_access', property: prop };
+        } else {
+          expr = { kind: 'member_expr', object: expr, property: prop };
+        }
+      } else if (this.current().type === '[') {
+        this.advance();
+        const index = this.parseExpression();
+        this.expect(']');
+        expr = { kind: 'index_access', object: expr, index };
+      } else {
+        break;
+      }
+    }
+    return expr;
   }
 }
 

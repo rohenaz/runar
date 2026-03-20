@@ -82,3 +82,33 @@ describe('Zig parser: example contracts', () => {
     });
   }
 });
+
+describe('Zig parser: stateful example parity', () => {
+  const parityPairs = [
+    ['auction/Auction.runar.zig', 'auction/Auction.runar.ts'],
+    ['token-ft/FungibleTokenExample.runar.zig', 'token-ft/FungibleTokenExample.runar.ts'],
+    ['token-nft/NFTExample.runar.zig', 'token-nft/NFTExample.runar.ts'],
+  ] as const;
+
+  for (const [zigRelativePath, tsRelativePath] of parityPairs) {
+    it(`matches TypeScript script hex for ${zigRelativePath}`, () => {
+      const zigSource = readFileSync(join(EXAMPLES_ZIG_DIR, zigRelativePath), 'utf-8');
+      const tsSource = readFileSync(join(EXAMPLES_TS_DIR, tsRelativePath), 'utf-8');
+
+      const zigResult = compile(zigSource, {
+        fileName: zigRelativePath.split('/').pop()!,
+        disableConstantFolding: true,
+      });
+      const tsResult = compile(tsSource, {
+        fileName: tsRelativePath.split('/').pop()!,
+        disableConstantFolding: true,
+      });
+
+      expect(zigResult.diagnostics.filter(diagnostic => diagnostic.severity === 'error')).toEqual([]);
+      expect(tsResult.diagnostics.filter(diagnostic => diagnostic.severity === 'error')).toEqual([]);
+      expect(zigResult.success).toBe(true);
+      expect(tsResult.success).toBe(true);
+      expect(zigResult.scriptHex).toBe(tsResult.scriptHex);
+    });
+  }
+});

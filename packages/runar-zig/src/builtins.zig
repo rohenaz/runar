@@ -1509,6 +1509,7 @@ fn isIdentityPoint(point: []const u8) bool {
 }
 
 fn parsePoint(point: []const u8) !bsvz.crypto.Point {
+    if (isIdentityPoint(point)) return bsvz.crypto.Point.identity();
     return bsvz.crypto.Point.fromRaw64(point);
 }
 

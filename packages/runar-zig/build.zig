@@ -29,18 +29,34 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const bsvz_dep = b.dependency("bsvz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const bsvz_module = bsvz_dep.module("bsvz");
 
-    const bsvz_module = b.createModule(.{
-        .root_source_file = b.path("../../../bsvz/src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const bsvz_runar_harness_module = b.createModule(.{
-        .root_source_file = b.path("../../../bsvz/tests/support/runar_harness.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    bsvz_runar_harness_module.addImport("bsvz", bsvz_module);
+    const has_bsvz_runar_harness = blk: {
+        const harness_path = b.pathFromRoot("../../../bsvz/tests/support/runar_harness.zig");
+        std.fs.cwd().access(harness_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => break :blk false,
+        };
+        break :blk true;
+    };
+
+    var bsvz_runar_harness_module: ?*std.Build.Module = null;
+    if (has_bsvz_runar_harness) {
+        const harness_module = b.createModule(.{
+            .root_source_file = b.path("../../../bsvz/tests/support/runar_harness.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        harness_module.addImport("bsvz", bsvz_module);
+        bsvz_runar_harness_module = harness_module;
+    }
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "has_bsvz_runar_harness", has_bsvz_runar_harness);
 
     const root_module = createConfiguredRootModule(
         b,
@@ -50,6 +66,7 @@ pub fn build(b: *std.Build) void {
         bsvz_module,
         bsvz_runar_harness_module,
     );
+    root_module.addOptions("build_options", build_options);
 
     const runar_module = b.addModule("runar", .{
         .root_source_file = b.path("src/root.zig"),
@@ -58,6 +75,7 @@ pub fn build(b: *std.Build) void {
     });
     runar_module.addImport("runar_frontend", frontend_module);
     runar_module.addImport("bsvz", bsvz_module);
+    runar_module.addOptions("build_options", build_options);
 
     const tests = b.addTest(.{
         .root_module = root_module,

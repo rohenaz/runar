@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 
 pub const base = @import("base.zig");
 pub const builtins = @import("builtins.zig");
@@ -106,6 +107,8 @@ test {
     _ = @import("builtins.zig");
     _ = @import("compile_check.zig");
     _ = @import("hex.zig");
-    _ = @import("script_integration_test.zig");
     _ = @import("testing_helpers.zig");
+    if (build_options.has_bsvz_runar_harness) {
+        _ = @import("script_integration_test.zig");
+    }
 }

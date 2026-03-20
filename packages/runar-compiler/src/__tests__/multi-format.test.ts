@@ -9,7 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import { parse } from '../passes/01-parse.js';
 import { compile } from '../index.js';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 
 // ---------------------------------------------------------------------------
@@ -24,6 +24,18 @@ function readConformanceSource(testName: string, ext: string, baseName = testNam
   const path = join(CONFORMANCE_DIR, testName, `${baseName}${ext}`);
   if (!existsSync(path)) return null;
   return readFileSync(path, 'utf-8');
+}
+
+function findZigConformanceCases(): { testName: string; fileName: string }[] {
+  return readdirSync(CONFORMANCE_DIR, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .flatMap((entry) => {
+      const dir = join(CONFORMANCE_DIR, entry.name);
+      return readdirSync(dir)
+        .filter(file => file.endsWith('.runar.zig'))
+        .map(fileName => ({ testName: entry.name, fileName }));
+    })
+    .sort((a, b) => a.testName.localeCompare(b.testName) || a.fileName.localeCompare(b.fileName));
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +238,8 @@ describe('Multi-format: stateful contract', () => {
 // ---------------------------------------------------------------------------
 
 describe('Multi-format: Zig conformance', () => {
+  const zigConformanceCases = findZigConformanceCases();
+
   it('parses basic-p2pkh from .runar.zig', () => {
     const source = readConformanceSource('basic-p2pkh', '.runar.zig', 'P2PKH');
     if (!source) return;
@@ -259,4 +273,26 @@ describe('Multi-format: Zig conformance', () => {
     expect(typeof result.scriptHex).toBe('string');
     expect(result.scriptHex!.toLowerCase()).toBe(expectedHex);
   });
+
+  for (const { testName, fileName } of zigConformanceCases) {
+    it(`compiles ${testName}/${fileName} to the golden script hex`, () => {
+      const source = readConformanceSource(testName, '.runar.zig', fileName.replace(/\.runar\.zig$/, ''));
+      if (!source) return;
+
+      const expectedHex = readFileSync(
+        join(CONFORMANCE_DIR, testName, 'expected-script.hex'),
+        'utf-8',
+      ).trim().toLowerCase();
+
+      const result = compile(source, {
+        fileName,
+        disableConstantFolding: true,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.diagnostics.filter(diagnostic => diagnostic.severity === 'error')).toEqual([]);
+      expect(typeof result.scriptHex).toBe('string');
+      expect(result.scriptHex!.toLowerCase()).toBe(expectedHex);
+    });
+  }
 });

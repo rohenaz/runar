@@ -99,7 +99,7 @@ fn parseSerializedOutput(
     allocator: std.mem.Allocator,
     output_bytes: []const u8,
 ) !bsvz.transaction.Output {
-    const parsed = bsvz.transaction.Output.parse(output_bytes) catch return error.InvalidSerializedOutput;
+    const parsed = bsvz.transaction.Output.parse(allocator, output_bytes) catch return error.InvalidSerializedOutput;
     if (parsed.len != output_bytes.len) return error.InvalidSerializedOutput;
 
     const locking_script = try allocator.dupe(u8, parsed.output.locking_script.bytes);

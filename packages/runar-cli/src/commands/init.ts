@@ -537,9 +537,9 @@ test "compile-check P2PKH.runar.zig" {
 .zig-local-cache/
 `);
 
-  console.log(\`Project created at: \${projectDir}\`);
+  console.log(`Project created at: ${projectDir}`);
   console.log('');
   console.log('Next steps:');
-  console.log(\`  cd \${projectName}\`);
+  console.log(`  cd ${projectName}`);
   console.log('  zig build test              # run contract compile-check tests');
 }

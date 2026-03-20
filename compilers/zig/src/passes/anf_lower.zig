@@ -1142,41 +1142,50 @@ fn exprMutatesState(expr: Expression, contract: ContractNode) bool {
 // ============================================================================
 
 fn methodHasAddOutput(method: MethodNode) bool {
-    return bodyHasAddOutput(method.body);
+    return bodyHasAddOutput(method.body, method.params);
 }
 
-fn bodyHasAddOutput(stmts: []const Statement) bool {
+fn bodyHasAddOutput(stmts: []const Statement, params: []const ParamNode) bool {
     for (stmts) |stmt| {
-        if (stmtHasAddOutput(stmt)) return true;
+        if (stmtHasAddOutput(stmt, params)) return true;
     }
     return false;
 }
 
-fn stmtHasAddOutput(stmt: Statement) bool {
+fn stmtHasAddOutput(stmt: Statement, params: []const ParamNode) bool {
     switch (stmt) {
-        .expr_stmt => |expr| return exprHasAddOutput(expr),
+        .expr_stmt => |expr| return exprHasAddOutput(expr, params),
         .if_stmt => |if_s| {
-            if (bodyHasAddOutput(if_s.then_body)) return true;
+            if (bodyHasAddOutput(if_s.then_body, params)) return true;
             if (if_s.else_body) |eb| {
-                if (bodyHasAddOutput(eb)) return true;
+                if (bodyHasAddOutput(eb, params)) return true;
             }
             return false;
         },
-        .for_stmt => |for_s| return bodyHasAddOutput(for_s.body),
+        .for_stmt => |for_s| return bodyHasAddOutput(for_s.body, params),
         else => return false,
     }
 }
 
-fn exprHasAddOutput(expr: Expression) bool {
+fn exprHasAddOutput(expr: Expression, params: []const ParamNode) bool {
     switch (expr) {
         .method_call => |mc| {
-            if (std.mem.eql(u8, mc.object, "this")) {
+            if (std.mem.eql(u8, mc.object, "this") or paramIsStatefulContext(params, mc.object)) {
                 if (std.mem.eql(u8, mc.method, "addOutput") or std.mem.eql(u8, mc.method, "addRawOutput")) {
                     return true;
                 }
             }
         },
         else => {},
+    }
+    return false;
+}
+
+fn paramIsStatefulContext(params: []const ParamNode, name: []const u8) bool {
+    for (params) |param| {
+        if (std.mem.eql(u8, param.name, name) and std.mem.eql(u8, param.type_name, "StatefulContext")) {
+            return true;
+        }
     }
     return false;
 }
